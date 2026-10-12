@@ -23,6 +23,7 @@ from aiohttp.web_urldispatcher import MatchInfoError
 
 from ..config import Config
 from ..sessions import ActionRecord, SessionStore, Session
+from ..turso import TursoService
 from ..util import extract_bearer_token, ApiError, iso, now_utc
 from .context import APP_CTX_KEY, Ctx
 from .registry import Endpoint, sorted_endpoints
@@ -44,6 +45,7 @@ class AppState:
         self.client = client
         self.config = config
         self.store = store
+        self.turso_service = TursoService(config)
         # Discord-Verbindungsstatus für /api/health. Wird vom Login-Loop
         # (bot.main) und on_ready gepflegt — damit man bei „Bot offline"
         # sofort sieht, OB gewartet wird und WANN es weitergeht, statt zu raten:

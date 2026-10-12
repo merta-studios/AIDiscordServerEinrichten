@@ -15,6 +15,7 @@ from . import (  # noqa: F401  (Import erzeugt die Registrierung)
     moderation,
     roles,
     setup,
+    systems,
     webhooks,
 )
 
@@ -32,4 +33,5 @@ __all__ = [
     "events",
     "guides",
     "setup",
+    "systems",
 ]

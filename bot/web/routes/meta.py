@@ -894,3 +894,63 @@ async def _collect_audit(guild: discord.Guild, limit: int) -> List[Dict[str, Any
     except discord.Forbidden:
         return [{"_error": "VIEW_AUDIT_LOG fehlt — Audit-Log nicht lesbar."}]
     return entries
+
+
+@route(
+    "GET", "/api/v1/bot", scope="read", tags=("meta",),
+    summary="Globales Profil des Bots (ID, Name, Avatar, Banner)",
+    description="Liefert die globalen Stammdaten des Bots (unabhängig von einzelnen Servern).",
+)
+async def get_bot_user(ctx: Ctx) -> Dict[str, Any]:
+    from ...serializers import serialize_user
+    user = ctx.client.user
+    if user is None:
+        raise ApiError.unavailable("Bot ist noch nicht mit Discord verbunden.", code="BOT_NOT_CONNECTED")
+    data = serialize_user(user) or {}
+    data["guild_count"] = len(ctx.client.guilds)
+    return data
+
+
+@route(
+    "PATCH", "/api/v1/bot", scope="manage", tags=("meta",),
+    summary="Globales Bot-Profil bearbeiten (Username, Avatar, Banner)",
+    body={
+        "username": "str (2–32) — globaler Bot-Name",
+        "avatar": "URL | Data-URI | null (entfernen) — globales Bot-Avatar",
+        "banner": "URL | Data-URI | null (entfernen) — globales Bot-Banner",
+    },
+    description="Ermöglicht Arena AI, das Bot-Erscheinungsbild komplett einzurichten: "
+                "Avatar und Banner direkt über die Discord-API ändern.",
+)
+async def patch_bot_user(ctx: Ctx) -> Dict[str, Any]:
+    from ..images import resolve_image
+    from ...serializers import serialize_user
+
+    user = ctx.client.user
+    if user is None:
+        raise ApiError.unavailable("Bot ist noch nicht mit Discord verbunden.", code="BOT_NOT_CONNECTED")
+
+    data = await ctx.body()
+    kwargs: Dict[str, Any] = {}
+    changes: List[str] = []
+
+    if "username" in data and data["username"] is not None:
+        uname = parse_str(data["username"], field="username", min_length=2, max_length=32, allow_empty=False)
+        if uname:
+            kwargs["username"] = uname
+            changes.append(f"username → {uname}")
+
+    if "avatar" in data:
+        kwargs["avatar"] = await resolve_image(data["avatar"], session=ctx.http_session(), field="avatar")
+        changes.append(f"avatar → {'entfernt' if kwargs['avatar'] is None else 'gesetzt'}")
+
+    if "banner" in data:
+        kwargs["banner"] = await resolve_image(data["banner"], session=ctx.http_session(), field="banner")
+        changes.append(f"banner → {'entfernt' if kwargs['banner'] is None else 'gesetzt'}")
+
+    if not kwargs:
+        raise ApiError.bad_request("Nichts zu tun: 'username', 'avatar' und/oder 'banner' angeben.", code="NO_CHANGES")
+
+    updated = await guard(user.edit(**kwargs), action="Globales Bot-Profil bearbeiten")
+    target = updated or ctx.client.user or user
+    return {"changed": changes, "bot": serialize_user(target)}

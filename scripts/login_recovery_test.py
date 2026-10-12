@@ -953,8 +953,10 @@ async def test_client_setup() -> None:
     check("setup_hook() wirft nicht", setup_ok, setup_detail)
 
     names = {c.name for c in client.tree.get_commands()}
-    check("nur connect und adminpanel sind registriert",
-          names == {"connect", "adminpanel"}, str(sorted(names)))
+    check("connect, adminpanel und manage_database sind registriert",
+          names == {"connect", "adminpanel", "manage_database"}, str(sorted(names)))
+    db_command = client.tree.get_command("manage_database")
+    check("manage_database ist als Slash-Command vorhanden", db_command is not None)
     panel_command = client.tree.get_command("adminpanel")
     panel_contexts = getattr(panel_command, "allowed_contexts", None)
     check("adminpanel ist ausschließlich im privaten Bot-DM registriert",

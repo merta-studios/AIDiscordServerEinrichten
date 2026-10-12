@@ -31,88 +31,58 @@ __all__ = ("GUIDES",)
 
 def _self_roles_guide() -> Dict[str, Any]:
     return {
-        "titel": "Self Roles / Reaction Roles einrichten — ehrliche Anleitung",
+        "titel": "Self Roles / Reaction Roles einrichten — Nativ mit Turso",
         "beschreibung": (
-            "Was die KI selbst erledigen kann, was nur ein Mensch/dritter Bot "
-            "kann, und eine Schritt-für-Schritt-Anleitung für den Nutzer."
+            "Self Roles können jetzt direkt über die eigene Turso-Datenbank "
+            "vom Bot selbst ausgeführt werden (kein Drittanbieter-Bot nötig!)."
         ),
         "wichtig_fuer_ki": [
-            "Bots dürfen die Konfiguration anderer Bots NICHT ändern — Self-Role-"
-            "Mechaniken (Reaktion ⇒ Rolle) laufen immer über einen Drittanbieter-Bot.",
-            "Die KI darf und SOLL aber alles drumherum bauen: Rollen anlegen "
-            "(Farbe, Name, Rechte), den Kanal inkl. Sperre für @everyone, die "
-            "Übersichts-Nachricht (als Webhook-Persona) und diese Anleitung posten.",
-            "Die KI DARF Slash-Commands anderer Bots aufrufen (z. B. /reactionrole, "
-            "/rr add), um Ablauf und Optionen des installierten Bots zu erkunden — "
-            "das macht die Anleitung konkreter. Konfigurieren muss sie trotzdem nicht.",
-            "Erst prüfen, was installiert ist: GET /api/v1/members?bots=true — "
-            "danach den passenden Abschnitt der Anleitung wählen.",
-            "Natives Detail: Auf Community-Servern kann Discord-Onboarding "
-            "(Server-Onboarding mit Rollen-Auswahl) Self Roles teilweise ersetzen — "
-            "das DARF die KI selbst einrichten: PATCH /api/v1/guild/onboarding.",
+            "Bots dürfen andere Bots nicht konfigurieren — daher für Self Roles die native Turso-Datenbank (POST /api/v1/systems) nutzen oder diese Anleitung weitergeben.",
+            "Prüfe zuerst GET /api/v1/database/status — ist eine Turso-Datenbank verknüpft?",
+            "Falls NEIN: Stoppe sofort und bitte den Nutzer, /manage_database auf Discord auszuführen.",
+            "Falls JA: Lege Rollen und Übersichtsnachricht an und registriere das System per "
+            "POST /api/v1/systems mit Triggern für 'reaction_add' und 'reaction_remove'.",
+            "Beispiel-Trigger: {'event': 'reaction_add', 'filter': {'message_id': '...', 'emoji': '🎮'}, "
+            "'action': {'type': 'add_role', 'role_id': '...'}}.",
+            "Alternativ kann Discord-Onboarding auf Community-Servern genutzt werden: PATCH /api/v1/guild/onboarding.",
         ],
         "schritte_nutzer": [
-            "Prüfe, ob bereits ein Rollen-Bot auf dem Server ist "
-            "(Servereinstellungen → Integrationen, oder Mitgliederliste nach Bots filtern).",
-            "Fehlt einer: Lade einen geeigneten Bot über dessen Website mit der "
-            "'Zum Server einladen'-Funktion (braucht die Berechtigung 'Rollen verwalten').",
-            "Öffne das Dashboard des Bots (meist /dashboard oder Link in der Bot-"
-            "Beschreibung) und wähle 'Reaction Roles' bzw. 'Rollen-Auswahl'.",
-            "Wähle den vorbereiteten Kanal (z. B. #rollen-wahl) und die vorbereitete "
-            "Nachricht des Bots als Ziel.",
-            "Lege pro Rolle eine Zeile an: Rolle + Emoji. Nutze die Rollen, die "
-            "Arena AI bereits erstellt hat (Namen stehen in der Übersichtsnachricht).",
-            "Speichern — der Bot postet/verlinkt die Nachricht; erledigt. Reaktion "
-            "drauf klicken ⇒ Rolle kommt sofort.",
+            "Führe /manage_database auf Discord aus (kostenlose Turso-Datenbank verknüpfen).",
+            "Sag Arena AI, welche Self Roles du haben möchtest.",
+            "Arena AI erstellt die Rollen, die Übersichtsnachricht und das System automatisch!",
         ],
         "bot_anleitungen": {
-            "carl-bot": (
-                "/reactionrole → 'Create' → Kanal wählen → im nächsten Schritt pro Zeile "
-                "'Emoji Rolle' eintragen (Rollen per @vervollständigung). Carl-bot "
-                "erlaubt auch Buttons statt Emojis (Mode: Buttons)."
-            ),
-            "dyno": (
-                "web.dyno.gg → Modules → Reaction Roles → 'Add Reaction Role' → Kanal "
-                "und Nachricht wählen → Rollen + Emojis zuordnen → Save."
-            ),
-            "mee6": (
-                "mee6.xyz/dashboard → deinem Server wählen → Reaction Roles → "
-                "'Create' → Kanal, Nachricht, Emoji→Rolle-Paare festlegen."
-            ),
-            "yagpdb": (
-                "yagpdb.xyz/manage → Tools & Utilities → Reaction Roles → 'New Group' "
-                "→ Modus 'Only one' für exklusive Farben, 'Many' für freie Rollen → "
-                "Emoji→Rolle-Mapping anlegen."
-            ),
-            "reaction-roles /ReactionRoles": (
-                "/reactionroles create → Kanal wählen → eigene Nachricht oder "
-                "'Use existing message' → pro Rolle Emoji wählen und Rolle zuordnen."
-            ),
-            "arcane": "arcane.bot/dashboard → Leveling/Roles → 'Reaction Roles' → Assistent folgen.",
-            "sonstige": "Fast jeder größere Bot hat ein Dashboard: Servereinstellungen → Integrationen → Bot auswählen → Dashboard öffnen.",
+            "nativ_turso": "Wird vollautomatisch von diesem Bot über /manage_database und die Turso-Engine gesteuert.",
+            "carl-bot": "/reactionrole create",
+            "dyno": "web.dyno.gg → Modules → Reaction Roles",
+            "mee6": "mee6.xyz/dashboard → Reaction Roles",
         },
-        "text_vorlage": (
-            "**Rollen selbst auswählen — so geht's** 🎨\n\n"
-            "Ich habe alles vorbereitet: die Rollen ({rollenliste}) und diesen Kanal. "
-            "Einen Haken gibt es: **Die Auswahl selbst übernimmt ein anderer Bot** — "
-            "Bots dürfen andere Bots nicht konfigurieren, das ist eine Discord-Regel. "
-            "Deshalb hier die 3-Minuten-Anleitung für dich:\n\n"
-            "1️⃣ **Bot prüfen/laden** —Invite-Link: {bot_einladung}\n"
-            "2️⃣ **Dashboard öffnen** — {dashboard_hinweis}\n"
-            "3️⃣ **Reaction Roles anlegen** — {bot_schritte}\n"
-            "4️⃣ **Fertig** — Emoji anklicken ⇒ Rolle ist sofort da ✅\n\n"
-            "*Tipp: Alternativ kann Discord selbst Rollen beim Beitritt anbieten — "
-            "das nennt sich Server-Onboarding und kann komplett eingerichtet werden; "
-            "sag einfach Bescheid.*"
-        ),
         "was_die_ki_ubernehmen_kann": [
             "Rollen anlegen: POST /api/v1/roles (Name, Farbe, Rechte, Icon)",
-            "Kanal 'rollen-wahl' anlegen + @everyone Schreibrechte entziehen (Overwrites)",
-            "Übersichts-Nachricht posten (Webhook-Persona, alle Rollen mit echten "
-            "<@&id>-Mentions auflisten)",
-            "Onboarding mit Rollen-Prompts konfigurieren (Community-Server)",
-            "Diese Anleitung als Nachricht im Kanal hinterlassen",
+            "Kanal 'rollen-wahl' anlegen + @everyone Schreibrechte entziehen",
+            "Übersichts-Nachricht posten (Webhook-Persona)",
+            "System nativ schalten: POST /api/v1/systems mit Triggern für reaction_add & reaction_remove",
         ],
+    }
+
+
+def _systems_guide() -> Dict[str, Any]:
+    return {
+        "titel": "Eigene Server-Systeme mit Turso-Datenbank",
+        "beschreibung": "Wie Arena AI eigene Systeme (Self Roles, Welcome, Timer um 5 Uhr, Auto-Responder) einrichtet.",
+        "vorgehen": [
+            "1. Datenbank prüfen: GET /api/v1/database/status.",
+            "2. Falls 'configured: false': SOFORT ANTWORT STOPPEN und Nutzer bitten: 'Bitte führe /manage_database auf Discord aus, um eine kostenlose Turso-Datenbank zu verbinden.'",
+            "3. Falls 'configured: true': System per POST /api/v1/systems anlegen (inkl. Triggers für reaction_add, member_join, cron usw.).",
+            "4. Eigene Tabellen & SQL können per POST /api/v1/database/query ausgeführt werden.",
+        ],
+        "system_typen": {
+            "self_roles": "Reaktions-Rollen über reaction_add und reaction_remove Trigger.",
+            "welcome": "Willkommensnachrichten, DMs und Auto-Rollen bei member_join.",
+            "scheduled": "Tägliche Nachrichten oder Aktionen (z.B. cron um 05:00 UTC).",
+            "auto_responder": "Automatische Antworten oder SQL-Aktionen auf bestimmte Chat-Nachrichten.",
+            "custom": "Frei definierte SQL-Logik, Tabellen und Variablen.",
+        },
     }
 
 
@@ -273,6 +243,7 @@ def _security_guide() -> Dict[str, Any]:
 
 GUIDES: Dict[str, Dict[str, Any]] = {
     "self-roles": _self_roles_guide(),
+    "systems": _systems_guide(),
     "design": _design_guide(),
     "branding": _branding_guide(),
     "webhooks": _webhook_guide(),

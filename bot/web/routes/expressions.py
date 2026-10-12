@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from typing import Any, Dict, List
 
 import discord
@@ -155,7 +156,7 @@ async def create_sticker(ctx: Ctx) -> Dict[str, Any]:
     sticker = await guard(
         ctx.guild.create_sticker(
             name=name, description=description, emoji=emoji,
-            file=discord.File(payload, filename=f"{name[:20]}.png"),
+            file=discord.File(io.BytesIO(payload), filename=f"{name[:20]}.png"),
             reason=ctx.reason(data, default=f"Sticker '{name}' hochgeladen (Arena AI)"),
         ),
         action=f"Sticker '{name}' hochladen",
@@ -163,6 +164,66 @@ async def create_sticker(ctx: Ctx) -> Dict[str, Any]:
     )
     await ctx.settle(0.5)
     return {"created": serialize_sticker(sticker), "id": sf(sticker.id)}
+
+
+@route(
+    "GET", "/api/v1/stickers/{sticker_id}", scope="read", tags=("expressions",),
+    summary="Einzelnen Sticker abrufen",
+)
+async def get_sticker(ctx: Ctx) -> Dict[str, Any]:
+    sticker_id = ctx.path_id("sticker_id")
+    sticker = next((s for s in ctx.guild.stickers if s.id == sticker_id), None)
+    if sticker is None:
+        try:
+            sticker = await guard(ctx.guild.fetch_sticker(sticker_id), action="Sticker laden")
+        except ApiError:
+            sticker = None
+    if sticker is None:
+        raise ApiError.not_found(
+            f"Sticker {sticker_id} nicht gefunden.",
+            hint="GET /api/v1/stickers listet alle Server-Sticker.",
+            code="STICKER_NOT_FOUND",
+        )
+    return serialize_sticker(sticker) or {}
+
+
+@route(
+    "PATCH", "/api/v1/stickers/{sticker_id}", scope="manage", tags=("expressions",),
+    summary="Sticker bearbeiten (Name, Beschreibung, Emoji)",
+    body={
+        "name": "str (2–30)",
+        "description": "str (2–100)",
+        "emoji": "zugeordnetes Emoji (Unicode)",
+        "reason": "str",
+    },
+)
+async def patch_sticker(ctx: Ctx) -> Dict[str, Any]:
+    sticker_id = ctx.path_id("sticker_id")
+    sticker = next((s for s in ctx.guild.stickers if s.id == sticker_id), None)
+    if sticker is None:
+        try:
+            sticker = await guard(ctx.guild.fetch_sticker(sticker_id), action="Sticker laden")
+        except ApiError:
+            sticker = None
+    if sticker is None:
+        raise ApiError.not_found(
+            f"Sticker {sticker_id} nicht gefunden.",
+            code="STICKER_NOT_FOUND",
+        )
+    data = await ctx.body()
+    kwargs: Dict[str, Any] = {}
+    if "name" in data:
+        kwargs["name"] = parse_str(data["name"], field="name", min_length=2, max_length=30, allow_empty=False)
+    if "description" in data:
+        kwargs["description"] = parse_str(data["description"], field="description", min_length=2, max_length=100, allow_empty=False)
+    if "emoji" in data:
+        kwargs["emoji"] = parse_str(data["emoji"], field="emoji", max_length=200, allow_empty=False)
+    if not kwargs:
+        raise ApiError.bad_request("Nichts zu tun: 'name', 'description' und/oder 'emoji' angeben.", code="NO_CHANGES")
+    kwargs["reason"] = ctx.reason(data, default=f"Sticker '{sticker.name}' bearbeitet (Arena AI)")
+    updated = await guard(sticker.edit(**kwargs), action=f"Sticker '{sticker.name}' bearbeiten")
+    await ctx.settle(0.4)
+    return {"sticker": serialize_sticker(updated or sticker), "id": sf(sticker_id)}
 
 
 @route(
