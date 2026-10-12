@@ -18,16 +18,17 @@
 2. [Schnellstart (≈ 15 Minuten)](#schnellstart)
 3. [Betrieb auf einem eigenen Server (VPS / Fly.io / Proxy)](#betrieb-auf-einem-eigenen-server)
 4. [Der `/connect`-Command](#der-connect-command)
-5. [Owner-Features: Presence, Adminpanel & Benachrichtigungen](#owner-features)
-6. [Sicherheitsmodell](#sicherheitsmodell)
-7. [Die REST-API](#die-rest-api)
-8. [Die Console](#die-console)
-9. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
-10. [Konfiguration](#konfiguration)
-11. [Lokal entwickeln](#lokal-entwickeln)
-12. [Tests](#tests)
-13. [Fehlerbehebung](#fehlerbehebung)
-14. [Projektstruktur](#projektstruktur)
+5. [Der `/manage_database`-Command & Turso](#der-manage_database-command)
+6. [Owner-Features: Presence, Adminpanel & Benachrichtigungen](#owner-features)
+7. [Sicherheitsmodell](#sicherheitsmodell)
+8. [Die REST-API](#die-rest-api)
+9. [Die Console](#die-console)
+10. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
+11. [Konfiguration](#konfiguration)
+12. [Lokal entwickeln](#lokal-entwickeln)
+13. [Tests](#tests)
+14. [Fehlerbehebung](#fehlerbehebung)
+15. [Projektstruktur](#projektstruktur)
 
 ---
 
@@ -353,9 +354,24 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 
 ---
 
----
+## Der `/manage_database`-Command & Turso
 
-## Owner-Features: Presence, Adminpanel & Benachrichtigungen
+Um interaktive Server-Systeme wie **Self Roles (Reaction Roles)**, **Willkommensnachrichten**, **Auto-Responder**, **Levels** oder **zeitgesteuerte Cron-Aktionen (z. B. jeden Tag um 5:00 Uhr)** direkt und ohne Drittanbieter-Bots auszuführen, bringt der Bot eine native Integration mit [Turso](https://turso.tech) (libSQL) mit.
+
+### Kostenlose Turso-Datenbank in 2 Minuten:
+1. Registriere dich kostenlos auf [turso.tech](https://turso.tech) (Free Plan: bis zu 9 GB Speicher und 1 Mrd. Lesevorgänge).
+2. Erstelle eine neue Datenbank (z. B. `my-server-db`).
+3. Kopiere die Datenbank-URL (z. B. `libsql://my-server-db-...turso.io`) und erstelle ein Auth-Token (`turso db tokens create ...`).
+4. Führe auf deinem Discord-Server `/manage_database` aus und klicke auf **Datenbank verknüpfen**.
+5. Trage URL und Token in das Modal ein — fertig!
+
+### Features von `/manage_database`:
+- **Live-Speicheranzeige:** Belegter Speicher, Turso-Free-Quota (9 GB) und visuelle Statusübersicht.
+- **System-Verwaltung:** Alle aktiven Systeme (Self Roles, Welcome, Cron, Responder) geordnet einsehen und bei Bedarf mit einem Klick löschen.
+- **Sicher & Isoliert:** Jeder Server hat seine eigene Datenbank. Der Bot speichert die Server-Zuordnung in einer Master-Datenbank und hält Konfigurationen im schnellen In-Memory-Cache.
+- **Arena AI Anbindung:** Fordert ein Nutzer Arena AI auf, Self Roles oder automatisierte Abläufe zu bauen, prüft Arena die Turso-Verbindung (`GET /api/v1/database/status`). Ist noch keine Datenbank verknüpft, stoppt Arena sofort und bittet den Admin, `/manage_database` auf Discord auszuführen. Sobald verknüpft, registriert Arena die Trigger und Aktionen automatisch über `POST /api/v1/systems`!
+
+---
 
 Wer den Bot betreibt, will den Überblick behalten — ohne Discord Developer
 Portal oder Render-Logs zu öffnen. Drei Dinge laufen von selbst:
@@ -988,7 +1004,7 @@ AIDiscordServerEinrichten/
 ├── bot/
 │   ├── main.py              Einstiegspunkt: Bot + Web-Server in einem Loop
 │   ├── __main__.py          python -m bot
-│   ├── discord_bot.py       /connect, privates /adminpanel, Container-V2-Buttons, Presence, Owner-DMs
+│   ├── discord_bot.py       /connect, /manage_database, privates /adminpanel, Container-V2-Buttons, Gateway-Events
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
@@ -997,6 +1013,7 @@ AIDiscordServerEinrichten/
 │   ├── serializers.py       discord.py-Objekte → JSON-sichere Dicts
 │   ├── util.py              Parsing: IDs, Farben, Permissions, Enums, Overwrites
 │   ├── web_errors.py        ApiError mit code/message/hint/status
+│   ├── turso/               Turso libSQL-Client, Master-DB, Guild-DB Manager, Trigger-Engine & Service
 │   └── web/
 │       ├── app.py           aiohttp-App, Middleware, Rate-Limit, CORS
 │       ├── console.py       Das Dashboard (eine HTML-Datei, kein Build)
@@ -1004,10 +1021,10 @@ AIDiscordServerEinrichten/
 │       ├── registry.py      @route-Dekorator + Endpoint-Verzeichnis
 │       ├── channel_ops.py   Kanäle anlegen/bearbeiten/auflösen
 │       ├── message_ops.py   Nachrichten, Embeds, Komponenten
-│       ├── webhook_ops.py   Webhook-Personen + echte Mentions statt Platzhalter
+│       ├── webhook_ops.py   Webhook-Personen (wait=True) + echte Mentions statt Platzhalter
 │       ├── images.py        Icons/Banner aus URL, Base64 oder Emoji
 │       └── routes/
-│           ├── meta.py      health, capabilities, me, session, prompt, snapshot
+│           ├── meta.py      health, capabilities, me, session, prompt, snapshot, bot profile (/bot)
 │           ├── guild.py     Server-Einstellungen, Welcome, Onboarding, Widget
 │           ├── channels.py  Kanäle, Kategorien, Threads, Positionen
 │           ├── roles.py     Rollen, Positionen, Vorlagen
@@ -1019,10 +1036,12 @@ AIDiscordServerEinrichten/
 │           ├── expressions.py Emojis und Sticker
 │           ├── invites.py   Invites auflisten, anlegen, aufräumen
 │           ├── events.py    Scheduled Events
+│           ├── systems.py   Turso-Datenbankstatus, Queries, Variablen & native Systeme
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
 │   ├── smoke_test.py        283 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 201 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── login_recovery_test.py 202 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   └── turso_systems_test.py Turso Client, Master-DB, Trigger-Engine & REST-APIs
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile

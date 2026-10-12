@@ -228,6 +228,13 @@ class Ctx:
     def bot_member(self) -> Optional[discord.Member]:
         return self.guild.me
 
+    @property
+    def turso(self) -> Any:
+        state = getattr(self.client, "state", None)
+        if state is None and hasattr(self, "request") and APP_CTX_KEY in self.request.app:
+            state = self.request.app[APP_CTX_KEY]
+        return getattr(state, "turso_service", None)
+
     # ── Scope ────────────────────────────────────────────────────────────────
     def require(self, scope: str) -> None:
         if self.session is None:

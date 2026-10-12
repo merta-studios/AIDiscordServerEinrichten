@@ -13,6 +13,7 @@ beschreiben kann: ``content``, ``embeds``, ``components`` (Buttons),
 from __future__ import annotations
 
 import datetime as _dt
+import io
 import os
 import re
 
@@ -356,7 +357,7 @@ async def download_attachments(
             )
         files.append(
             discord.File(
-                payload,
+                io.BytesIO(payload),
                 filename=filename,
                 spoiler=bool(parse_bool(entry.get("spoiler"), field=f"{where}.spoiler", default=False)),
                 description=parse_str(entry.get("description"), field=f"{where}.description",

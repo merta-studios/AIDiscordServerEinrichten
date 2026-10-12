@@ -146,6 +146,14 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("Housekeeping-Fehler: %s", exc)
 
+        try:
+            client = state.client
+            turso_srv = getattr(state, "turso_service", None)
+            if client and getattr(client, "user", None) and turso_srv:
+                await turso_srv.engine.check_cron_triggers(client)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Cron-Trigger-Fehler: %s", exc)
+
         now = time.monotonic()
         if now - last_beat >= 300:
             last_beat = now

@@ -160,7 +160,7 @@ async def send_as_webhook(
         send_kwargs["avatar_url"] = avatar_text
 
     message = await guard(
-        hook.send(**send_kwargs),
+        hook.send(**send_kwargs, wait=True),
         action=f"Webhook-Nachricht als '{send_kwargs['username']}' senden",
     )
     return message, notes
