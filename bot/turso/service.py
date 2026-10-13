@@ -37,6 +37,80 @@ class TursoService:
         record = await self.master.get_guild_db(guild_id)
         return record is not None and bool(record.database_url)
 
+    async def list_reusable_databases_for_user(
+        self, user_id: int, exclude_guild_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Datenbanken, die ein Admin auf anderen Servern eingerichtet hat und
+        auf diesem Server wiederverwenden könnte (für den blauen Button).
+
+        Es zählt, WER die Zugangsdaten eingegeben hat (``configured_by_id``)
+        und dass die Datenbank auf einem anderen Server **weiterhin aktiv
+        eingestellt** ist. Pro URL nur ein Eintrag (mehrere Server auf derselben
+        geteilten DB würden sonst den Button mehrfach anzeigen).
+        """
+        records = await self.master.list_by_user(str(user_id))
+        output: List[Dict[str, Any]] = []
+        seen_urls: set = set()
+        for r in records:
+            if exclude_guild_id is not None and r.guild_id == exclude_guild_id:
+                continue
+            if not r.database_url or r.database_url in seen_urls:
+                continue
+            seen_urls.add(r.database_url)
+            masked_url = r.database_url.split("@")[-1] if "@" in r.database_url else r.database_url
+            output.append({
+                "source_guild_id": r.guild_id,
+                "source_guild_name": r.guild_name,
+                "database_url": r.database_url,
+                "database_url_masked": masked_url,
+                "configured_by": r.configured_by,
+                "configured_at": r.created_at,
+            })
+        return output
+
+    async def reuse_guild_database(
+        self,
+        guild_id: int,
+        guild_name: str,
+        source_guild_id: int,
+        configured_by: str = "",
+        configured_by_id: str = "",
+    ) -> Tuple[bool, str]:
+        """
+        Verknüpft einen Server mit der **bereits vorhandenen** Datenbank eines
+        anderen Servers (der blaue Wiederverwenden-Button).
+
+        Die Zugangsdaten werden vom Master-Eintrag des Quell-Servers kopiert
+        und wie eine Neueinrichtung getestet und initialisiert. Zusätzlich wird
+        geprüft, dass der anfragende Admin auch wirklich derjenige ist, der die
+        Quelldatenbank eingerichtet hat — die Daten eines fremden Admins lassen
+        sich so nicht übernehmen.
+        """
+        record = await self.master.get_guild_db(source_guild_id)
+        if record is None or not record.database_url:
+            return False, (
+                "Die gespeicherte Datenbank wurde in der Zwischenzeit getrennt "
+                "oder der andere Server ist nicht mehr eingerichtet."
+            )
+        source_owner = record.owner_user_id
+        if source_owner and configured_by_id and source_owner != str(configured_by_id):
+            log.warning(
+                "Wiederverwenden abgelehnt: Admin %s versuchte die Datenbank von "
+                "Guild %s (eingerichtet von %s) zu übernehmen.",
+                configured_by_id, source_guild_id, source_owner,
+            )
+            return False, "Diese Datenbank wurde von einem anderen Admin eingerichtet."
+
+        return await self.connect_guild_database(
+            guild_id=guild_id,
+            guild_name=guild_name,
+            database_url=record.database_url,
+            auth_token=record.auth_token,
+            configured_by=configured_by,
+            configured_by_id=configured_by_id,
+        )
+
     async def connect_guild_database(
         self,
         guild_id: int,
@@ -44,6 +118,7 @@ class TursoService:
         database_url: str,
         auth_token: str,
         configured_by: str = "",
+        configured_by_id: str = "",
     ) -> Tuple[bool, str]:
         """Testet die Verbindung, initialisiert das Schema und verknüpft die Datenbank."""
         test_client = TursoClient(database_url.strip(), auth_token.strip())
@@ -63,10 +138,12 @@ class TursoService:
                 database_url=database_url.strip(),
                 auth_token=auth_token.strip(),
                 configured_by=configured_by,
+                configured_by_id=configured_by_id,
             )
 
-            # 4. Engine-Cache invalidieren
-            self.engine.invalidate(guild_id)
+            # 4. Engine-Cache invalidieren — bei geteilten Datenbanken für ALLE
+            #    beteiligten Server (sie sehen dieselben Systeme).
+            await self._invalidate_guilds_sharing_database(database_url)
             return True, "Erfolgreich mit Turso-Datenbank verbunden und Schema initialisiert!"
         except Exception as exc:
             log.warning("Fehler beim Verbinden der Turso-DB für %s: %s", guild_id, exc)
@@ -74,10 +151,75 @@ class TursoService:
         finally:
             await test_client.close()
 
+    async def _invalidate_guilds_sharing_database(self, database_url: str) -> None:
+        """Invalidiert den Engine-Cache aller Server, die diese Datenbank nutzen."""
+        try:
+            for r in await self.master.list_guilds_by_database(database_url):
+                self.engine.invalidate(r.guild_id)
+        except Exception as exc:  # noqa: BLE001 — Cache-Invalidierung darf nie crashen
+            log.debug("Geteilte Cache-Invalidierung fehlgeschlagen: %s", exc)
+
     async def disconnect_guild_database(self, guild_id: int) -> bool:
         success = await self.master.delete_guild_db(guild_id)
         self.engine.invalidate(guild_id)
+        await self.guild_manager.close_guild(guild_id)
         return success
+
+    async def purge_guild(self, guild_id: int) -> Dict[str, Any]:
+        """
+        Löscht **alle** Daten eines Servers — der Aufruf, wenn der Bot den
+        Server verlässt (Kick, Ban oder freiwillig).
+
+        * Die Verknüpfung in der Master-DB wird entfernt.
+        * Ist die Datenbank **exklusiv** (kein anderer Server teilt sie), werden
+          zusätzlich alle Tabellen der Datenbank komplett geleert.
+        * Bei **geteilten** Datenbanken bleiben die Daten für die anderen
+          Server selbstverständlich bestehen — nur die Verknüpfung verschwindet.
+        """
+        record = await self.master.get_guild_db(guild_id)
+        sharers: List[GuildDbRecord] = []
+        dropped_tables: List[str] = []
+
+        if record is not None:
+            sharers = await self.master.list_guilds_by_database(record.database_url, exclude_guild_id=guild_id)
+
+            if not sharers:
+                # Exklusive Datenbank → vollständig leeren, damit keine
+                # Serverdaten (Systeme, Variablen, eigene Tabellen) zurückbleiben.
+                client = await self.guild_manager.get_client_for_guild(guild_id)
+                if client is not None:
+                    try:
+                        res = await client.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
+                        )
+                        tables = [str(r.get("name")) for r in res.rows if r.get("name")]
+                        for table in tables:
+                            safe = table.replace('"', '""')
+                            try:
+                                await client.execute(f'DROP TABLE IF EXISTS "{safe}";')
+                                dropped_tables.append(table)
+                            except Exception as exc:  # noqa: BLE001 — einzelne Tabelle darf nicht blockieren
+                                log.warning("Tabelle '%s' konnte nicht gelöscht werden: %s", table, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Tabellen der exklusiven DB für Guild %s konnten nicht ermittelt werden: %s",
+                                    guild_id, exc)
+
+        await self.master.delete_guild_db(guild_id)
+        await self.guild_manager.close_guild(guild_id)
+        self.engine.invalidate(guild_id)
+
+        summary = {
+            "had_database": record is not None,
+            "exclusive": bool(record is not None and not sharers),
+            "shared_with": [r.guild_id for r in sharers],
+            "dropped_tables": dropped_tables,
+        }
+        log.info(
+            "Serverdaten für Guild %s bereinigt: DB-Verknüpfung entfernt=%s, "
+            "exklusive DB geleert=%s, Tabellen=%s, geteilt mit=%s",
+            guild_id, record is not None, bool(dropped_tables), dropped_tables, summary["shared_with"],
+        )
+        return summary
 
     async def get_guild_status(self, guild_id: int) -> Dict[str, Any]:
         """Liefert den kompletten Status: Verbindung, Speicher, Tabellen, Systeme."""
@@ -108,12 +250,21 @@ class TursoService:
         if "@" in raw_url:
             masked_url = raw_url.split("@")[-1]
 
+        # Wird diese Datenbank mit anderen Servern geteilt?
+        try:
+            sharers = await self.master.list_guilds_by_database(raw_url, exclude_guild_id=guild_id)
+        except Exception:  # noqa: BLE001 — Anzeige-Feature darf den Status nie sprengen
+            sharers = []
+
         return {
             "configured": True,
             "database_url": masked_url,
             "configured_by": record.configured_by,
+            "configured_by_id": record.configured_by_id,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
+            "shared": bool(sharers),
+            "shared_with": [{"guild_id": str(r.guild_id), "guild_name": r.guild_name} for r in sharers],
             "storage": storage_stats,
             "systems_count": len(systems),
             "systems": systems,
@@ -256,8 +407,15 @@ class TursoService:
                     trig_id, sys_id, event_type, filter_str, action_str, trig_enabled, now_str
                 ])
 
-        # Engine-Cache invalidieren
+        # Engine-Cache invalidieren — bei geteilten Datenbanken für ALLE
+        # beteiligten Server (der Trigger einer Shared-DB gilt überall).
         self.engine.invalidate(guild_id)
+        try:
+            record_now = await self.master.get_guild_db(guild_id)
+            if record_now is not None:
+                await self._invalidate_guilds_sharing_database(record_now.database_url)
+        except Exception:  # noqa: BLE001 — Cache-Invalidierung darf nie crashen
+            pass
         saved = await self.get_system(guild_id, sys_id)
         return saved or {}
 
@@ -269,6 +427,12 @@ class TursoService:
         await client.execute("DELETE FROM triggers WHERE system_id = ?;", [system_id])
         res = await client.execute("DELETE FROM systems WHERE id = ?;", [system_id])
         self.engine.invalidate(guild_id)
+        try:
+            record_now = await self.master.get_guild_db(guild_id)
+            if record_now is not None:
+                await self._invalidate_guilds_sharing_database(record_now.database_url)
+        except Exception:  # noqa: BLE001 — Cache-Invalidierung darf nie crashen
+            pass
         return res.affected_rows > 0
 
     # ── Direkte SQL-Abfragen & Variablen ─────────────────────────────────────

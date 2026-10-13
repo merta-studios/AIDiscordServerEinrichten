@@ -17,7 +17,7 @@ import aiohttp
 import discord
 from bot.config import Config
 from bot.turso.client import TursoClient, format_bytes, normalize_turso_url
-from bot.turso.master import MasterTursoStore
+from bot.turso.master import MasterTursoStore, legacy_configured_user_id
 from bot.turso.guild_db import GuildDatabaseManager
 from bot.turso.engine import TursoSystemsEngine, _render_template
 from bot.turso.service import TursoService
@@ -175,6 +175,94 @@ async def run_tests() -> None:
         unconf_status = await service.get_guild_status(123)
         check("Status nach Trennung configured: false", unconf_status["configured"] is False)
         check("Status enthält setup_command /manage_database", unconf_status["setup_command"] == "/manage_database")
+
+        print("\n── Mehrere Server teilen sich eine Datenbank ─────────────────")
+        admin_id = "555000111222333444"
+        shared_db_path = f"sqlite:///{test_dir}/guild_shared.db"
+        ok, msg = await service.connect_guild_database(
+            guild_id=201, guild_name="Server A", database_url=shared_db_path, auth_token="",
+            configured_by=f"Klaus ({admin_id})", configured_by_id=admin_id,
+        )
+        check("Server A richtet DB ein (configured_by_id gespeichert)", ok, msg)
+
+        # Wiederverwenden-Liste: derselbe Admin sieht seine DB auf einem anderen Server
+        reusable = await service.list_reusable_databases_for_user(int(admin_id), exclude_guild_id=202)
+        check("Wiederverwenden-Liste enthält Server A",
+              len(reusable) == 1 and reusable[0]["source_guild_id"] == 201, str(reusable))
+        # Ein fremder Admin sieht sie nicht
+        check("Fremder Admin sieht keine fremde DB",
+              len(await service.list_reusable_databases_for_user(999)) == 0)
+        # Legacy-Erkennung über den Freitext ("Name (id)")
+        check("legacy_configured_user_id parst Freitext",
+              legacy_configured_user_id(f"Klaus ({admin_id})") == admin_id)
+        by_user = await service.master.list_by_user(admin_id)
+        check("list_by_user findet den Eintrag (exakte ID)", len(by_user) == 1 and by_user[0].guild_id == 201)
+
+        # Server B übernimmt die Datenbank per Wiederverwenden (blauer Button)
+        ok, msg = await service.reuse_guild_database(
+            guild_id=202, guild_name="Server B", source_guild_id=201,
+            configured_by=f"Klaus ({admin_id})", configured_by_id=admin_id,
+        )
+        check("Server B nutzt die Datenbank von Server A wieder", ok, msg)
+        check("Beide Server konfiguriert",
+              await service.is_guild_db_configured(201) and await service.is_guild_db_configured(202))
+
+        # Ein fremder Admin darf die DB von Server A NICHT übernehmen
+        ok_denied, msg_denied = await service.reuse_guild_database(
+            guild_id=203, guild_name="Server C", source_guild_id=201,
+            configured_by="Fremd (999)", configured_by_id="999",
+        )
+        check("Fremd-Übernahme abgelehnt", not ok_denied and "anderen Admin" in msg_denied, msg_denied)
+
+        # Geteilte DB → gemeinsamer Client (eine Verbindung für beide Server)
+        c_a = await service.guild_manager.get_client_for_guild(201)
+        c_b = await service.guild_manager.get_client_for_guild(202)
+        check("Geteilte DB → gemeinsamer Client", c_a is c_b)
+
+        # Auf Server B angelegte Systeme sind auf Server A sichtbar (gleiche DB)
+        await service.save_system(202, {
+            "id": "shared_welcome", "name": "Geteilt", "type": "welcome",
+            "triggers": [{"event": "member_join",
+                          "action": {"type": "send_message", "channel_id": "1", "content": "Hi"}}],
+        })
+        triggers_a = await service.engine.get_active_triggers(201)
+        check("System über Server A sichtbar (geteilte DB)",
+              any(t["system_id"] == "shared_welcome" for t in triggers_a), str(triggers_a))
+
+        # Eine Änderung über B invalidiert den Trigger-Cache auch für A
+        await service.save_system(202, {"id": "shared_welcome", "name": "Geteilt", "type": "welcome",
+                                        "enabled": False})
+        triggers_a = await service.engine.get_active_triggers(201)
+        check("Deaktivierung über B greift sofort auch für A",
+              all(t["system_id"] != "shared_welcome" for t in triggers_a), str(triggers_a))
+
+        # Status zeigt die Teilung
+        status_a = await service.get_guild_status(201)
+        check("Status: shared_with enthält Server B",
+              status_a.get("shared") is True
+              and any(s["guild_id"] == "202" for s in status_a.get("shared_with", [])),
+              str(status_a.get("shared_with")))
+        check("Status: configured_by_id gesetzt", status_a.get("configured_by_id") == admin_id)
+
+        # Server B verlässt den Bot → geteilte DB bleibt, nur Verknüpfung weg
+        summary_b = await service.purge_guild(202)
+        check("Purge B (geteilt): Verknüpfung entfernt",
+              summary_b["had_database"] and not summary_b["exclusive"], str(summary_b))
+        check("Purge B (geteilt): keine Tabellen gelöscht", summary_b["dropped_tables"] == [], str(summary_b))
+        check("Server A weiterhin konfiguriert", await service.is_guild_db_configured(201))
+        systems_a_after = await service.list_systems(201)
+        check("Daten für Server A noch vorhanden",
+              any(s["id"] == "shared_welcome" for s in systems_a_after))
+
+        # Server A verlässt den Bot → exklusive DB wird vollständig geleert
+        summary_a = await service.purge_guild(201)
+        check("Purge A (exklusiv): Tabellen gelöscht",
+              summary_a["exclusive"] and len(summary_a["dropped_tables"]) >= 4, str(summary_a))
+        check("Server A nicht mehr konfiguriert", not await service.is_guild_db_configured(201))
+        raw = TursoClient(shared_db_path, "")
+        res = await raw.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        check("Physische DB vollständig geleert", len(res.rows) == 0, str(res.rows))
+        await raw.close()
 
         await service.guild_manager.close_all()
 
