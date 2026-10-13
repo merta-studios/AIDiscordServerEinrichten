@@ -39,9 +39,17 @@ Der Zugriff wird direkt in ``/connect`` über die Buttons verwaltet; separate
 ``/connect | 👀 N eingerichtete Server``. Im Privatchat mit dem Bot gibt es
 ``/adminpanel`` — eine durchsuchbare, blätterbare Server-Liste (sortiert nach
 Mitgliederzahl; Server, auf denen der Owner **nicht** Mitglied ist, stehen mit
-❗️ ganz oben). Der Owner bekommt zusätzlich eine DM, wenn der Bot einem Server
-beitritt oder ihn verlässt (mit bestmöglichem Grund), und der Server-Owner
-erhält beim Beitritt eine Willkommens-DM mit der Kurzanleitung.
+❗️ ganz oben). Die Server-Übersicht zeigt zusätzlich Kanäle, Rollen, Emojis,
+Boosts, Erstellungsdatum, Bot-Rechte und den Datenbank-Status. Der Owner
+bekommt zusätzlich eine DM, wenn der Bot einem Server beitritt oder ihn
+verlässt — der Grund (Kick/Ban inkl. Ausführendem) wird jetzt **live über das
+Gateway** mitgelesen (``GUILD_AUDIT_LOG_ENTRY_CREATE``), solange der Bot noch
+Mitglied ist, und landet so zuverlässig in der DM. Beim Verlassen eines
+Servers werden außerdem alle Daten des Servers gelöscht: aktive KI-Sitzungen
+werden gestoppt und die Datenbank-Verknüpfung entfernt (exklusive
+Server-Datenbanken werden komplett geleert, geteilte bleiben für die anderen
+Server bestehen). Der Server-Owner erhält beim Beitritt eine Willkommens-DM
+mit der Kurzanleitung.
 """
 
 from __future__ import annotations
@@ -97,6 +105,10 @@ CID_DB_DISCONNECT = "relay:v2_db_disconnect"
 CID_DB_REFRESH = "relay:v2_db_refresh"
 CID_DB_SYSTEMS = "relay:v2_db_systems"
 CID_DB_SYS_DEL = "relay:v2_db_sys_del"
+#: Blauer Wiederverwenden-Button: eine auf einem anderen Server bereits
+#: eingerichtete Datenbank auch für diesen Server nutzen. Die Custom-ID
+#: trägt die Quell-Guild-ID: ``relay:v2_db_reuse:<guild_id>``.
+CID_DB_REUSE = "relay:v2_db_reuse"
 
 # Legacy-IDs der Buttons vor dem Components-V2-Upgrade. Nachrichten aus der
 # Zeit vor dem Deploy sollen nicht ins Leere laufen: Ihre Klicks werden auf
@@ -117,6 +129,12 @@ ADMIN_PAGE_SIZE = 10
 #: Max. Länge des Suchbegriffs im Adminpanel — die Custom-IDs der Blätter-
 #: Buttons transportieren ihn mit und sind auf 100 Zeichen begrenzt.
 ADMIN_QUERY_MAX = 40
+
+#: Wie lange (Sekunden) ein per Gateway empfangener Kick/Ban-Grund auf die
+#: zugehörige ``on_guild_remove``-Nachricht wartet. Discord liefert den
+#: Audit-Log-Eintrag typischerweise *vor* GUILD_DELETE; durch das Zeitfenster
+#: funktioniert es auch umgekehrt.
+PENDING_LEAVE_REASON_TTL = 600.0
 
 
 def build_intents(privileged: bool = True) -> discord.Intents:
@@ -256,36 +274,69 @@ def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
     return view
 
 
-def database_unconfigured_view() -> discord.ui.LayoutView:
-    """Container-V2-Nachricht für /manage_database wenn noch keine DB verknüpft ist."""
-    container = discord.ui.Container(
-        discord.ui.TextDisplay(
-            "# 🗄️ Turso-Datenbank einrichten\n"
-            "Für diesen Server ist noch keine Turso-Datenbank verknüpft.\n\n"
-            "**Warum Turso?**\n"
-            "Mit Turso kann Arena AI eigene Server-Systeme völlig autonom für dich "
-            "scripten: **Self Roles / Reaction Roles**, **Willkommensnachrichten & Auto-Rollen**, "
-            "**Auto-Responder**, **Leveling** und **tägliche Timer** (z. B. um 5 Uhr morgens) — "
-            "komplett ohne Drittanbieter-Bots!\n\n"
-            "**100% Kostenlos:**\n"
-            "Turso bietet im kostenlosen Free-Plan **9 GB Speicher** und **1 Milliarde Abfragen/Monat** "
-            "(keine Kreditkarte erforderlich).\n\n"
-            "**Schritt-für-Schritt Anleitung:**\n"
-            "1️⃣ Erstelle einen Account auf https://turso.tech (Free Tier)\n"
-            "2️⃣ Erstelle eine neue Datenbank (Name frei wählbar, z.B. für diesen Server)\n"
-            "3️⃣ Kopiere die **Database URL** (`https://...` oder `libsql://...`)\n"
-            "4️⃣ Erzeuge ein **Auth Token** und kopiere es\n"
-            "5️⃣ Klicke unten auf **„Datenbank verknüpfen“** und füge beides ein!"
+def database_unconfigured_view(
+    reusable: Optional[List[Dict[str, Any]]] = None,
+) -> discord.ui.LayoutView:
+    """
+    Container-V2-Nachricht für /manage_database wenn noch keine DB verknüpft ist.
+
+    Hat der ausführende Admin auf einem **anderen** Server bereits eine
+    Datenbank eingerichtet (und sie dort noch aktiv), erscheint neben dem
+    grünen „Datenbank verknüpfen“-Button ein **blauer** Wiederverwenden-Button
+    pro gespeicherter Datenbank — ein Klick verbindet diesen Server mit der
+    bestehenden Datenbank, ohne dass URL und Token neu eingetippt werden müssen.
+    """
+    reusable = [r for r in (reusable or []) if r.get("source_guild_id") is not None][:4]
+
+    intro_text = (
+        "# 🗄️ Turso-Datenbank einrichten\n"
+        "Für diesen Server ist noch keine Turso-Datenbank verknüpft.\n\n"
+        "**Warum Turso?**\n"
+        "Mit Turso kann Arena AI eigene Server-Systeme völlig autonom für dich "
+        "scripten: **Self Roles / Reaction Roles**, **Willkommensnachrichten & Auto-Rollen**, "
+        "**Auto-Responder**, **Leveling** und **tägliche Timer** (z. B. um 5 Uhr morgens) — "
+        "komplett ohne Drittanbieter-Bots!\n\n"
+        "**100% Kostenlos:**\n"
+        "Turso bietet im kostenlosen Free-Plan **9 GB Speicher** und **1 Milliarde Abfragen/Monat** "
+        "(keine Kreditkarte erforderlich).\n\n"
+        "**Schritt-für-Schritt Anleitung:**\n"
+        "1️⃣ Erstelle einen Account auf https://turso.tech (Free Tier)\n"
+        "2️⃣ Erstelle eine neue Datenbank (Name frei wählbar, z.B. für diesen Server)\n"
+        "3️⃣ Kopiere die **Database URL** (`https://...` oder `libsql://...`)\n"
+        "4️⃣ Erzeuge ein **Auth Token** und kopiere es\n"
+        "5️⃣ Klicke unten auf **„Datenbank verknüpfen“** und füge beides ein!"
+    )
+    if reusable:
+        names = ", ".join(f"**{r.get('source_guild_name') or 'Server'}**" for r in reusable)
+        intro_text += (
+            f"\n\n♻️ **Bereits eingerichtet:** Du hast auf {names} schon eine Datenbank "
+            "verknüpft — mit dem blauen Button kannst du sie direkt auch für diesen Server "
+            "verwenden (mehrere Server können sich eine Datenbank teilen)."
+        )
+
+    buttons = [
+        discord.ui.Button(
+            label="Datenbank verknüpfen",
+            emoji="🗄️",
+            style=discord.ButtonStyle.success,
+            custom_id=CID_DB_CONNECT,
         ),
-        discord.ui.Separator(),
-        discord.ui.ActionRow(
+    ]
+    for entry in reusable:
+        source_name = entry.get("source_guild_name") or "anderem Server"
+        buttons.append(
             discord.ui.Button(
-                label="Datenbank verknüpfen",
-                emoji="🗄️",
-                style=discord.ButtonStyle.success,
-                custom_id=CID_DB_CONNECT,
-            )
-        ),
+                label=f"DB von „{source_name}“ nutzen"[:80],
+                emoji="♻️",
+                style=discord.ButtonStyle.primary,  # blau
+                custom_id=f"{CID_DB_REUSE}:{entry['source_guild_id']}",
+            ),
+        )
+
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(intro_text),
+        discord.ui.Separator(),
+        discord.ui.ActionRow(*buttons),
         accent_colour=WELCOME_ACCENT,
     )
     view = discord.ui.LayoutView(timeout=None)
@@ -426,6 +477,7 @@ class TursoConnectModal(discord.ui.Modal, title="🗄️ Turso-Datenbank verknü
             database_url=url,
             auth_token=token,
             configured_by=f"{interaction.user.display_name} ({interaction.user.id})",
+            configured_by_id=str(interaction.user.id),
         )
         if not ok:
             await interaction.followup.send(f"❌ {msg}", ephemeral=True)
@@ -471,6 +523,7 @@ def _button_registration_view() -> discord.ui.LayoutView:
                 discord.ui.Button(label="DB Trennen", custom_id=CID_DB_DISCONNECT),
                 discord.ui.Button(label="DB Refresh", custom_id=CID_DB_REFRESH),
                 discord.ui.Button(label="DB Systeme", custom_id=CID_DB_SYSTEMS),
+                discord.ui.Button(label="DB Wiederverwenden", custom_id=f"{CID_DB_REUSE}:0"),
             ),
         )
     )
@@ -651,6 +704,80 @@ def _admin_sessions_detail_text(sessions: List[Any]) -> str:
     return "\n".join(lines)[:1000]
 
 
+def _admin_guild_stats_lines(guild: discord.Guild) -> List[str]:
+    """
+    Statistik-Zeilen der Server-Übersicht: Kanäle, Rollen, Emojis, Boosts u. v. m.
+
+    Alles reine Cache-Blicke (keine REST-Aufrufe) — die Übersicht bleibt also
+    auch bei ausgefallener Discord-API bedienbar.
+    """
+    lines: List[str] = []
+    created = getattr(guild, "created_at", None)
+    if created is not None:
+        lines.append(f"**Erstellt:** {created.strftime('%d.%m.%Y')} · **Server-ID:** `{guild.id}`")
+
+    categories = len(getattr(guild, "categories", []) or [])
+    text_ch = len(getattr(guild, "text_channels", []) or [])
+    voice_ch = len(getattr(guild, "voice_channels", []) or [])
+    stage_ch = len(getattr(guild, "stage_channels", []) or [])
+    forum_ch = len(getattr(guild, "forums", []) or [])
+    channel_parts = [f"{categories} 📁", f"{text_ch} 💬", f"{voice_ch} 🔊"]
+    if stage_ch:
+        channel_parts.append(f"{stage_ch} 🎤")
+    if forum_ch:
+        channel_parts.append(f"{forum_ch} 🪧")
+    lines.append("**Kanäle:** " + " · ".join(channel_parts))
+
+    roles = len(getattr(guild, "roles", []) or [])
+    emojis = len(getattr(guild, "emojis", []) or [])
+    stickers = len(getattr(guild, "stickers", []) or [])
+    lines.append(f"**Rollen:** {roles} · **Emojis:** {emojis} · **Sticker:** {stickers}")
+
+    tier = getattr(guild, "premium_tier", 0) or 0
+    boosts = getattr(guild, "premium_subscription_count", 0) or 0
+    if boosts or tier:
+        lines.append(f"**Boosts:** Level {tier} · {boosts} Boost(s)")
+
+    me = getattr(guild, "me", None)
+    if me is not None:
+        is_admin = bool(getattr(me, "guild_permissions", None) and me.guild_permissions.administrator)
+        top_role = getattr(me, "top_role", None)
+        role_name = getattr(top_role, "name", "?") if top_role is not None else "?"
+        lines.append(
+            f"**Bot-Rolle:** {role_name} · " + ("✅ Administrator" if is_admin else "⚠️ KEIN Administrator")
+        )
+    return lines
+
+
+def _admin_db_status_text(db_status: Optional[Dict[str, Any]]) -> str:
+    """Datenbank-Sektion der Server-Übersicht (Turso-Status inkl. Teilen-Info)."""
+    if not db_status or not db_status.get("configured"):
+        return (
+            "**🗄️ Server-Datenbank:**\n"
+            "⚪ Nicht eingerichtet — der Server-Owner kann mit `/manage_database` "
+            "kostenlos eine Turso-Datenbank verknüpfen."
+        )
+    storage = db_status.get("storage") or {}
+    pct = storage.get("usage_percent", 0.0)
+    used = storage.get("used_formatted", "0 B")
+    systems_count = db_status.get("systems_count", len(db_status.get("systems", []) or []))
+    by = db_status.get("configured_by") or "unbekannt"
+    updated = str(db_status.get("updated_at") or "")[:10]
+    lines = [
+        f"🟢 Verbunden (`{db_status.get('database_url', 'Turso')}`)",
+        f"• **{systems_count}** System(e) · Speicher: `{used}` ({pct}%)",
+        f"• Eingerichtet von **{by}**" + (f" am {updated}" if updated else ""),
+    ]
+    if db_status.get("shared"):
+        shared_names = ", ".join(
+            s.get("guild_name") or f"`{s.get('guild_id')}`" for s in (db_status.get("shared_with") or [])
+        )
+        lines.append(f"• 🔗 **Geteilte Datenbank** mit: {shared_names or 'anderen Servern'}")
+    else:
+        lines.append("• Exklusive Datenbank (nur dieser Server)")
+    return "**🗄️ Server-Datenbank:**\n" + "\n".join(lines)
+
+
 def admin_guild_detail_view(
     guild: discord.Guild,
     *,
@@ -661,6 +788,7 @@ def admin_guild_detail_view(
     query: str,
     invite_url: Optional[str] = None,
     notice: Optional[str] = None,
+    db_status: Optional[Dict[str, Any]] = None,
 ) -> discord.ui.LayoutView:
     """Server-Übersicht (Container V2) im Adminpanel."""
     count = f"{(guild.member_count or 0):,}".replace(",", ".")
@@ -681,6 +809,8 @@ def admin_guild_detail_view(
             details,
         ),
         discord.ui.Separator(),
+        discord.ui.TextDisplay("**📊 Server-Details:**\n" + "\n".join(_admin_guild_stats_lines(guild))),
+        discord.ui.Separator(),
     ]
 
     if sessions:
@@ -697,6 +827,11 @@ def admin_guild_detail_view(
                 "⚪ Keine aktiven Tokens — Bridge für diesen Server ist nicht verbunden."
             )
         )
+
+    components.extend([
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(_admin_db_status_text(db_status)),
+    ])
 
     if invite_url:
         components.extend([
@@ -872,11 +1007,12 @@ def guild_join_notify_view(guild: discord.Guild, owner: Optional[Any]) -> discor
 
 
 def guild_remove_notify_view(
-    guild: discord.Guild, owner: Optional[Any], reason: str
+    guild: discord.Guild, owner: Optional[Any], reason: str,
+    *, cleanup: Optional[Dict[str, Any]] = None,
 ) -> discord.ui.LayoutView:
     """DM an den Bot-Owner: der Bot hat einen Server verlassen (mit bestmöglichem Grund)."""
     count = f"{(guild.member_count or 0):,}".replace(",", ".")
-    container = discord.ui.Container(
+    items: List[Any] = [
         _guild_header_section(
             guild,
             f"🔴 Server verlassen: {guild.name}",
@@ -884,8 +1020,26 @@ def guild_remove_notify_view(
         ),
         discord.ui.Separator(),
         discord.ui.TextDisplay(f"**Grund:** {reason}"),
-        accent_colour=ERR_COLOR,
-    )
+    ]
+    if cleanup is not None:
+        summary = cleanup.get("database_summary") or {}
+        parts: List[str] = [f"🧹 **Aufräumen:** {cleanup.get('sessions_revoked', 0)} KI-Verbindung(en) gestoppt,"]
+        if cleanup.get("database_purged"):
+            if summary.get("exclusive"):
+                parts.append(
+                    f"Datenbank komplett gelöscht ({len(summary.get('dropped_tables', []))} Tabellen geleert)."
+                )
+            else:
+                shared = summary.get("shared_with") or []
+                parts.append(
+                    "Datenbank-Verknüpfung entfernt (die Datenbank wird von anderen Servern "
+                    f"weiterverwendet: {', '.join(str(s) for s in shared) or 'andere'})."
+                )
+        else:
+            parts.append("keine Datenbank-Verknüpfung vorhanden.")
+        items.append(discord.ui.Separator())
+        items.append(discord.ui.TextDisplay(" ".join(parts)))
+    container = discord.ui.Container(*items, accent_colour=ERR_COLOR)
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     return view
@@ -969,6 +1123,11 @@ class RelayClient(discord.Client):
         self.state = state
         self.tree = app_commands.CommandTree(self)
         self.ready_at: Optional[Any] = None
+        # Kick/Ban-Gründe, die live per Gateway empfangen wurden (siehe
+        # ``on_audit_log_entry_create``): guild_id -> {"action", "reason", "by", "ts"}.
+        # Nach dem Verlassen des Servers hat der Bot keinen Audit-Log-Zugriff
+        # mehr — deshalb wird der Grund abgehört, SOLANGE er noch Mitglied ist.
+        self._pending_leave_reasons: Dict[int, Dict[str, Any]] = {}
         self.tree.on_error = self._on_command_error  # type: ignore[assignment]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -1109,11 +1268,75 @@ class RelayClient(discord.Client):
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         log.info("Server verlassen: %s (ID %s)", guild.name, guild.id)
-        await self._update_presence()
         try:
-            await self._notify_owner_remove(guild)
+            await self._update_presence()
+        except Exception as exc:  # noqa: BLE001 — Presence darf die Bereinigung nie blockieren
+            log.debug("Presence konnte nach Leave nicht aktualisiert werden: %s", exc)
+        cleanup = await self._cleanup_guild_data(guild)
+        try:
+            await self._notify_owner_remove(guild, cleanup=cleanup)
         except Exception as exc:  # noqa: BLE001
             log.warning("Leave-Benachrichtigung fehlgeschlagen: %s", exc)
+
+    async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry) -> None:
+        """
+        Live-Audit-Log: Kick/Ban-Gründe empfangen, **solange** der Bot noch
+        Mitglied ist.
+
+        Das ist der zuverlässige Weg an den Grund zu kommen, den ein Moderator
+        beim Kick/Ban angegeben hat: Nach dem Entfernen wäre der Bot nicht mehr
+        berechtigt, das Audit-Log zu lesen — aber ``GUILD_AUDIT_LOG_ENTRY_CREATE``
+        wird ihm per Gateway geliefert, sobald der Eintrag entsteht. Zielt der
+        Eintrag auf den Bot selbst, merkt er sich Grund und Ausführenden für die
+        Leave-DM (``_leave_reason``).
+        """
+        try:
+            guild = entry.guild
+            if guild is None:
+                return
+            if entry.action not in (discord.AuditLogAction.kick, discord.AuditLogAction.ban):
+                return
+            bot_id = self.user.id if self.user else None
+            target_id = getattr(getattr(entry, "target", None), "id", None)
+            if bot_id is None or target_id != bot_id:
+                return
+            executor = getattr(entry, "user", None)
+            executor_name = getattr(executor, "name", None) or (str(executor) if executor else "")
+            self._pending_leave_reasons[guild.id] = {
+                "action": "kick" if entry.action is discord.AuditLogAction.kick else "ban",
+                "reason": (entry.reason or "").strip(),
+                "by": executor_name,
+                "ts": time.monotonic(),
+            }
+            log.info(
+                "Leave-Grund live empfangen: Bot wird %s auf '%s' (Grund: %s, von %s).",
+                "gekickt" if entry.action is discord.AuditLogAction.kick else "gebannt",
+                guild.name, entry.reason or "(keiner)", executor,
+            )
+        except Exception as exc:  # noqa: BLE001 — Audit-Events dürfen nie crashen
+            log.debug("audit_log_entry_create konnte nicht verarbeitet werden: %s", exc)
+
+    async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User) -> None:
+        """
+        Der Bot selbst wurde gebannt (``GUILD_BAN_ADD``, liefert keinen Grund —
+        der Audit-Log-Eintrag mit Grund folgt typischerweise direkt danach und
+        überschreibt diesen Notizeintrag).
+        """
+        try:
+            if self.user is None or user.id != self.user.id:
+                return
+            existing = self._pending_leave_reasons.get(guild.id)
+            if existing and existing.get("action") == "ban":
+                return
+            self._pending_leave_reasons[guild.id] = {
+                "action": "ban",
+                "reason": "",
+                "by": "",
+                "ts": time.monotonic(),
+            }
+            log.info("Bot wurde auf '%s' gebannt (Audit-Log-Details folgen).", guild.name)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("member_ban konnte nicht verarbeitet werden: %s", exc)
 
     async def on_member_join(self, member: discord.Member) -> None:
         """Turso-Engine: Begrüßungen, Auto-Rollen und Join-Aktionen."""
@@ -1281,16 +1504,39 @@ class RelayClient(discord.Client):
         await self._dm_user(target, server_owner_welcome_view(guild),
                              context=f"Willkommen {guild.id}")
 
+    def _prune_pending_leave_reasons(self) -> None:
+        """Wirft veraltete Kick/Ban-Notizen weg (das Zeitfenster ist abgelaufen)."""
+        now = time.monotonic()
+        stale = [
+            gid for gid, info in self._pending_leave_reasons.items()
+            if now - float(info.get("ts", 0.0)) > PENDING_LEAVE_REASON_TTL
+        ]
+        for gid in stale:
+            self._pending_leave_reasons.pop(gid, None)
+
     async def _leave_reason(self, guild: discord.Guild) -> str:
         """
         Bestmöglicher Grund, warum der Bot den Server verlassen hat.
 
-        Ehrlich gesagt: Nach dem Entfernen hat der Bot **keinen Zugriff mehr**
-        auf das Audit-Log des Servers — der Grund ist deshalb meist nicht
-        ermittelbar. Der Versuch kostet aber nichts (kurzes Zeitfenster, bis
-        Discord die Rechte durchzieht), und wenn er durchgeht, gibt es den
-        echten Grund inklusive Ausführendem.
+        **Primäre Quelle:** der live per Gateway empfangene Kick/Ban-Eintrag
+        (``on_audit_log_entry_create``) — er kommt an, SOLANGE der Bot noch
+        Mitglied ist, und enthält exakt den Grund, den der Moderator angegeben
+        hat, plus Ausführendem.
+
+        **Fallback:** ein letzter Audit-Log-Leseversuch (kostet nichts, klappt
+        aber nach dem Entfernen meist nicht mehr, weil der Bot dann keinen
+        Zugriff mehr hat). Wenn beides nichts liefert, wird das ehrlich gesagt.
         """
+        self._prune_pending_leave_reasons()
+        pending = self._pending_leave_reasons.pop(guild.id, None)
+        if pending:
+            action = "gekickt" if pending.get("action") == "kick" else "gebannt"
+            by = f" von **{pending['by']}**" if pending.get("by") else ""
+            reason = (pending.get("reason") or "").strip()
+            if reason:
+                return f"Bot wurde {action}{by} — Grund: {reason}"
+            return f"Bot wurde {action}{by} — kein Grund angegeben."
+
         await asyncio.sleep(1.5)  # Audit-Einträge brauchen einen Moment zum Anlegen
         try:
             async for entry in guild.audit_logs(limit=15):
@@ -1313,7 +1559,49 @@ class RelayClient(discord.Client):
             "gebannt oder der Server wurde gelöscht."
         )
 
-    async def _notify_owner_remove(self, guild: discord.Guild) -> None:
+    async def _cleanup_guild_data(self, guild: discord.Guild) -> Dict[str, Any]:
+        """
+        Löscht alle Daten des Servers — läuft bei **jedem** Verlassen
+        (Kick, Ban oder freiwillig), noch bevor der Owner informiert wird.
+
+        * Alle aktiven KI-Sitzungen (Tokens) werden sofort widerrufen.
+        * Die Datenbank-Verknüpfung des Servers wird aus der Master-DB entfernt.
+        * Ist die Server-Datenbank **exklusiv** (kein anderer Server teilt sie),
+          wird sie komplett geleert. Bei **geteilten** Datenbanken bleiben die
+          Daten für die übrigen Server bestehen.
+
+        Alles davon darf niemals die Leave-Benachrichtigung blockieren —
+        Fehler werden geloggt und als Summary zurückgegeben.
+        """
+        cleanup: Dict[str, Any] = {"sessions_revoked": 0, "database_purged": False}
+
+        try:
+            revoked = await self.store.revoke(guild_id=guild.id, by="server verlassen")
+            cleanup["sessions_revoked"] = len(revoked)
+            if revoked:
+                if self.state is not None:
+                    self.state.maybe_save(force=True)
+                log.info(
+                    "%d aktive KI-Verbindung(en) auf '%s' gestoppt (Server verlassen).",
+                    len(revoked), guild.name,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Sitzungen von '%s' konnten nicht widerrufen werden: %s", guild.name, exc)
+
+        turso = getattr(self.state, "turso_service", None) if self.state is not None else None
+        if turso is None:
+            return cleanup
+        try:
+            summary = await turso.purge_guild(guild.id)
+            cleanup["database_purged"] = bool(summary.get("had_database"))
+            cleanup["database_summary"] = summary
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Datenbank-Bereinigung für '%s' fehlgeschlagen: %s", guild.name, exc)
+        return cleanup
+
+    async def _notify_owner_remove(
+        self, guild: discord.Guild, *, cleanup: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """DM an den Bot-Owner: Name, Mitgliederzahl, Icon, Owner-Mention + Grund."""
         owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
         if not owner_id:
@@ -1321,7 +1609,7 @@ class RelayClient(discord.Client):
         bot_owner = self._bot_owner() or None
         reason = await self._leave_reason(guild)
         sent = await self._dm_user(
-            bot_owner, guild_remove_notify_view(guild, guild.owner, reason),
+            bot_owner, guild_remove_notify_view(guild, guild.owner, reason, cleanup=cleanup),
             context=f"Leave-Info {guild.id}",
         )
         if not sent:
@@ -1402,6 +1690,16 @@ class RelayClient(discord.Client):
                 guild_owner = None
 
         sessions = self.store.active_for_guild(guild.id)
+
+        db_status: Optional[Dict[str, Any]] = None
+        turso = getattr(self.state, "turso_service", None) if self.state is not None else None
+        if turso is not None:
+            try:
+                db_status = await turso.get_guild_status(guild.id)
+            except Exception as exc:  # noqa: BLE001 — DB-Status darf die Übersicht nie sprengen
+                log.debug("DB-Status für '%s' nicht ladbar: %s", guild.name, exc)
+                db_status = None
+
         return admin_guild_detail_view(
             guild,
             owner=guild_owner,
@@ -1411,6 +1709,7 @@ class RelayClient(discord.Client):
             query=query,
             invite_url=invite_url,
             notice=notice,
+            db_status=db_status,
         )
 
     async def _handle_admin_button(self, interaction: discord.Interaction, custom_id: str) -> None:
@@ -1746,7 +2045,16 @@ class RelayClient(discord.Client):
                 status_data = await self.state.turso_service.get_guild_status(guild.id)
                 view = database_configured_view(status_data)
             else:
-                view = database_unconfigured_view()
+                # Noch keine DB hier — aber hat dieser Admin woanders schon eine
+                # eingerichtet? Dann gibt es den blauen Wiederverwenden-Button.
+                try:
+                    reusable = await self.state.turso_service.list_reusable_databases_for_user(
+                        interaction.user.id, exclude_guild_id=guild.id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — Anzeige-Feature darf den Command nie blockieren
+                    log.warning("Wiederverwenden-Liste konnte nicht geladen werden: %s", exc)
+                    reusable = []
+                view = database_unconfigured_view(reusable=reusable)
 
             try:
                 await interaction.response.send_message(view=view, ephemeral=True)
@@ -1862,6 +2170,8 @@ class RelayClient(discord.Client):
             await self._handle_db_systems(interaction)
         elif custom_id == CID_DB_SYS_DEL:
             await self._handle_db_delete_system(interaction)
+        elif custom_id.startswith(f"{CID_DB_REUSE}:"):
+            await self._handle_db_reuse(interaction, custom_id)
         elif custom_id.startswith(CID_ADMIN_PREFIX):
             await self._handle_admin_button(interaction, custom_id)
 
@@ -1920,6 +2230,52 @@ class RelayClient(discord.Client):
         if gate is None:
             return
         await interaction.response.send_modal(TursoConnectModal(self, gate["guild"]))
+
+    async def _handle_db_reuse(self, interaction: discord.Interaction, custom_id: str) -> None:
+        """
+        Blauer „DB von … nutzen“-Button: verknüpft diesen Server mit der
+        bereits vorhandenen Datenbank desselben Admins von einem anderen Server.
+        """
+        gate = await self._guard(interaction)
+        if gate is None:
+            return
+        guild = gate["guild"]
+        service = getattr(self.state, "turso_service", None) if self.state else None
+        if service is None:
+            await interaction.response.send_message("❌ Turso-Service ist noch nicht bereit.", ephemeral=True)
+            return
+
+        raw = custom_id[len(CID_DB_REUSE) + 1:]
+        try:
+            source_guild_id = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ Dieser Button ist nicht mehr gültig — führe `/manage_database` erneut aus.",
+                ephemeral=True,
+            )
+            return
+
+        ok, msg = await service.reuse_guild_database(
+            guild_id=guild.id,
+            guild_name=guild.name,
+            source_guild_id=source_guild_id,
+            configured_by=f"{interaction.user.display_name} ({interaction.user.id})",
+            configured_by_id=str(interaction.user.id),
+        )
+        if not ok:
+            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+            return
+
+        status_data = await service.get_guild_status(guild.id)
+        await interaction.response.send_message(
+            content=f"✅ {msg}",
+            view=database_configured_view(status_data),
+            ephemeral=True,
+        )
+        log.info(
+            "Bestehende Datenbank von Guild %s für '%s' (%s) wiederverwendet durch %s (%s).",
+            source_guild_id, guild.name, guild.id, gate["member"].display_name, interaction.user.id,
+        )
 
     async def _handle_db_disconnect(self, interaction: discord.Interaction) -> None:
         """Trennt die Turso-Datenbank und zeigt die unkonfigurierte Ansicht."""

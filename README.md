@@ -368,7 +368,10 @@ Um interaktive Server-Systeme wie **Self Roles (Reaction Roles)**, **Willkommens
 ### Features von `/manage_database`:
 - **Live-Speicheranzeige:** Belegter Speicher, Turso-Free-Quota (9 GB) und visuelle Statusübersicht.
 - **System-Verwaltung:** Alle aktiven Systeme (Self Roles, Welcome, Cron, Responder) geordnet einsehen und bei Bedarf mit einem Klick löschen.
-- **Sicher & Isoliert:** Jeder Server hat seine eigene Datenbank. Der Bot speichert die Server-Zuordnung in einer Master-Datenbank und hält Konfigurationen im schnellen In-Memory-Cache.
+- **Sicher & flexibel:** Standardmäßig hat jeder Server seine eigene Datenbank. Der Bot speichert die Server-Zuordnung in einer Master-Datenbank und hält Konfigurationen im schnellen In-Memory-Cache.
+- **Datenbank wiederverwenden (blauer Button):** Der Bot merkt sich, **welcher Admin** die Zugangsdaten eingegeben hat. Richtet dieser Admin auf einem anderen Server `/manage_database` ein, erscheint dort neben dem grünen **„Datenbank verknüpfen“** ein **blauer Button „♻️ DB von … nutzen“** — ein Klick verknüpft seine bereits eingerichtete (dort noch aktive) Datenbank, ohne URL und Token neu eintippen zu müssen. Die Daten eines fremden Admins lassen sich nicht übernehmen (der Button prüft die Admin-ID gegen die Master-Datenbank).
+- **Mehrere Server, eine Datenbank:** Server, die sich eine Datenbank teilen, teilen sich auch eine Verbindung und dieselben Systeme — eine Änderung (z. B. ein neuer Trigger) ist sofort für alle beteiligten Server aktiv, und Anzeige/Cache bleiben konsistent. Beim Verlassen eines Servers bleibt eine geteilte Datenbank für die übrigen Server selbstverständlich erhalten.
+- **Automatisches Aufräumen beim Verlassen:** Verlässt der Bot einen Server (Kick, Ban oder freiwillig), werden **alle Daten des Servers gelöscht**: aktive KI-Tokens werden sofort widerrufen und die Datenbank-Verknüpfung entfernt. Ist die Server-Datenbank **exklusiv** (kein anderer Server teilt sie), wird sie zusätzlich komplett geleert.
 - **Arena AI Anbindung:** Fordert ein Nutzer Arena AI auf, Self Roles oder automatisierte Abläufe zu bauen, prüft Arena die Turso-Verbindung (`GET /api/v1/database/status`). Ist noch keine Datenbank verknüpft, stoppt Arena sofort und bittet den Admin, `/manage_database` auf Discord auszuführen. Sobald verknüpft, registriert Arena die Trigger und Aktionen automatisch über `POST /api/v1/systems`!
 
 ---
@@ -407,16 +410,25 @@ die Owner-ID. Die Liste zeigt:
 #### Server-Übersicht (Detailansicht)
 - **Server-Details:** Name, Server-ID, Mitgliederzahl, Owner-Mention und
   Status, ob der Bot-Owner Mitglied auf diesem Server ist.
+- **📊 Statistik:** Erstellungsdatum, Kanäle (Kategorien/Text/Voice/Bühne/Forum),
+  Rollen, Emojis, Sticker, Boost-Level mit Boost-Anzahl sowie die Bot-Rolle mit
+  Administrator-Status — alles auf einen Blick, ohne REST-Aufrufe.
 - **KI-Verbindungsstatus:** Zeigt sofort an, ob die Bridge auf dem Server
   aktiv ist (inkl. Token-Präfix, Ablaufzeit, Request-Anzahl und letzter Nutzung)
   oder ob noch keine aktiven Sitzungen existieren.
+- **🗄️ Datenbank-Status:** Ob eine Turso-Datenbank verknüpft ist (mit Anzahl
+  der Systeme, Speicherauslastung und wer sie wann eingerichtet hat) — inklusive
+  Hinweis, ob es eine **geteilte Datenbank** ist und mit welchen anderen
+  Servern sie geteilt wird.
 - **Einladungslink für den Owner:** Button ✉️ *Einladung erstellen* generiert
   einen 1-Stunde gültigen Einzellink (`max_uses=1, max_age=3600`) und zeigt
   ihn direkt im Panel an (ehrliche Fehlermeldung bei fehlendem
   `create_instant_invite`-Recht).
 - **Server verlassen:** Danger-Button 🚪 *Server verlassen* mit zweistufigem
   Bestätigungsdialog (`guild.leave()`), fängt Fehler ab und kehrt zur
-  aktualisierten Liste zurück.
+  aktualisierten Liste zurück. Dabei werden automatisch alle Serverdaten
+  gelöscht (KI-Tokens gestoppt, DB-Verknüpfung entfernt, exklusive
+  Datenbanken geleert).
 - **Zurück-Button:** Bringt dich mit gemerkter Seite und aktivem Suchbegriff
   zurück in die Listenansicht.
 
@@ -427,12 +439,24 @@ und Server-IDs reisen in den Custom-IDs mit — ein altes Panel bleibt bedienbar
 
 Der Bot-Owner bekommt bei jedem Server-Wechsel eine DM (Container V2 mit
 Server-Icon, falls vorhanden): Servername, Mitgliederzahl und Owner-Mention.
-Beim **Verlassen** enthält die DM zusätzlich den Grund — sofern er ermittelbar
-ist. Ehrlich gesagt: Nach dem Entfernen hat der Bot keinen Zugriff mehr auf
-das Audit-Log des Servers, deshalb liefert Discord den Grund meist nicht.
-Der Bot versucht es trotzdem (Kick/Ban-Eintrag inkl. Ausführendem und
-Begründung) und sagt dir andernfalls offen, dass der Grund nicht ermittelbar
-ist — statt etwas zu erfinden.
+
+Beim **Verlassen** enthält die DM den Grund — und zwar jetzt **live**:
+Solange der Bot noch Mitglied ist, hört er das Gateway-Event
+`GUILD_AUDIT_LOG_ENTRY_CREATE` ab. Wird ein Kick- oder Ban-Eintrag mit dem Bot
+als Ziel erzeugt, merkt er sich **den vom Moderator angegebenen Grund samt
+Ausführendem** und schickt ihn in der Leave-DM:
+
+> **Grund:** Bot wurde gekickt von **ModeratorKlaus** — Grund: Bot-Regeln verletzt
+
+Wird der Bot ohne Grund gekickt/gebannt, steht entsprechend *„kein Grund
+angegeben“*. Auch der Umfang des automatischen Aufräumens wird in der DM
+berichtigt: wie viele KI-Verbindungen gestoppt wurden und ob die exklusive
+Server-Datenbank komplett geleert wurde oder eine geteilte Datenbank für die
+übrigen Server bestehen blieb.
+
+Nur wenn gar kein Kick/Ban-Event empfangen wurde (z. B. der Server wurde
+gelöscht oder der Bot wurde manuell entfernt), sagt die DM ehrlich, dass der
+Grund nicht ermittelbar ist — statt etwas zu erfinden.
 
 ### Willkommens-DM an den Server-Owner
 
@@ -767,11 +791,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 283 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 289 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 201 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
+python scripts/login_recovery_test.py # 210 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -1039,8 +1063,8 @@ AIDiscordServerEinrichten/
 │           ├── systems.py   Turso-Datenbankstatus, Queries, Variablen & native Systeme
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        283 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 202 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── smoke_test.py        289 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 210 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── turso_systems_test.py Turso Client, Master-DB, Trigger-Engine & REST-APIs
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/

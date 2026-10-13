@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -23,7 +24,22 @@ from .client import TursoClient, TursoError
 
 log = logging.getLogger("relay.turso.master")
 
-__all__ = ("MasterTursoStore", "GuildDbRecord")
+__all__ = ("MasterTursoStore", "GuildDbRecord", "legacy_configured_user_id")
+
+_LEGACY_USER_ID_RE = re.compile(r"\((\d{5,25})\)\s*$")
+
+
+def legacy_configured_user_id(configured_by: str) -> str:
+    """
+    Zieht aus einem Legacy-``configured_by``-String (``"Name (123456789)"``)
+    die Nutzer-ID heraus — leer, wenn kein Muster passt.
+
+    Alte Einträge (vor dem Mehr-Server-Update) speicherten nur Name + ID im
+    Freitext; die Wiederverwenden-Suche soll auch für diese Bestände greifen,
+    ohne dass der Admin die Zugangsdaten neu eintippen muss.
+    """
+    match = _LEGACY_USER_ID_RE.search(configured_by or "")
+    return match.group(1) if match else ""
 
 
 @dataclass(slots=True)
@@ -33,8 +49,9 @@ class GuildDbRecord:
     database_url: str
     auth_token: str
     configured_by: str
-    created_at: str
-    updated_at: str
+    configured_by_id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
 
     def to_dict(self, *, include_token: bool = False) -> Dict[str, Any]:
         data = {
@@ -42,12 +59,18 @@ class GuildDbRecord:
             "guild_name": self.guild_name,
             "database_url": self.database_url,
             "configured_by": self.configured_by,
+            "configured_by_id": self.configured_by_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
         if include_token:
             data["auth_token"] = self.auth_token
         return data
+
+    @property
+    def owner_user_id(self) -> str:
+        """Der Admin, der die Datenbank eingerichtet hat (Legacy-fähig)."""
+        return self.configured_by_id or legacy_configured_user_id(self.configured_by)
 
 
 class MasterTursoStore:
@@ -102,6 +125,15 @@ class MasterTursoStore:
         """
         try:
             await client.execute(sql)
+            # Migration für Bestände vor dem Mehr-Server-Update: die Spalte
+            # ``configured_by_id`` merkt sich, WELCHER Admin die Zugangsdaten
+            # eingegeben hat (exakte ID statt Freitext). Existiert die Spalte
+            # bereits, schlägt das ALTER fehl — das ist der Normalfall und wird
+            # still ignoriert.
+            try:
+                await client.execute("ALTER TABLE server_databases ADD COLUMN configured_by_id TEXT;")
+            except Exception:  # noqa: BLE001 — "duplicate column" ist der Erwartungsfall
+                pass
             self._initialized = True
             log.info("Master-Datenbank initialisiert (%s)", "Turso Cloud" if not client.is_sqlite else "SQLite Fallback")
         except Exception as exc:
@@ -119,7 +151,8 @@ class MasterTursoStore:
         self.cache_misses += 1
         await self.init()
         client = self._get_client()
-        sql = "SELECT guild_id, guild_name, database_url, auth_token, configured_by, created_at, updated_at FROM server_databases WHERE guild_id = ? LIMIT 1;"
+        sql = ("SELECT guild_id, guild_name, database_url, auth_token, configured_by, "
+               "configured_by_id, created_at, updated_at FROM server_databases WHERE guild_id = ? LIMIT 1;")
 
         try:
             res = await client.execute(sql, [str(guild_id)])
@@ -135,6 +168,7 @@ class MasterTursoStore:
                 database_url=r.get("database_url") or "",
                 auth_token=r.get("auth_token") or "",
                 configured_by=r.get("configured_by") or "",
+                configured_by_id=r.get("configured_by_id") or "",
                 created_at=r.get("created_at") or "",
                 updated_at=r.get("updated_at") or "",
             )
@@ -152,6 +186,7 @@ class MasterTursoStore:
         database_url: str,
         auth_token: str,
         configured_by: str = "",
+        configured_by_id: str = "",
     ) -> GuildDbRecord:
         """Speichert oder aktualisiert die Datenbank-Konfiguration eines Servers."""
         await self.init()
@@ -161,15 +196,20 @@ class MasterTursoStore:
         # Prüfen ob vorhanden
         existing = await self.get_guild_db(guild_id)
         created_str = existing.created_at if existing else now_str
+        # Ohne explizite Admin-ID den bisherigen Wert behalten (Legacy-Einträge
+        # behalten so ihre über den Freitext ermittelbare ID).
+        if not configured_by_id and existing is not None:
+            configured_by_id = existing.configured_by_id
 
         sql = """
-        INSERT INTO server_databases (guild_id, guild_name, database_url, auth_token, configured_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO server_databases (guild_id, guild_name, database_url, auth_token, configured_by, configured_by_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
             guild_name = excluded.guild_name,
             database_url = excluded.database_url,
             auth_token = excluded.auth_token,
             configured_by = excluded.configured_by,
+            configured_by_id = excluded.configured_by_id,
             updated_at = excluded.updated_at;
         """
         await client.execute(sql, [
@@ -178,6 +218,7 @@ class MasterTursoStore:
             database_url.strip(),
             auth_token.strip(),
             configured_by,
+            configured_by_id,
             created_str,
             now_str,
         ])
@@ -188,6 +229,7 @@ class MasterTursoStore:
             database_url=database_url.strip(),
             auth_token=auth_token.strip(),
             configured_by=configured_by,
+            configured_by_id=configured_by_id,
             created_at=created_str,
             updated_at=now_str,
         )
@@ -214,7 +256,8 @@ class MasterTursoStore:
         """Listet alle registrierten Server-Datenbanken."""
         await self.init()
         client = self._get_client()
-        sql = "SELECT guild_id, guild_name, database_url, auth_token, configured_by, created_at, updated_at FROM server_databases ORDER BY guild_name;"
+        sql = ("SELECT guild_id, guild_name, database_url, auth_token, configured_by, "
+               "configured_by_id, created_at, updated_at FROM server_databases ORDER BY guild_name;")
         try:
             res = await client.execute(sql)
             output: List[GuildDbRecord] = []
@@ -225,6 +268,7 @@ class MasterTursoStore:
                     database_url=r.get("database_url") or "",
                     auth_token=r.get("auth_token") or "",
                     configured_by=r.get("configured_by") or "",
+                    configured_by_id=r.get("configured_by_id") or "",
                     created_at=r.get("created_at") or "",
                     updated_at=r.get("updated_at") or "",
                 ))
@@ -232,6 +276,38 @@ class MasterTursoStore:
         except Exception as exc:
             log.error("Fehler beim Listen aller Guild-DBs: %s", exc)
             return []
+
+    async def list_by_user(self, user_id: str) -> List[GuildDbRecord]:
+        """
+        Alle Datenbanken, die ein bestimmter Admin eingerichtet hat.
+
+        Matchkriterium ist die exakte ``configured_by_id``; Legacy-Einträge
+        ohne diese Spalte werden über die im Freitext gespeicherte ID
+        (``"Name (123456789)"``) nachgewiesen — so funktioniert die
+        Wiederverwenden-Suche auch für Bestände vor dem Update.
+        """
+        records = await self.list_all()
+        uid = str(user_id)
+        if not uid:
+            return []
+        return [r for r in records if r.owner_user_id == uid]
+
+    async def list_guilds_by_database(self, database_url: str, exclude_guild_id: Optional[int] = None) -> List[GuildDbRecord]:
+        """
+        Alle Server, die dieselbe physische Datenbank nutzen (geteilte DB).
+
+        Wichtig fürs Bereinigen beim Server-Verlassen: Nur wenn **kein**
+        anderer Server mehr auf dieselbe URL zeigt, dürfen die Tabellen der
+        Datenbank fallen.
+        """
+        url = (database_url or "").strip()
+        if not url:
+            return []
+        records = await self.list_all()
+        return [
+            r for r in records
+            if r.database_url.strip() == url and r.guild_id != exclude_guild_id
+        ]
 
     def invalidate_cache(self, guild_id: Optional[int] = None) -> None:
         if guild_id is not None:

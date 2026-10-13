@@ -42,6 +42,7 @@ os.environ.setdefault("PUBLIC_URL", "https://relay.example.com")
 os.environ.setdefault("SESSION_FILE", "/tmp/adse-smoke/sessions.json")
 
 import aiohttp  # noqa: E402
+import discord  # noqa: E402
 
 from bot.config import load_config  # noqa: E402
 from bot.sessions import SessionStore  # noqa: E402
@@ -933,6 +934,76 @@ async def t_prompt(h: Harness) -> None:
           bad_section_accessories(guild_join_notify_view(g_smoke, None)) == []
           and bad_section_accessories(guild_remove_notify_view(g_smoke, None, "grund")) == [],
           "Section-Accessory muss Button/Thumbnail sein")
+
+    # ── Mehr-Server-Datenbank: Wiederverwenden-Button & Leave-Aufräumen ──────
+    from bot.discord_bot import database_unconfigured_view, CID_DB_REUSE
+
+    def _view_parts(view: Any) -> Dict[str, List[Dict[str, Any]]]:
+        flat: List[Dict[str, Any]] = []
+
+        def walk(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                flat.append(item)
+                walk(item.get("components", []))
+
+        walk(view.to_components())
+        return {
+            "texts": [p for p in flat if p.get("type") == 10],
+            "buttons": [p for p in flat if p.get("type") == 2],
+        }
+
+    def _joined_text(view: Any) -> str:
+        return "\n".join(p.get("content", "") for p in _view_parts(view)["texts"])
+
+    db_plain = database_unconfigured_view()
+    plain_parts = _view_parts(db_plain)
+    plain_ids = [b.get("custom_id", "") for b in plain_parts["buttons"]]
+    check("DB-View ohne Wiederverwenden: nur der grüne Verknüpfen-Button",
+          "relay:v2_db_connect" in plain_ids and not any(i.startswith(CID_DB_REUSE) for i in plain_ids),
+          str(plain_ids))
+
+    db_reuse = database_unconfigured_view(reusable=[
+        {"source_guild_id": 424242, "source_guild_name": "Mein Anderer Server",
+         "database_url": "https://x.turso.io", "database_url_masked": "x.turso.io",
+         "configured_by": "Klaus", "configured_at": "2026-01-01"},
+    ])
+    reuse_parts = _view_parts(db_reuse)
+    reuse_buttons = [b for b in reuse_parts["buttons"] if b.get("custom_id", "").startswith(CID_DB_REUSE)]
+    check("DB-View mit Wiederverwenden: blauer Button neben dem grünen",
+          "relay:v2_db_connect" in [b.get("custom_id") for b in reuse_parts["buttons"]]
+          and len(reuse_buttons) == 1
+          and reuse_buttons[0].get("style") == int(discord.ButtonStyle.primary)  # blau
+          and reuse_buttons[0].get("custom_id") == f"{CID_DB_REUSE}:424242",
+          str([b.get("custom_id") for b in reuse_parts["buttons"]]))
+    check("DB-View mit Wiederverwenden: Hinweistext nennt den Quell-Server",
+          "Mein Anderer Server" in _joined_text(db_reuse) and "teilen" in _joined_text(db_reuse))
+
+    detail_db = admin_guild_detail_view(
+        g_smoke, owner=g_smoke.owner, owner_present=True, sessions=[],
+        page=0, query="",
+        db_status={"configured": True, "database_url": "demo.turso.io", "configured_by": "Klaus",
+                   "systems_count": 3, "storage": {"usage_percent": 1.5, "used_formatted": "1.2 MB"},
+                   "shared": True, "shared_with": [{"guild_id": "77", "guild_name": "Partner"}],
+                   "updated_at": "2026-02-03T04:05:06+00:00"},
+    )
+    detail_db_text = _joined_text(detail_db)
+    check("Server-Übersicht: Server-Details (Kanäle, Rollen, Bot-Rolle)",
+          "Server-Details" in detail_db_text and "Kanäle:" in detail_db_text
+          and "Rollen:" in detail_db_text and "Bot-Rolle:" in detail_db_text, detail_db_text[:300])
+    check("Server-Übersicht: Datenbank-Status mit Teilen-Info",
+          "Server-Datenbank" in detail_db_text and "3" in detail_db_text
+          and "Geteilte Datenbank" in detail_db_text and "Partner" in detail_db_text,
+          detail_db_text[:400])
+
+    leave_cleanup = guild_remove_notify_view(g_smoke, None, "Bot wurde gekickt — Grund: Test", cleanup={
+        "sessions_revoked": 2, "database_purged": True, "database_summary": {
+            "exclusive": True, "shared_with": [], "dropped_tables": ["systems", "triggers"],
+        },
+    })
+    leave_cleanup_text = _joined_text(leave_cleanup)
+    check("Leave-DM nennt das Aufräumen (Sessions + geleerte DB)",
+          "Aufräumen" in leave_cleanup_text and "2 KI-Verbindung(en) gestoppt" in leave_cleanup_text
+          and "komplett gelöscht" in leave_cleanup_text, leave_cleanup_text[:300])
     leave_v = admin_guild_leave_confirm_view(g_smoke, page=0, query="")
     check("admin_guild_leave_confirm_view ist Components V2", leave_v.has_components_v2())
 
