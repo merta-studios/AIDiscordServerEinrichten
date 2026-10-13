@@ -36,10 +36,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-os.environ.setdefault("DISCORD_BOT_TOKEN", "smoke.test.token")
-os.environ.setdefault("LOG_LEVEL", "WARNING")
-os.environ.setdefault("PUBLIC_URL", "https://relay.example.com")
-os.environ.setdefault("SESSION_FILE", "/tmp/adse-smoke/sessions.json")
+# Bewusst **gesetzt** statt ``setdefault``: Der Test prüft feste Werte
+# (``base_url`` im Healthcheck, Maskierung des Platzhalter-Tokens). Ein von
+# außen geerbtes ``PUBLIC_URL``/``DISCORD_BOT_TOKEN`` — z. B. aus ``ci/ci.yml``
+# — würde diese Prüfungen kippen, obwohl am Bot alles in Ordnung ist.
+os.environ["DISCORD_BOT_TOKEN"] = "smoke.test.token"
+os.environ["LOG_LEVEL"] = "WARNING"
+os.environ["PUBLIC_URL"] = "https://relay.example.com"
+os.environ["SESSION_FILE"] = "/tmp/adse-smoke/sessions.json"
 
 import aiohttp  # noqa: E402
 import discord  # noqa: E402

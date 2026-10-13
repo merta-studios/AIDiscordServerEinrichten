@@ -25,7 +25,7 @@ Oder im Browser: `ci/ci.yml` öffnen → *Raw* → Datei unter
 
 | Job | Inhalt |
 | --- | ------ |
-| `smoke-test` | `compileall`, dann `scripts/smoke_test.py` (289 Prüfungen) + `scripts/login_recovery_test.py` (210 Prüfungen) auf **Python 3.11 und 3.12** |
+| `smoke-test` | `compileall`, dann `scripts/smoke_test.py` (289 Prüfungen) + `scripts/login_recovery_test.py` (228 Prüfungen) auf **Python 3.11 und 3.12** |
 | `smoke-test` | Start ohne `DISCORD_BOT_TOKEN` muss mit Exit-Code **2** und klarer deutscher Fehlermeldung abbrechen |
 | `image` | Baut das Docker-Image aus [`Dockerfile`](../Dockerfile) |
 | `image` | Startet den Container und verlangt, dass `/api/health` `"status":"healthy"` liefert — **auch** ohne gültigen Discord-Token |

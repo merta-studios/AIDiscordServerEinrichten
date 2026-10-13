@@ -27,7 +27,8 @@ __all__ = (
     "FakeStageChannel", "FakeForumChannel", "FakeMember", "FakeUser", "FakeGuild",
     "FakeClient", "FakeHTTP", "FakeMessage", "FakeInvite", "FakeAutoModRule",
     "FakeWebhook", "MutableGuild", "GUILD_ID", "BOT_ID", "OWNER_ID", "USER_ID",
-    "fake_response",
+    "fake_response", "invalid_form_body", "is_components_v2_view",
+    "validate_message_payload", "INVALID_FORM_BODY_CODE",
 )
 
 GUILD_ID = 111111111111111111
@@ -70,6 +71,99 @@ def fake_response(status: int = 404, reason: str = "Not Found") -> Any:
 def not_found(message: str = "404: Not Found") -> discord.NotFound:
     """``discord.NotFound(response, message)`` — die Signatur hat kein ``data=``."""
     return discord.NotFound(fake_response(), message)
+
+
+# Discord-Fehlercode für „Feld X passt nicht zum Rest des Bodies“.
+INVALID_FORM_BODY_CODE = 50035
+LEGACY_FIELDS_WITH_V2 = "MESSAGE_CANNOT_USE_LEGACY_FIELDS_WITH_COMPONENTS_V2"
+
+
+def invalid_form_body(field: str, message: str,
+                      *, error_code: str = LEGACY_FIELDS_WITH_V2,
+                      status: int = 400) -> discord.HTTPException:
+    """
+    Baut Discords ``400 Bad Request (50035): Invalid Form Body`` nach.
+
+    Der Text ist bewusst identisch zur echten API — genau so steht er später im
+    Log bzw. in der Fehlermeldung, die der Nutzer sieht::
+
+        400 Bad Request (error code: 50035): Invalid Form Body
+        In content: The 'content' field cannot be used when using
+        MessageFlags.IS_COMPONENTS_V2
+    """
+    return discord.HTTPException(
+        fake_response(status=status, reason="Bad Request"),
+        {
+            "code": INVALID_FORM_BODY_CODE,
+            "message": "Invalid Form Body",
+            "errors": {
+                field: {"_errors": [{"code": error_code, "message": message}]},
+            },
+        },
+    )
+
+
+def is_components_v2_view(view: Any) -> bool:
+    """
+    ``True``, wenn Discord die Nachricht als **Components V2** behandelt.
+
+    Entscheidend ist, was wirklich geschickt wird (``to_components()``): Liegt
+    oben ein Layout-Baustein (Container 17, Section 9, TextDisplay 10, …),
+    setzt Discord intern ``MessageFlags.IS_COMPONENTS_V2``. Eine ``LayoutView``
+    mit ausschließlich Action Rows (Typ 1) bleibt dagegen eine klassische
+    V1-Nachricht — dort ist ``content`` weiterhin erlaubt (so verschickt die
+    REST-API ihre Buttons).
+    """
+    to_components = getattr(view, "to_components", None)
+    if callable(to_components):
+        try:
+            parts = to_components()
+        except Exception:  # noqa: BLE001 — kaputte Attrappen sollen nicht den Test killen
+            parts = None
+        if isinstance(parts, list):
+            return any(
+                isinstance(part, dict) and part.get("type") not in (None, 1)
+                for part in parts
+            )
+    checker = getattr(view, "has_components_v2", None)
+    return bool(checker()) if callable(checker) else False
+
+
+def validate_message_payload(*, content: Any = None, view: Any = None,
+                             embed: Any = None, embeds: Any = None,
+                             attachments: Any = None, files: Any = None) -> None:
+    """
+    Emuliert Discords härteste Nachrichten-Regel für **Components V2**.
+
+    Sobald eine Nachricht Layout-Komponenten (Container, TextDisplay, …) trägt,
+    setzt Discord intern ``MessageFlags.IS_COMPONENTS_V2`` und lehnt alle
+    Legacy-Felder ab — ``content``, ``embeds`` und ``attachments``:
+
+        400 Bad Request (error code: 50035): Invalid Form Body
+        In content: The 'content' field cannot be used when using
+        MessageFlags.IS_COMPONENTS_V2
+
+    Genau daran ist die Datenbank-Einrichtung gescheitert: Die Erfolgsmeldung
+    „✅ …“ wurde als ``content`` **neben** dem Container-View geschickt. Die
+    Datenbank war zu dem Zeitpunkt bereits verknüpft, der Admin sah trotzdem
+    nur einen Fehler. Leere Werte (``None``, ``""``, ``[]``) sind erlaubt — so
+    räumt :meth:`RelayClient._show` alte Felder beim Bearbeiten bewusst leer.
+    """
+    if not is_components_v2_view(view):
+        return
+
+    legacy: List[tuple] = [
+        ("content", content),
+        ("embeds", embed if embed is not None else embeds),
+        ("attachments", attachments if attachments is not None else files),
+    ]
+    for field, value in legacy:
+        if value is None or value == "" or value == []:
+            continue
+        raise invalid_form_body(
+            field,
+            f"The '{field}' field cannot be used when using MessageFlags.IS_COMPONENTS_V2",
+        )
 
 
 def _fake_state() -> Any:
@@ -548,6 +642,9 @@ class FakeWebhook:
         return f"https://discord.com/api/webhooks/{self.id}/{self.token}"
 
     async def send(self, content: Optional[str] = None, **kwargs: Any) -> "FakeMessage":
+        validate_message_payload(content=content, view=kwargs.get("view"),
+                                 embed=kwargs.get("embed"), embeds=kwargs.get("embeds"),
+                                 files=kwargs.get("files"))
         persona = kwargs.get("username") or self.name
         self._persona = persona
         author = FakeUser(int(self.id), persona, bot=True)
@@ -941,6 +1038,11 @@ class MutableGuild(FakeGuild):
 
 def _make_send(guild: MutableGuild, channel: Any):
     async def send(content: Optional[str] = None, **kwargs: Any) -> FakeMessage:
+        # Wie die echte API: content/embeds/attachments sind neben Components V2
+        # verboten (400, error code 50035).
+        validate_message_payload(content=content, view=kwargs.get("view"),
+                                 embed=kwargs.get("embed"), embeds=kwargs.get("embeds"),
+                                 files=kwargs.get("files"))
         embeds = list(kwargs.get("embeds") or [])
         if kwargs.get("embed") is not None:
             embeds.append(kwargs["embed"])

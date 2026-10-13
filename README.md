@@ -795,7 +795,7 @@ python scripts/smoke_test.py          # 289 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 210 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
+python scripts/login_recovery_test.py # 228 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -858,6 +858,20 @@ und verlangt `/api/health` im laufenden Container.
 ---
 
 ## Fehlerbehebung
+
+**`⚠️ Fehler: 400 Bad Request (error code: 50035): Invalid Form Body — In content: The 'content' field cannot be used when using MessageFlags.IS_COMPONENTS_V2` beim Datenbank-Einrichten**
+Versionen vor **1.0.5** schickten die Erfolgsmeldung nach dem Modal
+(🗄️ *Turso-Datenbank verknüpfen*) als `content` **zusammen** mit der
+Container-Ansicht — und Discord *Components V2* verbietet die Legacy-Felder
+`content`, `embeds` und `attachments`. Discord lehnte die Antwort deshalb ab,
+**obwohl die Datenbank in dem Moment bereits verknüpft und das Schema
+initialisiert war**; sichtbar wurde nur der Fehler. Derselbe Konflikt steckte
+im blauen „♻️ DB von … nutzen“-Button. Seit **1.0.5** steht die ✅-Zeile als
+`TextDisplay` *im* Container, `content` bleibt leer. Auf `main` aktualisieren
+(`/api/health` → `version` ≥ `1.0.5`) und `/manage_database` erneut ausführen.
+Gut zu wissen: Wer die Meldung mit einer älteren Version bekommen hat, dessen
+Datenbank ist **trotzdem verbunden** — `/manage_database` zeigt den Status
+(🟢 Verbunden), erneutes Verknüpfen ist nicht nötig.
 
 **`/adminpanel` hängt endlos bei „Bot denkt nach…“ und endet mit „Die Anwendung reagiert nicht“**
 Versionen vor **1.0.4** konnten die Server-Liste nicht senden, sobald
@@ -1064,7 +1078,7 @@ AIDiscordServerEinrichten/
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
 │   ├── smoke_test.py        289 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 210 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── login_recovery_test.py 228 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── turso_systems_test.py Turso Client, Master-DB, Trigger-Engine & REST-APIs
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/

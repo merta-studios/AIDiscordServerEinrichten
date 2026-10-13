@@ -344,8 +344,18 @@ def database_unconfigured_view(
     return view
 
 
-def database_configured_view(status_data: Dict[str, Any]) -> discord.ui.LayoutView:
-    """Container-V2-Nachricht für /manage_database wenn die DB bereits aktiv ist."""
+def database_configured_view(
+    status_data: Dict[str, Any], *, notice: Optional[str] = None,
+) -> discord.ui.LayoutView:
+    """
+    Container-V2-Nachricht für /manage_database wenn die DB bereits aktiv ist.
+
+    ``notice`` ist eine optionale Erfolgs-/Hinweiszeile (z. B. „✅ Datenbank
+    verbunden“), die **als TextDisplay im Container** landet — niemals als
+    ``content``: Components-V2-Nachrichten verbieten ``content``, Discord
+    antwortet sonst mit ``400 (50035) Invalid Form Body — The 'content' field
+    cannot be used when using MessageFlags.IS_COMPONENTS_V2``.
+    """
     storage = status_data.get("storage", {})
     used_str = storage.get("used_formatted", "0 B")
     quota_str = storage.get("quota_formatted", "9.00 GB")
@@ -368,47 +378,54 @@ def database_configured_view(status_data: Dict[str, Any]) -> discord.ui.LayoutVi
     else:
         systems_text = "_Noch keine Systeme angelegt. Beauftrage Arena AI, Self Roles oder Welcome-Systeme für dich zu scripten!_"
 
-    container = discord.ui.Container(
-        discord.ui.TextDisplay(
-            f"# 🗄️ Turso-Datenbank — Status & Auslastung\n"
-            f"**Status:** 🟢 Verbunden mit Turso (`{db_url}`)\n\n"
-            f"**📊 Speicherauslastung:**\n"
-            f"• Verbraucht: `{used_str}` von `{quota_str}` ({pct}%)\n"
-            f"• Freier Speicher: `{free_str}`\n"
-            f"• Tabellen: `{tables_cnt}` in der Datenbank\n"
-            f"• Cache-Vorteil: `{total_hits}` Abfragen aus Speicher bedient (Rate Limits geschont!)\n\n"
-            f"**⚙️ Geordnete Systeme ({len(systems)}):**\n"
-            f"{systems_text}"
-        ),
-        discord.ui.Separator(),
-        discord.ui.ActionRow(
-            discord.ui.Button(
-                label="Systeme verwalten",
-                emoji="📋",
-                style=discord.ButtonStyle.primary,
-                custom_id=CID_DB_SYSTEMS,
-            ),
-            discord.ui.Button(
-                label="Aktualisieren",
-                emoji="🔄",
-                style=discord.ButtonStyle.secondary,
-                custom_id=CID_DB_REFRESH,
-            ),
-            discord.ui.Button(
-                label="Neu einrichten",
-                emoji="⚙️",
-                style=discord.ButtonStyle.secondary,
-                custom_id=CID_DB_CONNECT,
-            ),
-            discord.ui.Button(
-                label="Verbindung trennen",
-                emoji="⛔",
-                style=discord.ButtonStyle.danger,
-                custom_id=CID_DB_DISCONNECT,
-            ),
-        ),
-        accent_colour=CONNECTED_ACCENT,
+    status_text = (
+        f"# 🗄️ Turso-Datenbank — Status & Auslastung\n"
+        f"**Status:** 🟢 Verbunden mit Turso (`{db_url}`)\n\n"
+        f"**📊 Speicherauslastung:**\n"
+        f"• Verbraucht: `{used_str}` von `{quota_str}` ({pct}%)\n"
+        f"• Freier Speicher: `{free_str}`\n"
+        f"• Tabellen: `{tables_cnt}` in der Datenbank\n"
+        f"• Cache-Vorteil: `{total_hits}` Abfragen aus Speicher bedient (Rate Limits geschont!)\n\n"
+        f"**⚙️ Geordnete Systeme ({len(systems)}):**\n"
+        f"{systems_text}"
     )
+
+    # Container-Kinder: optional die Erfolgszeile VOR dem Status-Block. Ein
+    # Container darf höchstens 10 Kinder haben — mit Hinweis sind es 5.
+    children: List[Any] = []
+    if notice and str(notice).strip():
+        children.append(discord.ui.TextDisplay(str(notice).strip()[:4000]))
+        children.append(discord.ui.Separator())
+    children.append(discord.ui.TextDisplay(status_text))
+    children.append(discord.ui.Separator())
+    children.append(discord.ui.ActionRow(
+        discord.ui.Button(
+            label="Systeme verwalten",
+            emoji="📋",
+            style=discord.ButtonStyle.primary,
+            custom_id=CID_DB_SYSTEMS,
+        ),
+        discord.ui.Button(
+            label="Aktualisieren",
+            emoji="🔄",
+            style=discord.ButtonStyle.secondary,
+            custom_id=CID_DB_REFRESH,
+        ),
+        discord.ui.Button(
+            label="Neu einrichten",
+            emoji="⚙️",
+            style=discord.ButtonStyle.secondary,
+            custom_id=CID_DB_CONNECT,
+        ),
+        discord.ui.Button(
+            label="Verbindung trennen",
+            emoji="⛔",
+            style=discord.ButtonStyle.danger,
+            custom_id=CID_DB_DISCONNECT,
+        ),
+    ))
+
+    container = discord.ui.Container(*children, accent_colour=CONNECTED_ACCENT)
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     return view
@@ -484,11 +501,18 @@ class TursoConnectModal(discord.ui.Modal, title="🗄️ Turso-Datenbank verknü
             return
 
         status_data = await self.client.state.turso_service.get_guild_status(self.guild.id)
-        view = database_configured_view(status_data)
-        await interaction.followup.send(
-            content=f"✅ {msg}",
-            view=view,
-            ephemeral=True
+        # ⚠️ Components V2 (LayoutView/Container) verbietet ``content`` — Discord
+        # lehnt die Nachricht sonst mit ``400 Bad Request (50035): Invalid Form
+        # Body — In content: The 'content' field cannot be used when using
+        # MessageFlags.IS_COMPONENTS_V2`` ab, OBWOHL die Datenbank erfolgreich
+        # verknüpft wurde. Die Erfolgszeile wandert deshalb als TextDisplay in
+        # den Container (``notice=…``) und nicht in ``content``.
+        view = database_configured_view(status_data, notice=f"✅ {msg}")
+        await interaction.followup.send(view=view, ephemeral=True)
+        log.info(
+            "Turso-Datenbank für '%s' (%s) verknüpft durch %s (%s).",
+            self.guild.name, self.guild.id,
+            interaction.user.display_name, interaction.user.id,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -2267,11 +2291,25 @@ class RelayClient(discord.Client):
             return
 
         status_data = await service.get_guild_status(guild.id)
-        await interaction.response.send_message(
-            content=f"✅ {msg}",
-            view=database_configured_view(status_data),
-            ephemeral=True,
-        )
+        # Auch hier: KEIN ``content`` zu einer Components-V2-Nachricht, sonst
+        # 400 (50035) — die Erfolgszeile steht als TextDisplay im Container.
+        try:
+            await interaction.response.send_message(
+                view=database_configured_view(status_data, notice=f"✅ {msg}"),
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            # Die Datenbank IST verknüpft — nur die hübsche Ansicht ging nicht
+            # raus. Fallback auf eine schlichte Textmeldung, damit der Admin
+            # nicht „Interaktion fehlgeschlagen“ sieht.
+            log.error("Reuse-Bestätigung als Components V2 abgelehnt (%s) — Text-Fallback.", exc)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"✅ {msg}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
+            except discord.HTTPException:
+                log.exception("Auch der Text-Fallback der Reuse-Bestätigung schlug fehl.")
         log.info(
             "Bestehende Datenbank von Guild %s für '%s' (%s) wiederverwendet durch %s (%s).",
             source_guild_id, guild.name, guild.id, gate["member"].display_name, interaction.user.id,
