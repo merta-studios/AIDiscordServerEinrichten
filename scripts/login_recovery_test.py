@@ -76,7 +76,9 @@ from bot.web.app import AppState  # noqa: E402
 # Echte discord.py-Subklassen für die Guild-/Member-Doubles (gleiche Datei wie
 # im Smoke-Test — die isinstance()-Prüfungen der Bot-Logik sollen greifen).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _fake_discord import FakeGuild, FakeMember, FakeRole  # noqa: E402
+from _fake_discord import (  # noqa: E402
+    FakeGuild, FakeMember, FakeRole, validate_message_payload,
+)
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 
@@ -1100,6 +1102,27 @@ async def test_client_setup() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _validate_payload(args: tuple, kwargs: Dict[str, Any], *, view: Any = None,
+                      embed: Any = None) -> None:
+    """
+    Lässt jede simulierte Nachricht durch Discords Components-V2-Prüfung.
+
+    ``content``/``embeds``/``attachments`` neben einem Layout-Baustein
+    (Container, TextDisplay, …) quittiert Discord mit
+    ``400 Bad Request (error code: 50035): Invalid Form Body`` — egal ob die
+    Nachricht neu geschickt oder bearbeitet wird. Der Test wirft dann denselben
+    ``discord.HTTPException``, den auch die echte API werfen würde.
+    """
+    payload: Dict[str, Any] = {key: kwargs[key] for key in
+                               ("content", "embed", "embeds", "attachments", "files")
+                               if key in kwargs}
+    if args and "content" not in payload:
+        payload["content"] = args[0]
+    if embed is not None and "embed" not in payload:
+        payload["embed"] = embed
+    validate_message_payload(view=view, **payload)
+
+
 class _DmCapture:
     """Ein User/Member-Double, das DMs (Views) nur einsammelt."""
 
@@ -1110,6 +1133,7 @@ class _DmCapture:
         self.sent: List[Any] = []
 
     async def send(self, *args: Any, view: Any = None, **kwargs: Any) -> Any:
+        _validate_payload(args, kwargs, view=view)
         self.sent.append(view)
         return None
 
@@ -1135,11 +1159,14 @@ class _FakeResponse:
 
     async def send_message(self, *args: Any, embed: Any = None, view: Any = None,
                            ephemeral: bool = False, **kwargs: Any) -> None:
+        # Discords echte Prüfung: content/embeds + Components V2 ⇒ 400 (50035).
+        _validate_payload(args, kwargs, view=view, embed=embed)
         self.deferred = True
         self.messages.append({"embed": embed, "view": view, "ephemeral": ephemeral,
-                              "content": " ".join(str(a) for a in args)})
+                              "content": kwargs.get("content") or " ".join(str(a) for a in args)})
 
     async def edit_message(self, *args: Any, view: Any = None, **kwargs: Any) -> None:
+        _validate_payload(args, kwargs, view=view)
         self.deferred = True
         self.edits.append({"view": view})
 
@@ -1151,7 +1178,9 @@ class _FakeFollowup:
 
     async def send(self, *args: Any, view: Any = None, ephemeral: bool = False,
                    **kwargs: Any) -> None:
-        self.sends.append({"view": view, "ephemeral": ephemeral})
+        _validate_payload(args, kwargs, view=view)
+        self.sends.append({"view": view, "ephemeral": ephemeral,
+                           "content": kwargs.get("content") or (args[0] if args else None)})
 
 
 def _panel_interaction(user_id: int, *, guild: Any = None) -> Any:
@@ -1630,7 +1659,13 @@ async def test_owner_features() -> None:
         reuse_it.user = admin_b
         reuse_it.data = {"custom_id": f"relay:v2_db_reuse:{guild_a.id}"}
         reuse_it.type = discord.InteractionType.component
-        await client.on_interaction(reuse_it)
+        reuse_error: Optional[str] = None
+        try:
+            await client.on_interaction(reuse_it)
+        except discord.HTTPException as exc:  # genau der gemeldete 400er
+            reuse_error = str(exc)
+        check("Blauer Button: Discord nimmt die Antwort an (kein 400/50035)",
+              reuse_error is None, str(reuse_error))
         check("Blauer Button: Erfolg mit konfiguriertem Status-View",
               len(reuse_it.response.messages) == 1
               and reuse_it.response.messages[0]["view"] is not None
@@ -1638,6 +1673,128 @@ async def test_owner_features() -> None:
               str(len(reuse_it.response.messages)))
         check("Blauer Button: Ziel-Server nutzt dieselbe Datenbank",
               await srv.is_guild_db_configured(guild_b.id))
+
+        # ── Regression: „content" neben Components V2 ⇒ 400 (50035) ──────────
+        # Genau das war der Fehler bei der Datenbank-Einrichtung: Die
+        # Erfolgsmeldung „✅ …" wurde als ``content`` ZUSAMMEN mit dem
+        # Container-View geschickt. Discord lehnt das ab („The 'content' field
+        # cannot be used when using MessageFlags.IS_COMPONENTS_V2"), obwohl die
+        # Datenbank längst verknüpft war — der Admin sah nur ⚠️ Fehler.
+        reuse_msg = reuse_it.response.messages[0] if reuse_it.response.messages else {}
+        reuse_text = _view_text(reuse_msg["view"]) if reuse_msg.get("view") is not None else ""
+        check("Blauer Button: KEIN content neben dem Container-View",
+              not str(reuse_msg.get("content") or "").strip(),
+              repr(reuse_msg.get("content")))
+        check("Blauer Button: ✅-Erfolgszeile steht als TextDisplay IM Container",
+              "✅" in reuse_text and "Status & Auslastung" in reuse_text
+              and reuse_text.index("✅") < reuse_text.index("Status & Auslastung"),
+              reuse_text[:200])
+
+        # ── Modal „Turso-Datenbank verknüpfen" (der Weg des Nutzers) ─────────
+        from bot.discord_bot import TursoConnectModal, database_configured_view
+
+        guild_c = FakeGuild(gid=1102, name="ModalServer")
+        client._connection._guilds[guild_c.id] = guild_c
+        admin_role_c = FakeRole(6002, "Admin", 9, discord.Permissions(administrator=True).value)
+        admin_c = FakeMember(cfg.bot_owner_id, "Owner",
+                             [guild_c.default_role, admin_role_c], guild=guild_c)
+
+        modal = TursoConnectModal(client, guild_c)
+        modal.db_url._value = f"sqlite:///{_reuse_dir}/modal.db"
+        modal.auth_token._value = "adse_modal_token_0123456789"
+        modal_it = _panel_interaction(cfg.bot_owner_id, guild=guild_c)
+        modal_it.user = admin_c
+        modal_error: Optional[str] = None
+        try:
+            await modal.on_submit(modal_it)
+        except discord.HTTPException as exc:  # genau der gemeldete 400er
+            modal_error = str(exc)
+        check("Modal-Submit: Discord nimmt die Antwort an (kein 400/50035)",
+              modal_error is None, str(modal_error))
+        check("Modal-Submit: deferred + genau ein Followup",
+              modal_it.response.deferred and len(modal_it.followup.sends) == 1,
+              str(len(modal_it.followup.sends)))
+        sent = modal_it.followup.sends[0] if modal_it.followup.sends else {}
+        sent_view = sent.get("view")
+        sent_text = _view_text(sent_view) if sent_view is not None else ""
+        check("Modal-Submit: Datenbank ist verknüpft (gültige Daten ⇒ Erfolg)",
+              await srv.is_guild_db_configured(guild_c.id))
+        check("Modal-Submit: KEIN content neben Components V2 (sonst 400/50035)",
+              not str(sent.get("content") or "").strip()
+              and sent_view is not None and sent_view.has_components_v2(),
+              repr(sent.get("content")))
+        check("Modal-Submit: ✅-Bestätigung + Statusansicht im Container",
+              "✅" in sent_text and "Turso-Datenbank verbunden" in sent_text
+              and "Status & Auslastung" in sent_text, sent_text[:300])
+        check("Modal-Submit: Antwort ist ephemeral", bool(sent.get("ephemeral")))
+        container_kids = (_flatten_view(sent_view)[0].get("components", [])
+                          if sent_view is not None and _flatten_view(sent_view) else [])
+        check("Modal-Submit: Container bleibt unter Discords 10-Kinder-Limit",
+              0 < len(container_kids) <= 10, str(len(container_kids)))
+
+        # Ungültige Zugangsdaten ⇒ klare ❌-Meldung als Text (kein V2-View).
+        bad_modal = TursoConnectModal(client, guild_c)
+        bad_modal.db_url._value = f"sqlite:///{_reuse_dir}/gibt-es-nicht/db.sqlite"
+        bad_modal.auth_token._value = "adse_modal_token_0123456789"
+        bad_it = _panel_interaction(cfg.bot_owner_id, guild=guild_c)
+        bad_it.user = admin_c
+        try:
+            await bad_modal.on_submit(bad_it)
+        except discord.HTTPException as exc:
+            check("Modal-Submit (kaputte URL): keine 400er-Ablehnung", False, str(exc))
+        bad_sent = bad_it.followup.sends[0] if bad_it.followup.sends else {}
+        check("Modal-Submit (kaputte URL): ❌-Meldung ohne View",
+              str(bad_sent.get("content") or "").startswith("❌")
+              and bad_sent.get("view") is None,
+              str(bad_sent)[:200])
+
+        # ── Die Ansicht selbst: notice wandert in den Container ──────────────
+        plain = database_configured_view({"database_url": "demo.turso.io"})
+        with_notice = database_configured_view(
+            {"database_url": "demo.turso.io"}, notice="✅ Verbunden!",
+        )
+        check("database_configured_view ohne notice: kein leerer Hinweis-Block",
+              "✅ Verbunden" not in _view_text(plain)
+              and _view_text(plain).startswith("# 🗄️"), _view_text(plain)[:80])
+        check("database_configured_view mit notice: Hinweis steht VOR dem Status",
+              _view_text(with_notice).startswith("✅ Verbunden!")
+              and _view_text(with_notice).index("✅") < _view_text(with_notice).index("Status &"),
+              _view_text(with_notice)[:120])
+        check("database_configured_view: Buttons bleiben vollständig",
+              {b.get("custom_id") for b in _view_buttons(with_notice)}
+              == {"relay:v2_db_systems", "relay:v2_db_refresh",
+                  "relay:v2_db_connect", "relay:v2_db_disconnect"},
+              str([b.get("custom_id") for b in _view_buttons(with_notice)]))
+
+        # ── Selbsttest der Simulation: wirft sie wirklich wie Discord? ───────
+        def _v2_error(**payload: Any) -> Optional[str]:
+            try:
+                validate_message_payload(view=with_notice, **payload)
+            except discord.HTTPException as exc:
+                return str(exc)
+            return None
+
+        err = _v2_error(content="✅ Fertig")
+        check("Simulation: content + Components V2 ⇒ exakt Discords 400/50035",
+              err is not None and "(error code: 50035)" in err
+              and "In content: The 'content' field cannot be used when using "
+              "MessageFlags.IS_COMPONENTS_V2" in err, str(err))
+        check("Simulation: embeds + Components V2 ⇒ ebenfalls 400/50035",
+              (_v2_error(embeds=[discord.Embed(title="x")]) or "").startswith("400"))
+        check("Simulation: leere Legacy-Felder (content=None, embeds=[]) sind erlaubt",
+              _v2_error(content=None, embeds=[], attachments=[]) is None)
+
+        v1_view = discord.ui.LayoutView()
+        v1_view.add_item(discord.ui.ActionRow(
+            discord.ui.Button(label="Link", style=discord.ButtonStyle.link, url="https://arena.ai"),
+        ))
+        try:
+            validate_message_payload(view=v1_view, content="Nur Action Rows ⇒ V1")
+            v1_ok = True
+        except discord.HTTPException:
+            v1_ok = False
+        check("Simulation: LayoutView mit reinen Action Rows bleibt V1 (content erlaubt)",
+              v1_ok)
 
         # Ein fremder Admin darf den Button nicht für sich nutzen:
         admin_role_x = FakeRole(6001, "Admin", 9, discord.Permissions(administrator=True).value)
