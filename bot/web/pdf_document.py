@@ -208,24 +208,32 @@ def _components_to_text(components: List[discord.Component]) -> str:
     parts: List[str] = []
     for comp in components:
         ctype = comp.type
-        if ctype is discord.ComponentType.action_row:
+        ctype_name = getattr(ctype, "name", str(ctype))
+        action_row = getattr(discord.ComponentType, "action_row", None)
+        button = getattr(discord.ComponentType, "button", None)
+        select = getattr(discord.ComponentType, "select", None) or getattr(
+            discord.ComponentType, "select_menu", None
+        )
+        text_input = getattr(discord.ComponentType, "text_input", None)
+        container = getattr(discord.ComponentType, "container", None)
+        if ctype is action_row:
             for child in comp.children:
                 parts.append(_components_to_text([child]))
-        elif ctype is discord.ComponentType.button:
+        elif ctype is button:
             btn: discord.Button = comp
             parts.append(f"[Schaltfläche: {_escape(btn.label or '')} ({btn.style.name})]")
-        elif ctype is discord.ComponentType.select_menu:
+        elif ctype is select:
             sel: discord.SelectMenu = comp
-            parts.append(f"[Auswahlmenü: {_escape(sel.placeholder or '')}]")
-        elif ctype is discord.ComponentType.text_input:
+            parts.append(f"[Auswahlmenü: {_escape(getattr(sel, 'placeholder', '') or '')}]")
+        elif ctype is text_input:
             ti: discord.TextInput = comp
-            parts.append(f"[Text-Eingabe: {_escape(ti.label or '')}]")
-        elif ctype is discord.ComponentType.container:
+            parts.append(f"[Text-Eingabe: {_escape(getattr(ti, 'label', '') or '')}]")
+        elif ctype is container:
             cont: discord.Container = comp
             for child in cont.children:
                 parts.append(_components_to_text([child]))
         else:
-            parts.append(f"[Komponente: {ctype.name}]")
+            parts.append(f"[Komponente: {ctype_name}]")
     return " · ".join(parts)
 
 
