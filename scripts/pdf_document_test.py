@@ -49,6 +49,8 @@ import discord  # noqa: E402
 from aiohttp import web  # noqa: E402
 from PIL import Image as PILImage, ImageDraw  # noqa: E402
 
+from bot.web.pdf_document import _clean  # noqa: E402
+
 from bot.web import pdf_document as pdf_mod  # noqa: E402
 from bot.web.pdf_document import (  # noqa: E402
     CONTENT_WIDTH,
@@ -212,13 +214,18 @@ def _build_guild(base_url: str) -> Any:
     )
 
     t1.history = _hist([
-        msg(1, owner, f"Willkommen 🎉 <@455701000000000014> <:tada:455601000000000018> — Привет 中文 ✓ {long_text}"),
+        msg(1, owner, f"Willkommen 🎉 👋 <@455701000000000014> <:tada:455601000000000018> — Привет 中文 ✓ Unicode-Test: 𝗖𝗵𝗮𝘁 𝕏 {long_text}"),
         msg(2, m2, "Ping 👍🏽 :tada: sieht cool aus"),
         msg(3, m3, "Bot-Nachricht", embeds=[embed]),
         m_webhook,
     ])
     t2.history = _hist([msg(4, m4, "Zweite Nachricht ✓ — 中文 テスト"),])
     loose.history = _hist([])
+    # Kanal-Details: Slow-Modus + NSFW an zwei Kanälen
+    t2.slowmode_delay = 300
+    t2.nsfw = True
+    v1.bitrate = 64000
+    v1.user_limit = 12
     return g
 
 
@@ -274,17 +281,27 @@ async def run_tests() -> int:
     for ch in ("ä", "ö", "ü", "ß", "«", "»", "→", "✓", "—", "Ж"):
         check(f"Glyphe vorhanden: {ch!r}", ord(ch) in (pdf_mod._GLYPH_COVERAGE or set()))
 
-    # ── Text-Aufbereitung: keine Notdef-Kandidaten mehr ────────────────────
-    nasty = "🎮🎉 🛡️ <:custom_emoji:123456789012345678> <@123456789012345678> 👍🏽 🇩🇪 Привет 中文 ✓ «ok»"
+    # ── Text-Aufbereitung: Emojis & Unicode-Schriften bleiben sichtbar ─────
+    nasty = "🎮🎉 🛡️ <:custom_emoji:123456789012345678> <@123456789012345678> 👍🏽 🇩🇪 Привет 中文 ✓ «ok» 𝗖𝗵𝗮𝘁 𝕏"
     prepared = _prepare_text(nasty)
     check("Custom-Emoji-Syntax aufgelöst", "custom emoji" in prepared or "custom emoji" in prepared.lower(), prepared)
     check("Member-Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
-    leftovers = [ch for ch in prepared
-                 if ord(ch) not in (pdf_mod._GLYPH_COVERAGE or set()) and ch != "\n"]
-    check("Keine Zeichen ohne Glyphe im Ergebnis", not leftovers, repr(leftovers[:10]))
-    check("Emoji in deutsches Wort übersetzt", "konfettibombe" in prepared.lower(), prepared)
-    check("Kein roher Emoji-Rest", not re.search(
-        "[\U0001F000-\U0001FBFF\U0001F3FB-\U0001F3FF\uFE0F]", prepared), repr(prepared))
+    check("Unicode-Emojis bleiben erhalten", "🎮" in prepared and "🎉" in prepared, prepared)
+    check("Unicode-Schriftarten bleiben erhalten", "𝗖𝗵𝗮𝘁" in prepared and "𝕏" in prepared, prepared)
+    check("Emoji-/Math-Font-Zusatzregister vorhanden",
+          pdf_mod._FONT_COVERAGE.get("emoji") and pdf_mod._FONT_COVERAGE.get("math"),
+          str({k: (len(v) if v else None) for k, v in pdf_mod._FONT_COVERAGE.items()}))
+    # No-Notdef-Garantie: jedes Zeichen im fertigen Markup (Tags entfernt)
+    # muss in mind. einem der drei Fonts darstellbar sein.
+    markup = _clean(nasty)
+    tag_free = re.sub(r"</?font[^>]*>|<br/>", "", markup)
+    uncovered = [ch for ch in tag_free
+                 if ord(ch) not in (pdf_mod._FONT_COVERAGE.get("sans") or set())
+                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("emoji") or set())
+                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("math") or set())]
+    check("Markup: kein Zeichen ohne Glyphe in irgendeinem Font", not uncovered, repr(uncovered[:10]))
+    check("Ungedeckte Zeichen (CJK ohne Font) gefiltert statt Notdef",
+          "中" not in markup and "文" not in markup and "🎮" in markup)
     check("Zeitangaben bleiben unzerstört",
           _prepare_text("Treffen 12:30:00 Uhr") == "Treffen 12:30:00 Uhr",
           _prepare_text("Treffen 12:30:00 Uhr"))
@@ -292,7 +309,6 @@ async def run_tests() -> int:
           "\u200b" not in _prepare_text("a\u200bb\u202ec") and "\u202e" not in _prepare_text("a\u200bb\u202ec"))
     check("Mehrfach-Leerzeichen normalisiert",
           _prepare_text("a   \n   b") == "a b", repr(_prepare_text("a   \n   b")))
-
     # ── Tabellenbreiten ────────────────────────────────────────────────────
     print("\n  ── Server-Dokument (PDF): Komplett-Build gegen Fake-Server ──\n")
 
@@ -322,18 +338,45 @@ async def run_tests() -> int:
         check("Bild-XObjects im PDF vorhanden (≥ 15)", n_images >= 15, f"{n_images}")
         check("PDF-Größe plausibel mit Bildern (> 80 KB)", len(pdf_bytes) > 80_000,
               f"{len(pdf_bytes) // 1024} KB")
-        check("DejaVu-Fonts eingebettet (≥ 3: Sans, Bold, Mono)",
-              len(re.findall(rb"/FontFile2", pdf_bytes)) >= 3)
+        check("Fonts eingebettet (≥ 5: Sans, Bold, Mono, Emoji, Math)",
+              len(re.findall(rb"/FontFile2", pdf_bytes)) >= 5,
+              f"{len(re.findall(rb'/FontFile2', pdf_bytes))} FontFile2-Streams")
 
-        # 2) Sichtbarer Text ist notdef-frei (Font-Abdeckung deckt alles ab)
-        #    Der Build filtert bereits; als Doppelprüfung hier gegen Coverage:
-        check("Coverage-Filter greift (smoke)",
-              _prepare_text("🎮中文Ж✓") and not re.search(
-                  "[\U0001F000-\U0001FBFF]", _prepare_text("🎮中文Ж✓")))
+        # 2) Notdef-Schutz: Emojis/𝗖 laufen über Zusatz-Fonts, ungedeckte
+        #    Zeichen (CJK — DejaVu+Noto Math kennen keine Ideographen) werden
+        #    im Markup gefiltert statt als schwarzes Viereck zu landen:
+        check("Notdef-Schutz: ungedeckte Zeichen gefiltert, Emoji/Math sichtbar",
+              "中" not in _clean("中文🎮𝗖") and "🎮" in _clean("中文🎮𝗖") and "𝗖" in _clean("中文🎮𝗖"),
+              repr(_clean("中文🎮𝗖")))
 
         # 3) Tabellenbreiten: Summe der colWidths entspricht CONTENT_WIDTH
         check("CONTENT_WIDTH ist A4 abzüglich Ränder",
               abs(CONTENT_WIDTH / 2.8346 - (210 - 36)) < 1.0, f"{CONTENT_WIDTH / 2.8346:.1f} mm")
+
+        # 4) Neue Layout-Features: Emojis/Math-Fonts WIRKLICH benutzt
+        #    (ReportLab bettet nur benutzte Fonts ein — dies schlägt fehl,
+        #    wenn keine Emoji-/Math-Zeichen gerendert wurden), Kanal-Details
+        #    (Slow-Modus, NSFW, Bitrate), Nachrichten älteste zuerst,
+        #    Kanal-Überschriften.
+        try:
+            import pymupdf  # noqa: F401
+        except ImportError:  # pragma: no cover — pymupdf ist optional
+            pymupdf = None
+        check("Emoji-Font im PDF eingebettet & benutzt",
+              b"NotoEmoji-Regular" in pdf_bytes, "")
+        check("Math-Font im PDF eingebettet & benutzt",
+              b"NotoSansMath-Regular" in pdf_bytes, "")
+        if pymupdf is not None:
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            full_text = "\n".join(p.get_text() for p in doc)
+            doc.close()
+            check("Extraktion: Kanal-Details (Slow-Modus 5 min, NSFW)",
+                  "Slow-Modus 5 min" in full_text and "NSFW" in full_text, "")
+            check("Extraktion: Voice-Details (Bitrate, Limit)",
+                  "Bitrate 64 kbps" in full_text and "Limit 12 Nutzer" in full_text, "")
+            check("Extraktion: Kanal-Überschrift #allgemein vorhanden",
+                  "#allgemein" in full_text, "")
+
 
         # ── Regression: Riesige Nachrichten dürfen den Build nicht crashen ──
         # Discord erlaubt 4000–8000 Zeichen pro Nachricht und Embeds mit je

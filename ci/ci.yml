@@ -11,7 +11,7 @@
 #
 #  Läuft bei jedem Push und jedem Pull Request. Kein Discord-Token nötig:
 #  Der Smoke-Test startet den echten Web-Server gegen einen simulierten
-#  Discord-Client (scripts/_fake_discord.py) und fährt 311 Prüfungen,
+#  Discord-Client (scripts/_fake_discord.py) und fährt 313 Prüfungen,
 #  inklusive der vollständigen Ausführung aller fünf Setup-Vorlagen und
 #  eines kompletten Server-Dokument-Builds (PDF). Dazu kommt
 #  scripts/login_recovery_test.py (206 Prüfungen) für das Verhalten

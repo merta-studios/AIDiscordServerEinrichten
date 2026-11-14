@@ -78,13 +78,12 @@ log = logging.getLogger("relay.discord")
 # Das Dokument geht an den BOT-Owner (Application-Owner), nicht an den
 # Server-Owner — der Bot-Betreiber ist der Empfänger.
 #
-# Aufräumen: Frühere Versionen sendeten an den Server-Owner. Diese Legacy-
-# Empfänger werden beim Bot-Start und vor jeder neuen Zustellung nach
-# „server-dokument-*.pdf"-DMs gescannt und diese gelöscht (einmalig je ID,
-# danach in data/server_document_delivery.json markiert). Optional lässt sich
-# derselbe Schritt ohne Deploy sofort ausführen:
-#   DISCORD_BOT_TOKEN=… python scripts/delete_sent_documents.py
-LEGACY_DOCUMENT_RECIPIENTS = [1015212381619626014]
+# Vor jeder neuen Zustellung werden frühere „server-dokument-*.pdf"-DMs
+# gelöscht (beim letzten Empfänger aus data/server_document_delivery.json und
+# beim neuen Empfänger) — es gibt immer nur EIN aktuelles Dokument. Kein
+# Start-Scan mehr: das einmalige Legacy-Aufräumen (Server-Owner
+# 1015212381619626014) ist mit dem Deployment vom 14.11.2026 abgeschlossen
+# (Log: „Server-Dokument-Aufräumen beim Start: 1 DM-Nachricht(en) gelöscht").
 DOCUMENT_DELIVERY_PATH = "data/server_document_delivery.json"
 
 __all__ = (
@@ -889,8 +888,6 @@ class RelayClient(discord.Client):
         # Nach dem Verlassen des Servers hat der Bot keinen Audit-Log-Zugriff
         # mehr — deshalb wird der Grund abgehört, SOLANGE er noch Mitglied ist.
         self._pending_leave_reasons: Dict[int, Dict[str, Any]] = {}
-        # Task für das Start-Aufräumen der Server-Dokument-DMs (siehe setup_hook).
-        self._doc_cleanup_task: Optional[asyncio.Task] = None
         self.tree.on_error = self._on_command_error  # type: ignore[assignment]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -900,21 +897,7 @@ class RelayClient(discord.Client):
         # Registrierung sorgt dafür, dass Klicks auf ausgelieferte Nachrichten
         # auch nach einem Render-Deploy noch dispatched werden.
         self.add_view(_button_registration_view())
-        # Server-Dokument-Aufräumen: alte Dokument-DMs (Legacy-Empfänger +
-        # letzte Zustellung) werden sofort nach dem Start gelöscht — nie
-        # blockierend, nie startkritisches.
-        self._doc_cleanup_task = asyncio.create_task(self._cleanup_documents_on_start())
         await self._sync_commands()
-
-    async def _cleanup_documents_on_start(self) -> None:
-        """Löscht beim Start zugestellte Server-Dokument-DMs (best effort)."""
-        await self.wait_until_ready()
-        try:
-            deleted = await self._cleanup_previous_documents()
-            if deleted:
-                log.info("Server-Dokument-Aufräumen beim Start: %d DM-Nachricht(en) gelöscht.", deleted)
-        except Exception:  # noqa: BLE001 — Aufräumen darf den Start nie brechen
-            log.exception("Server-Dokument-Aufräumen beim Start fehlgeschlagen.")
 
     async def _sync_commands(self) -> None:
         """
@@ -1639,29 +1622,27 @@ class RelayClient(discord.Client):
             log.warning("DM-Verlauf für %s nicht lesbar: %s", user_id, exc)
         return deleted
 
-    async def _cleanup_previous_documents(self) -> int:
+    async def _cleanup_previous_documents(self, new_recipient_id: Optional[int] = None) -> int:
         """
-        Löscht bereits zugestellte Server-Dokument-DMs: die Legacy-Empfänger
-        (alte Zustellungen an den Server-Owner) und die letzte Zustellung aus
-        dem Status-File. Wird beim Bot-Start und vor jeder neuen Zustellung
-        aufgerufen; Fehler blockieren niemals.
+        Löscht bereits zugestellte Server-Dokument-DMs — beim letzten
+        Empfänger (Status-File) und beim neuen Empfänger — bevor ein neues
+        Dokument geht. Fehler blockieren niemals.
         """
         state = self._load_doc_delivery()
-        cleaned = {int(x) for x in (state.get("cleaned_recipient_ids") or [])
-                   if str(x).lstrip("-").isdigit()}
-        targets: List[int] = []
-        for rid in LEGACY_DOCUMENT_RECIPIENTS:
-            if int(rid) not in cleaned and int(rid) not in targets:
-                targets.append(int(rid))
         record = state.get("last_delivery") or {}
+        targets: List[int] = []
         rid = record.get("recipient_id")
-        if rid is not None and str(rid).lstrip("-").isdigit() \
-                and int(rid) not in targets:
+        if rid is not None and str(rid).lstrip("-").isdigit():
             targets.append(int(rid))
+        if new_recipient_id is not None:
+            if new_recipient_id not in targets:
+                targets.append(int(new_recipient_id))
         total = 0
         for uid in targets:
             total += await self._delete_document_dms_for(uid)
         if targets:
+            cleaned = {int(x) for x in (state.get("cleaned_recipient_ids") or [])
+                       if str(x).lstrip("-").isdigit()}
             cleaned.update(targets)
             state["cleaned_recipient_ids"] = sorted(cleaned)
             state.pop("last_delivery", None)
@@ -1746,10 +1727,10 @@ class RelayClient(discord.Client):
             file = discord.File(io.BytesIO(pdf_bytes), filename=f"server-dokument-{guild.id}.pdf")
 
             # Vor der neuen Zustellung: alte Dokument-DMs löschen (letzter
-            # Empfänger + Legacy-Empfänger) — Fehler dürfen den Versand
+            # Empfänger + der neue Empfänger) — Fehler dürfen den Versand
             # niemals verhindern.
             try:
-                cleaned = await self._cleanup_previous_documents()
+                cleaned = await self._cleanup_previous_documents(recipient.id)
                 if cleaned:
                     log.info("Vor neuer Zustellung %d alte Server-Dokument-DM(s) gelöscht.", cleaned)
             except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
