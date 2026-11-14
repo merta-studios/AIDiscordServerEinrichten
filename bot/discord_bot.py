@@ -346,7 +346,7 @@ def _parse_admin_custom_id(custom_id: str) -> Optional[Dict[str, Any]]:
     if action == "search":
         return {"action": "search", "page": 0, "query": ""}
 
-    if action in ("guild", "invite", "leave", "leave_confirm"):
+    if action in ("guild", "invite", "leave", "leave_confirm", "create_doc"):
         guild_id_raw = parts[1] if len(parts) > 1 else ""
         try:
             guild_id: Optional[int] = int(guild_id_raw)
