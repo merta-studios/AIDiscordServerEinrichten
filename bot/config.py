@@ -109,10 +109,6 @@ class Config:
     allowed_origin: str = "*"
     console_enabled: bool = True
 
-    # ── Turso Haupt-Datenbank (Master DB) ──────────────────────────────────
-    turso_database_url: str = ""
-    turso_auth_token: str = ""
-
     # ── Sessions ───────────────────────────────────────────────────────────
     session_ttl_hours: float = 24.0
     max_sessions_per_guild: int = 5
@@ -257,7 +253,7 @@ class Config:
         Weitere bleibt lesbar. So ist eine Fehlkonfiguration im Render-Log
         erkennbar, ohne dass ein Log-Screenshot das Token preisgibt.
         """
-        secret_fields = {"discord_token", "discord_proxy_password", "turso_auth_token"}
+        secret_fields = {"discord_token", "discord_proxy_password"}
         values: Dict[str, Any] = {}
         for name in sorted(dir(self)):
             if name.startswith("_"):
@@ -341,8 +337,6 @@ def load_config() -> Config:
         base_url=_clean_url(_str("PUBLIC_URL", "")),
         allowed_origin=_str("ALLOWED_ORIGIN", "*"),
         console_enabled=_bool("CONSOLE_ENABLED", True),
-        turso_database_url=_clean_url(_str("TURSO_DATABASE_URL", "") or _str("TURSO_URL", "") or _str("TURSO_DB_URL", "")),
-        turso_auth_token=_str("TURSO_AUTH_TOKEN", "") or _str("TURSO_TOKEN", ""),
         session_ttl_hours=_float("SESSION_TTL_HOURS", 24.0),
         max_sessions_per_guild=_int("MAX_SESSIONS_PER_GUILD", 5),
         data_dir=_str("DATA_DIR", "data"),
