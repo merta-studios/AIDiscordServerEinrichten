@@ -2,17 +2,13 @@
 """
 Löscht bereits zugestellte Server-Dokument-DMs — SOFORT, ohne Deploy.
 
-Der Bot hat früher das Server-Dokument per DM an den Server-Owner geschickt;
-jetzt geht es an den Bot-Owner. Dieses Skript räumt die alten DMs auf:
+Der Bot löscht vor jeder neuen Zustellung automatisch die alte Dokument-DM.
+Wenn das manuell nötig wird (z. B. ohne neuen Versand):
 
     DISCORD_BOT_TOKEN=<Bot-Token> python scripts/delete_sent_documents.py
 
-Ohne Argumente werden bereinigt:
-  * die Legacy-Empfänger aus ``bot.discord_bot.LEGACY_DOCUMENT_RECIPIENTS``
-    (inkl. des Dokuments, das an den Server-Owner zugestellt wurde),
-  * der Empfänger aus ``data/server_document_delivery.json`` (letzte Zustellung).
-
-Optional können eigene Empfänger-IDs als Argumente übergeben werden:
+Ohne Argumente wird der Empfänger aus ``data/server_document_delivery.json``
+(letzte Zustellung) bereinigt. Optional eigene Empfänger-IDs als Argumente:
     python scripts/delete_sent_documents.py 1015212381619626014 234567890123456789
 
 Gelöscht werden in den DM-Verläufen (bis 500 Nachrichten je Empfänger) alle
@@ -33,7 +29,7 @@ import discord
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from bot.discord_bot import DOCUMENT_DELIVERY_PATH, LEGACY_DOCUMENT_RECIPIENTS  # noqa: E402
+from bot.discord_bot import DOCUMENT_DELIVERY_PATH  # noqa: E402
 
 SCAN_LIMIT = 500
 
@@ -48,15 +44,11 @@ def _is_document_message(message: Any) -> bool:
 
 def _target_ids() -> List[int]:
     ids: List[int] = []
-    for rid in LEGACY_DOCUMENT_RECIPIENTS:
-        rid = int(rid)
-        if rid not in ids:
-            ids.append(rid)
     try:
         with open(REPO_ROOT / DOCUMENT_DELIVERY_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         rid = (data.get("last_delivery") or {}).get("recipient_id")
-        if rid is not None and str(rid).lstrip("-").isdigit() and int(rid) not in ids:
+        if rid is not None and str(rid).lstrip("-").isdigit():
             ids.append(int(rid))
     except (FileNotFoundError, OSError, ValueError):
         pass

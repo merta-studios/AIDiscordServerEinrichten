@@ -4,7 +4,7 @@ Server-Übersicht mit Bildern.
 
 Wird aus dem Adminpanel (Button „Server-Dokument erstellen“) aufgerufen,
 erzeugt ein PDF mit allen verfügbaren Server-Daten und liefert die PDF-Bytes
-zurück. Der Versand per DM an den Server-Owner erfolgt im Aufrufer
+zurück. Der Versand per DM an den Bot-Owner erfolgt im Aufrufer
 (``RelayClient._handle_admin_create_doc``), damit der Server selbst nichts
 bemerkt.
 
@@ -17,9 +17,11 @@ Design-Prinzipien dieser Neuauflage
   deshalb enthielt das PDF keine einzige Grafik.)
 * **Keine schwarzen Vierecke mehr** — statt Helvetica (die keine Emojis,
   Pfeile oder kyrillische Zeichen kennt) wird DejaVu Sans mit dem Bot
-  mitgeliefert und eingebettet. Rest-Emojis werden über ``emoji.demojize``
-  in Wörter übersetzt; Zeichen ohne Glyph im Font werden gefiltert, sodass
-  niemals „Notdef“-Kästen (schwarze Vierecke) entstehen können.
+  mitgeliefert und eingebettet. Emojis (👋, 🎉) und Unicode-„Schriftarten“
+  (𝗖𝗵𝗮𝘁, 𝕏, 𝔊) werden über mitgelieferte Noto-Fonts (Monochrome Emoji +
+  Noto Sans Math) als echte Zeichen gerendert — der Paragraph-Renderer wählt
+  pro Zeichen den passenden Font; Zeichen ohne Glyphe in ALLEN Fonts werden
+  gefiltert, sodass niemals „Notdef“-Kästen entstehen können.
 * **Nichts läuft mehr über den Rand** — alle langen Texte (Berechtigungen,
   Rollenlisten, Nachrichteninhalte) sind ReportLab-``Paragraph``-Flowables
   mit sauberem Zeilenumbruch; jede Tabelle bleibt schmaler als der Satzspiegel.
@@ -76,11 +78,6 @@ try:  # Pillow ist für Bildkonvertierung (WebP/GIF/RGBA) zuständig
 except ImportError:  # pragma: no cover — requirements machen das unwahrscheinlich
     _PILImage = None
 
-try:  # emoji übersetzt Rest-Emojis in lesbare Wörter (🎉 → "party popper")
-    import emoji as _emoji_lib
-except ImportError:  # pragma: no cover
-    _emoji_lib = None
-
 log = logging.getLogger("relay.pdf")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +118,9 @@ EMBED_TITLE_MAX_CHARS = 120
 EMBED_LABEL_MAX_CHARS = 80
 MAX_ATTACHMENT_NAMES = 6
 COMPONENTS_TEXT_MAX_CHARS = 500
+#: Max. Höhe einer Nachrichten-Kästchen-Box in Punkt — darüber wird die
+#: Nachricht unboxiert (splittbar) gerendert (LayoutError-Schutz).
+MAX_MESSAGE_BOX_PT = 660.0
 
 #: Fortschritts-Callback: (prozent: int, text: str) -> None
 ProgressCallback = Callable[[int, str], None]
@@ -163,10 +163,22 @@ _FONT_FILES: Dict[str, Tuple[str, str]] = {
     "mono": ("DejaVuSansMono.ttf", "Courier"),
     "mono_bold": ("DejaVuSansMono-Bold.ttf", "Courier-Bold"),
 }
-_FONTS: Dict[str, str] = {role: fallback for role, (_file, fallback) in _FONT_FILES.items()}
+#: Optionale Zusatz-Fonts (fehlende Datei degradiert nur die Darstellung):
+#: * emoji — Monochromes Noto Emoji: Echte Emoji-Glyphen im PDF (👋 statt
+#:   „winkende Hand“), inkl. Hauttönen, ZWJ-Sequenzen und Regional-Indikatoren.
+#: * math — Noto Sans Math: Unicode-„Schriftarten“ wie 𝗖𝗵𝗮𝘁 (Mathematical
+#:   Alphanumeric Symbols, Fraktur, Double-Struck …), die DejaVu nicht kennt.
+_EXTRA_FONT_FILES: Dict[str, str] = {
+    "emoji": "NotoEmoji.ttf",
+    "math": "NotoSansMath.ttf",
+}
+_FONTS: Dict[str, Optional[str]] = {role: fallback for role, (_file, fallback) in _FONT_FILES.items()}
+_FONTS.update({role: None for role in _EXTRA_FONT_FILES})  # bis geladen: None
 _FONTS_READY = False
 #: Menge der im Font vorhandenen Codepoints (für die Notdef-Filterung)
 _GLYPH_COVERAGE: Optional[set] = None
+#: Coverage der Zusatz-Fonts (None = Font nicht verfügbar)
+_FONT_COVERAGE: Dict[str, Optional[set]] = {"sans": None, "emoji": None, "math": None}
 
 
 def _ensure_fonts() -> Dict[str, str]:
@@ -186,7 +198,7 @@ def _ensure_fonts() -> Dict[str, str]:
 
     if fonts_dir is not None:
         try:
-            registered: Dict[str, str] = {}
+            registered: Dict[str, Optional[str]] = {}
             for role, (fname, _fallback) in _FONT_FILES.items():
                 name = f"DejaVu-{role}"
                 pdfmetrics.registerFont(TTFont(name, str(fonts_dir / fname)))
@@ -209,9 +221,28 @@ def _ensure_fonts() -> Dict[str, str]:
             _FONTS.update(registered)
             face = pdfmetrics.getFont(_FONTS["sans"]).face
             _GLYPH_COVERAGE = set(getattr(face, "charToGlyph", {}).keys())
+            _FONT_COVERAGE["sans"] = _GLYPH_COVERAGE
             log.debug("PDF-Fonts geladen aus %s", fonts_dir)
         except Exception as exc:  # noqa: BLE001 — Fallback unten greift
             log.warning("DejaVu-Fonts konnten nicht geladen werden (%s) — Fallback auf Base-14", exc)
+
+        # Zusatz-Fonts (Emoji + Math) — einzeln, fehlgeschlagen = optional
+        for role, fname in _EXTRA_FONT_FILES.items():
+            path = fonts_dir / fname
+            if not path.is_file():
+                continue
+            try:
+                name = f"DejaVu-{role}"
+                pdfmetrics.registerFont(TTFont(name, str(path)))
+                _FONTS[role] = name
+                _FONT_COVERAGE[role] = set(
+                    getattr(pdfmetrics.getFont(name).face, "charToGlyph", {}).keys()
+                )
+                log.debug("PDF-Zusatzfont %s geladen (%s)", role, fname)
+            except Exception as exc:  # noqa: BLE001 — Zusatzfont ist optional
+                log.warning("Zusatz-Font %s (%s) konnte nicht geladen werden: %s", role, fname, exc)
+                _FONTS[role] = None
+                _FONT_COVERAGE[role] = None
     else:
         log.warning("Keine DejaVu-Fonts gefunden — das PDF nutzt Base-14-Fallbacks")
 
@@ -220,7 +251,8 @@ def _ensure_fonts() -> Dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Text-Aufbereitung: Emojis → Wörter, Notdef-frei, Markup-sicher
+#  Text-Aufbereitung: Emojis & Unicode-Schriftarten bleiben sichtbar,
+#  Notdef-frei, Markup-sicher
 # ─────────────────────────────────────────────────────────────────────────────
 
 #: Custom-Discord-Emojis ``<:name:id>`` / ``<a:name:id>``
@@ -229,36 +261,19 @@ _DISCORD_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]{2,32}):\d{10,25}>")
 _MEMBER_MENTION_RE = re.compile(r"<@!?(\d{10,25})>")
 _ROLE_MENTION_RE = re.compile(r"<@&(\d{10,25})>")
 _CHANNEL_MENTION_RE = re.compile(r"<#(\d{10,25})>")
-#: Skin-Ton-Suffixe in Demojize-Tokens (deutsch + englisch)
-_SKIN_TONE_RE = re.compile(
-    r"_(?:helle|mittlere_helle|mittlere|mittlere_dunkle|dunkle)_hautfarbe"
-    r"|_(?:light|medium_light|medium|medium_dark|dark)_skin_tone"
-)
 #: Demojize-Tokens ``:party_popper:`` / ``:reißzwecke:`` — muss mit einem
 #: Buchstaben beginnen, damit Zeitangaben wie „12:30:00“ nicht zerstört werden.
 _DEMOJI_TOKEN_RE = re.compile(r":([^\W\d_][\w+\-]{1,59}):", re.UNICODE)
-#: Flag-Tokens ``:flag_de:`` / ``:flagge_deutschland:`` → Ländername
-_FLAG_TOKEN_RE = re.compile(r":flag_([a-z]{2}):|:flagge_([a-zäöüß]+):")
-#: Rest-Emojis: der komplette Symbolbereich der Supplemental Plane,
-#: Variationsselektoren, ZWJ, Keycaps, Skin-Ton-Modifier
-_LEFTOVER_EMOJI_RE = re.compile(
-    "[\U0001F000-\U0001FBFF\uFE00-\uFE0F\u200D\u20E3\U0001F3FB-\U0001F3FF]"
-)
 #: Kontroll- und unsichtbare Zeichen (Bidi-Overrides, Zero-Width …)
 _CONTROL_RE = re.compile(
     "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\uFEFF]"
 )
+#: Hautton-Modifier + Variationsselektoren: NotoEmoji zeichnet sie einzeln
+#: als leere Kästchen — für Monochrom-Darstellung bedeutungslos → strippen.
+_EMOJI_MODIFIER_RE = re.compile(
+    "[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F]"
+)
 _MULTI_SPACE_RE = re.compile(r"[ \t\f\v]{2,}")
-
-
-def _demojize(text: str) -> str:
-    """Übersetzt Unicode-Emojis in lesbare Token-Texte (🎉 → „konfettibombe“)."""
-    if _emoji_lib is None:
-        return _LEFTOVER_EMOJI_RE.sub(" ", text)
-    s = _emoji_lib.demojize(text, language="de")
-    s = _SKIN_TONE_RE.sub("", s)
-    s = _FLAG_TOKEN_RE.sub(lambda m: " " + (m.group(1) or m.group(2)).capitalize() + " ", s)
-    return s
 
 
 def _emoji_token_to_text(match: "re.Match[str]") -> str:
@@ -267,7 +282,7 @@ def _emoji_token_to_text(match: "re.Match[str]") -> str:
 
 
 def _coverage_filter(s: str) -> str:
-    """Entfernt Zeichen, die der aktive Font nicht darstellen kann (No-Notdef-Garantie)."""
+    """Entfernt Zeichen, die der Sans-Font nicht darstellen kann (Canvas-Pfade)."""
     if _GLYPH_COVERAGE is None:
         return s
     return "".join(ch for ch in s if ch == "\n" or ord(ch) in _GLYPH_COVERAGE)
@@ -284,9 +299,11 @@ def _prepare_text(text: Optional[str], *, keep_newlines: bool = False) -> str:
     """
     Roh-Text (Discord) → sauberer, druckbarer Text (noch NICHT HTML-escaped).
 
-    Reihenfolge: Custom-Emojis auflösen → Mentions lesbar machen → Emojis
-    demojizen → Tokens in Wörter → Rest-Emoji/Steuerzeichen entfernen →
-    Glyph-Filter → Whitespace normalisieren.
+    Unicode-Emojis (👋, 🎉 …) und Unicode-„Schriftarten“ (𝗖𝗵𝗮𝘁 …) bleiben
+    als echte Zeichen erhalten — die Paragraph-Renderer wählen dafür
+    automatisch den Emoji- bzw. Math-Font (``_font_markup``). Custom-Emojis
+    (``<:name:id>``) werden in ihren Namen aufgelöst, Mentions lesbar
+    umschrieben, Steuerzeichen entfernt, Whitespace normalisiert.
     """
     if text is None:
         return ""
@@ -295,11 +312,9 @@ def _prepare_text(text: Optional[str], *, keep_newlines: bool = False) -> str:
         lambda m: " " + m.group(1).replace("_", " ").replace("-", " ").strip() + " ", s
     )
     s = _mentions_to_text(s)
-    s = _demojize(s)
     s = _DEMOJI_TOKEN_RE.sub(_emoji_token_to_text, s)
-    s = _LEFTOVER_EMOJI_RE.sub(" ", s)
+    s = _EMOJI_MODIFIER_RE.sub("", s)
     s = _CONTROL_RE.sub(" ", s)
-    s = _coverage_filter(s)
     s = s.replace("\r", "\n")
     if keep_newlines:
         s = re.sub(r"[ \t\f\v]+", " ", s)
@@ -318,14 +333,70 @@ def _esc(text: Optional[str]) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _font_markup(escaped: str) -> str:
+    """
+    Escaped Text → Paragraph-Markup mit Font-Wechseln pro Zeichenbereich.
+
+    Priorität: Sans (DejaVu) → Emoji-Font (Noto Emoji) → Math-Font
+    (Noto Sans Math). Zeichen, die KEIN verfügbarer Font darstellen kann,
+    werden entfernt — so kann niemals ein „Notdef“-Kasten entstehen.
+    Dadurch sind echte Emojis (👋, 🎉) und Unicode-Schriftarten (𝗖𝗵𝗮𝘁,
+    𝕏, 𝔊) sichtbar, obwohl DejaVu sie nicht kennt. ``\\n`` wird zu ``<br/>``.
+    """
+    cov_sans = _FONT_COVERAGE.get("sans")
+    cov_emoji = _FONT_COVERAGE.get("emoji")
+    cov_math = _FONT_COVERAGE.get("math")
+    out: List[str] = []
+    cur: Optional[str] = None
+
+    def _cls(ch: str) -> Optional[str]:
+        """None = Sans/Base (kein Tag), sonst Rolle — oder „drop“ als Sentinel."""
+        o = ord(ch)
+        if cov_sans is not None:
+            if o in cov_sans:
+                return None
+        elif o < 0x100:  # kein DejaVu geladen: Base-14 deckt Latin-1 ab
+            return None
+        if cov_emoji is not None and o in cov_emoji:
+            return "emoji"
+        if cov_math is not None and o in cov_math:
+            return "math"
+        return "drop"
+
+    for ch in escaped:
+        if ch == "\n":
+            if cur is not None:
+                out.append("</font>")
+                cur = None
+            out.append("<br/>")
+            continue
+        cls = _cls(ch)
+        if cls == "drop":
+            # Kein Font kennt das Zeichen → wegfiltern (No-Notdef-Garantie).
+            if cur is not None:
+                out.append("</font>")
+                cur = None
+            continue
+        if cls != cur:
+            if cur is not None:
+                out.append("</font>")
+            if cls is not None:
+                out.append(f"<font name='{_FONTS[cls]}'>")
+            cur = cls
+        out.append(ch)
+    if cur is not None:
+        out.append("</font>")
+    return "".join(out)
+
+
 def _clean(text: Optional[str]) -> str:
     """Einzeilig, escaped, druckbar — für Namen, IDs, Tabellenzellen."""
-    return _esc(_prepare_text(text))
+    return _font_markup(_esc(_prepare_text(text)))
 
 
 def _clean_ml(text: Optional[str]) -> str:
     """Wie ``_clean``, behält aber Zeilenumbrüche (→ ``<br/>`` für Paragraphs)."""
-    return _esc(_prepare_text(text, keep_newlines=True)).replace("\n", "<br/>")
+    return _font_markup(_esc(_prepare_text(text, keep_newlines=True)))
 
 
 def _short(text: str, max_len: int) -> str:
@@ -599,6 +670,14 @@ def _styles() -> Dict[str, ParagraphStyle]:
             "msg_body", fontName=f["sans"], fontSize=8.8, leading=12.2,
             textColor=_C.text,
         ),
+        "msg_channel_head": ParagraphStyle(
+            "msg_channel_head", fontName=f["bold"], fontSize=12.6, leading=16.4,
+            textColor=_C.dark, spaceBefore=2, spaceAfter=1,
+        ),
+        "msg_channel_meta": ParagraphStyle(
+            "msg_channel_meta", fontName=f["sans"], fontSize=7.8, leading=16.4,
+            textColor=_C.muted,
+        ),
         "chip_white": ParagraphStyle(
             "chip_white", fontName=f["bold"], fontSize=7.4, leading=9.4,
             textColor=_C.white,
@@ -639,6 +718,11 @@ def _styles() -> Dict[str, ParagraphStyle]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _luma(c: colors.Color) -> float:
+    """Helligkeit einer Farbe (0–1) — für Kontrast-Entscheidungen."""
+    return 0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue
+
+
 def _chip(text: str, bg: colors.Color, dark_text: bool = False) -> Table:
     """
     Abgerundetes Farbetag (in Tabellenzellen und Chips-Zeilen verwendbar).
@@ -649,7 +733,7 @@ def _chip(text: str, bg: colors.Color, dark_text: bool = False) -> Table:
     label = _prepare_text(text)
     font = _FONTS["bold"]
     width = pdfmetrics.stringWidth(label, font, 7.4) + 9  # + Padding links/rechts
-    inner = Table([[Paragraph(_esc(label), _styles()["chip_dark" if dark_text else "chip_white"])]],
+    inner = Table([[Paragraph(_font_markup(_esc(label)), _styles()["chip_dark" if dark_text else "chip_white"])]],
                   colWidths=[width])
     inner._adse_width = width
     inner.setStyle(TableStyle([
@@ -686,6 +770,80 @@ def _chips_row(chips: List[Tuple[str, colors.Color, bool]]) -> Table:
 
 
 _ZEBRA = ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_C.white, _C.lighter])
+
+
+def _gray_chip(label: str, max_width: Optional[float] = None) -> Table:
+    """
+    Abgerundetes graues Kästchen (Mitglieder-Rollen). Breite = Label-Breite;
+    bei sehr langen Rollennamen wird das Label mit „…“ auf ``max_width``
+    gekürzt, damit kein Kästchen die Spalte sprengt.
+    """
+    text = _prepare_text(label)
+    font = _FONTS["sans"]
+    size = 7.0
+    if max_width is not None:
+        while len(text) > 1 and pdfmetrics.stringWidth(text, font, size) + 8 > max_width:
+            text = text[:-2].rstrip() + "…"
+    width = pdfmetrics.stringWidth(text, font, size) + 8
+    inner = Table([[Paragraph(
+        _font_markup(_esc(text)),
+        ParagraphStyle("chip_gray", fontName=font, fontSize=size, leading=8.8, textColor=_C.text),
+    )]], colWidths=[width])
+    inner._gray_chip_w = width
+    inner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#E7E9EE")),
+        ("ROUNDEDCORNERS", [3, 3, 3, 3]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6),
+    ]))
+    return inner
+
+
+def _chip_lines(labels: List[str], max_width: float) -> List[Any]:
+    """
+    Packt graue Rollen-Kästchen mit Padding nebeneinander (greedy) und
+    untereinander als Zeilen — jede Zeile eine kleine Tabelle, linksbündig.
+    """
+    gap = 4.0
+    lines: List[List[Table]] = [[]]
+    line_widths: List[float] = [0.0]
+    for label in labels:
+        chip = _gray_chip(label, max_width)
+        w = chip._gray_chip_w
+        extra = w if not lines[-1] else gap + w
+        if lines[-1] and line_widths[-1] + extra > max_width:
+            lines.append([chip])
+            line_widths.append(w)
+        else:
+            lines[-1].append(chip)
+            line_widths[-1] += extra
+    out: List[Any] = []
+    for row in lines:
+        if not row:
+            continue
+        cells: List[Any] = []
+        widths: List[float] = []
+        for i, c in enumerate(row):
+            if i:
+                cells.append(Spacer(gap, 1))
+                widths.append(gap)
+            cells.append(c)
+            widths.append(c._gray_chip_w)
+        t = Table([cells], colWidths=widths, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        out.append(t)
+        out.append(Spacer(1, 1.6))
+    if out:
+        out.pop()  # letzter Zeilen-Abstand entfällt
+    return out or [Paragraph("—", _styles()["table_small"])]
 
 
 def _table_style(zebra: bool = True) -> TableStyle:
@@ -1028,9 +1186,49 @@ async def build_server_document(
     banner_url = getattr(guild.banner, "url", None) if getattr(guild, "banner", None) else None
 
     banner_flow = img(banner_url, max_w=CONTENT_WIDTH / mm, max_h=52, upscale=True)
+    banner_hint: str
     if banner_flow is not None:
         flowables.append(banner_flow)
         flowables.append(Spacer(1, 5 * mm))
+        banner_hint = "Server-Banner: <b>hochgeladen</b> — als Bild oben."
+    else:
+        # Kein Banner: Akzentfarbe zeigen — die Farbe der höchsten farbigen
+        # Rolle (die „ausgewählte Farbe“ des Servers), sonst Blurple.
+        accent_role: Any = None
+        for r in roles:
+            if r.color.value:
+                accent_role = r
+                break
+        if accent_role is not None:
+            accent_hex = f"#{accent_role.color.value:06x}"
+            accent_src = f"höchste farbige Rolle „{_clean(accent_role.name)}“"
+        else:
+            accent_hex = "#5865F2"
+            accent_src = "Standard-Akzentfarbe (keine farbige Rolle)"
+        accent_color = colors.HexColor(accent_hex)
+        band_text_color = colors.white if _luma(accent_color) < 0.6 else _C.dark
+        band = Table(
+            [[Paragraph(
+                "Server-Banner",
+                ParagraphStyle(
+                    "banner_band", fontName=_FONTS["bold"], fontSize=13, leading=16,
+                    textColor=band_text_color, alignment=TA_CENTER,
+                ),
+            )]],
+            colWidths=[CONTENT_WIDTH],
+        )
+        band.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), accent_color),
+            ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+            ("TOPPADDING", (0, 0), (-1, -1), 12),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
+        ]))
+        flowables.append(band)
+        flowables.append(Spacer(1, 5 * mm))
+        banner_hint = (
+            f"Kein Banner hochgeladen — Hinweis: Farbband in der Akzentfarbe "
+            f"<font name='{_FONTS['mono']}' size='7.6'>{accent_hex}</font> ({accent_src})."
+        )
 
     icon_flow = _avatar_flow(image_cache.get(icon_url), 24) if icon_url else None
     meta_bits = [
@@ -1054,6 +1252,8 @@ async def build_server_document(
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
     flowables.append(header)
+    flowables.append(Spacer(1, 1.2 * mm))
+    flowables.append(Paragraph(banner_hint, styles["small"]))
     flowables.append(Spacer(1, 3 * mm))
 
     # Statistik-Chips
@@ -1098,7 +1298,7 @@ async def build_server_document(
         info_rows.append(("Sprache", Paragraph(_clean(locale), styles["table"])))
     features = ", ".join(_prepare_text(ft) for ft in (getattr(guild, "features", []) or [])[:8])
     if features:
-        info_rows.append(("Features", Paragraph(_short(_clean(features), 160), styles["table"])))
+        info_rows.append(("Features", Paragraph(_clean(_short(features, 160)), styles["table"])))
     flowables.append(_kv_card(info_rows, styles))
     flowables.append(Spacer(1, 4 * mm))
 
@@ -1145,6 +1345,38 @@ async def build_server_document(
 
     CH_W = [24 * mm, CONTENT_WIDTH - 24 * mm - 30 * mm, 30 * mm]
 
+    def _fmt_duration(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds} s"
+        minutes, rest = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes} min" + (f" {rest} s" if rest else "")
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} h" + (f" {minutes} min" if minutes else "")
+
+    def _channel_details(ch: Any) -> str:
+        """Zusätzliche Kanal-Details als eine muted-Zeile (ohne Thema)."""
+        bits: List[str] = []
+        delay = getattr(ch, "slowmode_delay", 0) or 0
+        if delay:
+            bits.append(f"Slow-Modus {_fmt_duration(int(delay))}")
+        thread_delay = getattr(ch, "default_thread_slowmode_delay", 0) or 0
+        if thread_delay:
+            bits.append(f"Thread-Slow-Modus {_fmt_duration(int(thread_delay))}")
+        if getattr(ch, "nsfw", False):
+            bits.append("NSFW")
+        bitrate = getattr(ch, "bitrate", None)
+        if bitrate:
+            bits.append(f"Bitrate {int(bitrate) // 1000} kbps")
+        user_limit = getattr(ch, "user_limit", 0) or 0
+        if user_limit:
+            bits.append(f"Limit {user_limit} Nutzer")
+        video_quality = getattr(ch, "video_quality_mode", None)
+        quality_name = getattr(video_quality, "name", None)
+        if quality_name == "FULL":
+            bits.append("Video 720p60")
+        return " · ".join(_prepare_text(b) for b in bits)
+
     def _channel_table(channels: List[Any]) -> Table:
         rows: List[List[Any]] = []
         for ch in channels:
@@ -1152,7 +1384,10 @@ async def build_server_document(
             name_cell: List[Any] = [Paragraph(f"<b>{_clean(ch.name)}</b>", styles["table"])]
             topic = _prepare_text(getattr(ch, "topic", None))
             if topic:
-                name_cell.append(Paragraph(_short(topic, 220), styles["table_muted"]))
+                name_cell.append(Paragraph(_font_markup(_esc(_short(topic, 220))), styles["table_muted"]))
+            details = _channel_details(ch)
+            if details:
+                name_cell.append(Paragraph(_font_markup(_esc(details)), styles["table_muted"]))
             id_cell = Paragraph(
                 f"<font name='{_FONTS['mono']}' size='6.8'>{ch.id}</font>",
                 ParagraphStyle("id_r", parent=styles["mono"], alignment=TA_RIGHT),
@@ -1302,7 +1537,7 @@ async def build_server_document(
                     flow = Paragraph("kein Bild", styles["center_tiny"])
                 cell.append(flow)
                 cell.append(Spacer(1, 1 * mm))
-                cell.append(Paragraph(_short(_clean(emoji.name), 22), styles["center_small"]))
+                cell.append(Paragraph(_clean(_short(emoji.name, 22)), styles["center_small"]))
                 cell.append(Paragraph(str(emoji.id), styles["center_tiny"]))
                 if emoji.animated:
                     cell.append(Paragraph("<b>animiert</b>", styles["center_tiny"]))
@@ -1341,7 +1576,7 @@ async def build_server_document(
                 cell = [
                     img(sticker.url, max_w=26, max_h=30) or Paragraph("kein Bild", styles["center_tiny"]),
                     Spacer(1, 1.2 * mm),
-                    Paragraph(_short(_clean(sticker.name), 30), styles["center_small"]),
+                    Paragraph(_clean(_short(sticker.name, 30)), styles["center_small"]),
                     Paragraph(
                         f"{_clean(str(getattr(sticker, 'type', ''))).replace('StickerType.', '')} · {sticker.id}",
                         styles["center_tiny"],
@@ -1397,16 +1632,17 @@ async def build_server_document(
             name_bits += f"<br/><font color='#6B7280' size='7.2'>@{username}</font>"
         if getattr(member, "bot", False):
             name_bits += " <font color='#5865F2' size='7'><b>BOT</b></font>"
-        role_bits = " · ".join(
-            (f"<font color='#{r.color.value:06x}'>●</font> {_clean(r.name)}"
-             if r.color.value else
-             f"<font color='#9AA0AB'>●</font> {_clean(r.name)}")
-            for r in member.roles if r != guild.default_role
-        ) or "—"
+        # Rollen als abgerundete graue Kästchen: nebeneinander mit Padding,
+        # umbrochen in Zeilen (statt ein langer „ · “-Text).
+        member_role_names = [r.name for r in member.roles if r != guild.default_role]
+        roles_col_pt = (CONTENT_WIDTH - 12 * mm - 44 * mm - 23 * mm - 26 * mm) / mm * 2.8346
+        role_cell: List[Any] = _chip_lines(
+            member_role_names, max_width=roles_col_pt - 9
+        )
         member_rows.append([
             avatar if avatar is not None else "",
             Paragraph(name_bits, styles["table"]),
-            Paragraph(role_bits, styles["table_small"]),
+            role_cell,
             Paragraph(_clean(_fmt_date(member.joined_at)), styles["table_small"]),
             Paragraph(_id_para(member.id), styles["mono"]),
         ])
@@ -1436,27 +1672,41 @@ async def build_server_document(
     any_messages = False
     for channel in text_channels:
         msgs = channel_messages.get(channel.id, [])
-        head_line = Paragraph(
+        # Kanal-Überschrift: groß, fett, unterstrichen (Farblinie unten).
+        head_table = Table([[Paragraph(
             f"<b>#{_clean(channel.name)}</b> "
-            f"<font name='{_FONTS['mono']}' size='6.6' color='#6B7280'>{channel.id}</font> "
-            f"<font color='#6B7280' size='7.6'>· {len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}</font>",
-            styles["h3"],
-        )
+            f"<font name='{_FONTS['mono']}' size='7.2' color='#6B7280'>{channel.id}</font> "
+            f"<font color='#6B7280'>· {len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}</font>",
+            styles["msg_channel_head"],
+        )]], colWidths=[CONTENT_WIDTH])
+        head_table.setStyle(TableStyle([
+            ("LINEBELOW", (0, 0), (-1, -1), 1.1, _C.blurple),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+        ]))
         if not msgs:
             flowables.append(KeepTogether([
-                head_line,
+                head_table,
+                Spacer(1, 1.4 * mm),
                 Paragraph("Keine Nachrichten verfügbar (leer, keine Historie oder keine Rechte).", styles["small"]),
-                Spacer(1, 2.5 * mm),
+                Spacer(1, 3.2 * mm),
             ]))
             continue
 
         any_messages = True
-        first_in_channel = True
-        for m in msgs:
+        flowables.append(head_table)
+        flowables.append(Spacer(1, 2.4 * mm))
+
+        # ÄLTESTE zuerst: Discord liefert die Historie neueste-zuerst —
+        # umgekehrt lesen wir sie von oben (alt) nach unten (neu).
+        for m in reversed(msgs):
             author = m.author
 
             # Kopfzeile der Nachricht: Avatar + Name/Zeit — bewusst eine
             # winzige 1-Zeilen-Tabelle, die nie höher als ~10 mm wird.
+            # Breite = Boxen-Innenmaß (Box-Padding 7 pt links/rechts).
             avatar_cell: List[Any] = []
             av = avatar_img(getattr(author, "id", -1), 7)
             if av is not None:
@@ -1474,9 +1724,10 @@ async def build_server_document(
             head += (
                 f"  <font color='#9AA0AB' size='6.8'>{m.created_at.strftime('%d.%m.%Y %H:%M')} UTC</font>"
             )
+            box_inner_w = CONTENT_WIDTH - 14
             msg_header = Table(
                 [[avatar_cell, Paragraph(head, styles["msg_head"])]],
-                colWidths=[10 * mm, CONTENT_WIDTH - 10 * mm],
+                colWidths=[10 * mm, box_inner_w - 10 * mm],
             )
             msg_header.setStyle(TableStyle([
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -1488,8 +1739,7 @@ async def build_server_document(
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
             ]))
 
-            # Inhalt: einzelne, jeweils selbst splittbare Flowables
-            # (Paragraphs können über Seiten umbrechen — Tabellenzeilen nicht).
+            # Inhalt: einzelne Paragraphs/Tabellen (splittbar im Notfall-Pfad).
             body: List[Any] = []
 
             content_prepared = _cap(
@@ -1497,7 +1747,7 @@ async def build_server_document(
             )
             if content_prepared:
                 body.append(
-                    Paragraph(_esc(content_prepared).replace("\n", "<br/>"), styles["msg_body"])
+                    Paragraph(_font_markup(_esc(content_prepared)), styles["msg_body"])
                 )
 
             shown_embeds = (m.embeds or [])[:MAX_EMBEDS_PER_MESSAGE]
@@ -1509,20 +1759,21 @@ async def build_server_document(
                     colors.HexColor(f"#{embed.color.value:06x}")
                     if embed.color is not None else _C.blurple
                 )
-                # Eine Tabellenzeile pro Embed-Zeile → die Box kann beim
-                # Seitenumbruch zwischen den Zeilen splitten.
+                # Weiße Box mit Akzentkante — hebt sich vom grauen
+                # Nachrichten-Kästchen ab (und funktioniert im Notfall-Pfad
+                # auf weißem Grund ebenfalls).
                 box = Table(
                     [
                         [Paragraph(f"<b>{_clean(label)}:</b> {_clean_ml(value)}", styles["embed_text"])]
                         for label, value in rows
                     ],
-                    colWidths=[CONTENT_WIDTH - 22 * mm],
+                    colWidths=[box_inner_w - 6],
                 )
                 box.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F7")),
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
                     ("LINEBEFORE", (0, 0), (0, -1), 2.2, embed_color),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                     ("TOPPADDING", (0, 0), (-1, -1), 2.2),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 2.6),
                 ]))
@@ -1553,17 +1804,34 @@ async def build_server_document(
                 body.append(Spacer(1, 0.8 * mm))
                 body.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
 
-            # Nachricht ausgeben: Kopf (winzige Tabelle) + eingerückter,
-            # splittbarer Inhalt. Kein KeepTogether über den gesamten Block —
-            # sonst würde eine lange Nachricht wieder eine zu große Einheit
-            # erzeugen. KeepTogether hier enthält nur winzige Teile.
-            flowables.append(KeepTogether([head_line, msg_header] if first_in_channel else [msg_header]))
-            first_in_channel = False
-            if body:
-                flowables.append(Indenter(left=12 * mm))
-                flowables.extend(body)
-                flowables.append(Indenter(left=-12 * mm))
-            flowables.append(Spacer(1, 2.2 * mm))
+            # Nachricht als graues, abgerundetes Kästchen. Sicherheitsnetz
+            # (LayoutError-Schutz): die Box-Höhe wird vorher gemessen — passt
+            # sie nicht sicher auf eine Seite, wird die Nachricht unboxiert
+            # mit splittbaren Flowables ausgegeben (Tabellenzeilen splitten
+            # nicht!). Siehe LayoutError-Fix: never KeepTogether unbounded.
+            msg_box = Table([[ [msg_header] + body ]], colWidths=[CONTENT_WIDTH])
+            msg_box.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F3F7")),
+                ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            try:
+                _bw, _bh = msg_box.wrap(CONTENT_WIDTH, 100000)
+            except Exception:  # noqa: BLE001 — Messung darf nie crashen
+                _bh = MAX_MESSAGE_BOX_PT + 1
+            if _bh <= MAX_MESSAGE_BOX_PT:
+                flowables.append(msg_box)
+            else:
+                # Box zu hoch für eine Seite → unboxiert, splittbar ausgeben.
+                flowables.append(msg_header)
+                if body:
+                    flowables.append(Indenter(left=7))
+                    flowables.extend(body)
+                    flowables.append(Indenter(left=-7))
+            flowables.append(Spacer(1, 2.4 * mm))
 
     if not any_messages:
         flowables.append(Spacer(1, 1.5 * mm))

@@ -764,11 +764,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 311 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 313 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/pdf_document_test.py   # 31 Prüfungen: Server-Dokument (PDF) mit eingebetteten Bildern & Fonts
+python scripts/pdf_document_test.py   # 38 Prüfungen: Server-Dokument (PDF) mit eingebetteten Bildern, Fonts, Emojis
 python scripts/login_recovery_test.py # 206 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 
@@ -1039,8 +1039,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        311 Prüfungen ohne Discord-Verbindung
-│   ├── pdf_document_test.py 31 Prüfungen: Server-Dokument (PDF) — Bilder & Fonts eingebettet
+│   ├── smoke_test.py        313 Prüfungen ohne Discord-Verbindung
+│   ├── pdf_document_test.py 38 Prüfungen: Server-Dokument (PDF) — Bilder & Fonts eingebettet
 │   ├── login_recovery_test.py 206 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double

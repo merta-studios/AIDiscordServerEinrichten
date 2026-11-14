@@ -993,7 +993,7 @@ async def t_pdf(h: Harness) -> None:
     import aiohttp as _aiohttp
 
     from bot.web import pdf_document as pdf_mod
-    from bot.web.pdf_document import _ensure_fonts, _prepare_text, build_server_document
+    from bot.web.pdf_document import _FONTS, _clean, _ensure_fonts, _prepare_text, build_server_document
 
     _ensure_fonts()
     check("PDF: DejaVu-Sans registriert (kein Base-14-Fallback)",
@@ -1001,14 +1001,31 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: Glyph-Abdeckung ermittelt",
           pdf_mod._GLYPH_COVERAGE is not None and len(pdf_mod._GLYPH_COVERAGE) > 3000)
 
-    # Text-Hygiene: Emojis → deutsche Wörter, keine Notdef-Kandidaten
+    # Text-Hygiene: Emojis bleiben als ECHTE Zeichen sichtbar (Noto-Emoji-
+    # Font), keine Notdef-Kandidaten im Paragraph-Markup
     prepared = _prepare_text("Willkommen 🎉 <:ping:123456789012345678> Привет 中文 ✓ <@123456789012345678>")
-    check("PDF: Emoji wird ins Deutsche übersetzt", "konfettibombe" in prepared.lower(), prepared)
+    check("PDF: Unicode-Emoji bleibt als Zeichen erhalten", "🎉" in prepared, prepared)
     check("PDF: Custom-Emoji-Syntax aufgelöst",
           "ping" in prepared.lower() and "<:ping:" not in prepared, prepared)
     check("PDF: Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
-    leftovers = [ch for ch in prepared
-                 if ord(ch) not in (pdf_mod._GLYPH_COVERAGE or set()) and ch != "\n"]
+    markup = _clean("👋 👍🏽 🎉 𝗖𝗵𝗮𝘁 𝕏 𝔊 ✓ 中文 Привет")
+    check("PDF: Emoji-Font-Markup wird gesetzt (👋 sichtbar)",
+          "name='DejaVu-emoji'" in markup and "👋" in markup, markup[:220])
+    check("PDF: Math-Font-Markup für 𝗖𝗵𝗮𝘁 & Co.",
+          "name='DejaVu-math'" in markup and "𝗖" in markup and "𝕏" in markup, markup[:220])
+    check("PDF: DejaVu-fähige Zeichen bleiben ohne Font-Tag",
+          "Привет" in markup and "✓" in markup and "中文" not in markup
+          and "name='DejaVu-sans'" not in markup, markup[:220])
+    check("PDF: Fonts registriert (Emoji + Math)",
+          _FONTS.get("emoji") == "DejaVu-emoji" and _FONTS.get("math") == "DejaVu-math",
+          str(_FONTS))
+    # No-Notdef-Garantie im FERTIGEN Markup (Tags entfernt): jedes gerenderte
+    # Zeichen muss in mind. einem Font (Sans/Emoji/Math) darstellbar sein.
+    tag_free = re.sub(r"</?font[^>]*>|<br/>", "", markup)
+    leftovers = [ch for ch in tag_free
+                 if ord(ch) not in (pdf_mod._FONT_COVERAGE.get("sans") or set())
+                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("emoji") or set())
+                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("math") or set())]
     check("PDF: kein Zeichen ohne Glyphe im Ergebnis", not leftovers, repr(leftovers[:10]))
     check("PDF: Zeitangaben bleiben unzerstört",
           _prepare_text("Treffen 12:30:00 Uhr") == "Treffen 12:30:00 Uhr")
@@ -1034,7 +1051,7 @@ async def t_pdf(h: Harness) -> None:
     msgs = []
     for i, author in enumerate((g.owner, g.me)):
         m = FakeMessage(700000000000000000 + i, channel, author,
-                        content=f"Testnachricht {i} — 🎉 Привет ✓",
+                        content=f"Testnachricht {i} — 🎉 👋 Привет ✓ 𝗖𝗵𝗮𝘁",
                         embeds=[embed] if i == 0 else [])
         msgs.append(m)
     channel.history = _history_factory(msgs)
@@ -1052,8 +1069,8 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: Fortschritt läuft bis 100 %", bool(progress_seen) and progress_seen[-1] == 100,
           str(progress_seen))
     n_fonts = len(_re.findall(rb"/FontFile2", pdf_bytes))
-    check("PDF: DejaVu-Fonts eingebettet (≥ 3: Sans, Bold, Mono)",
-          n_fonts >= 3, f"{n_fonts} FontFile2-Streams")
+    check("PDF: Fonts eingebettet (≥ 5: Sans, Bold, Mono, Emoji, Math)",
+          n_fonts >= 5, f"{n_fonts} FontFile2-Streams")
     check("PDF: mehrere Seiten", pdf_bytes.count(b"/Type /Page") >= 5,
           str(pdf_bytes.count(b"/Type /Page")))
     check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
@@ -1091,15 +1108,15 @@ async def t_session_limit(h: Harness) -> None:
 async def t_docdelivery(h: Harness) -> None:
     """
     Server-Dokument-Zustellung: Empfänger ist der BOT-Owner (Application-Owner),
-    nicht der Server-Owner. Zugestellte Dokument-DMs werden automatisch
-    gelöscht (letzte Zustellung + Legacy-Empfänger), bevor ein neues Dokument
-    geht — es gibt immer nur EIN aktuelles Dokument.
+    nicht der Server-Owner. Vor jeder neuen Zustellung werden frühere
+    „server-dokument-*.pdf"-DMs gelöscht (letzte Zustellung + neuer
+    Empfänger) — es gibt immer nur EIN aktuelles Dokument. Kein Start-Scan
+    mehr (das einmalige Legacy-Aufräumen ist abgeschlossen).
     """
     print("── Server-Dokument: Zustellung (Bot-Owner) & Aufräumen ───────")
     import tempfile
     from types import SimpleNamespace
 
-    import bot.discord_bot as db
     from bot.discord_bot import RelayClient
 
     bot_owner = SimpleNamespace(id=424242424242424242, display_name="Bot-Betreiber")
@@ -1179,44 +1196,37 @@ async def t_docdelivery(h: Harness) -> None:
           not RelayClient._is_document_message(SimpleNamespace(attachments=[_Att("anderes.pdf")])),
           "anderes.pdf")
 
-    legacy_saved = list(db.LEGACY_DOCUMENT_RECIPIENTS)
-    try:
-        db.LEGACY_DOCUMENT_RECIPIENTS = [1015212381619626014]
-        await users[1015212381619626014].create_dm()
-        legacy_channel = users[1015212381619626014].dm_channel
-        assert legacy_channel is not None
-        m_old1 = _Msg(1, "server-dokument-555123888444222111.pdf")
-        m_keep = _Msg(2, "wichtiges-protokoll.pdf")
-        m_old2 = _Msg(3, "server-dokument-42.pdf")
-        legacy_channel.messages = [m_old1, m_keep, m_old2]
+    # Prä-Zustellungs-Aufräumen: neue Zustellung an den Bot-Owner → Dokument-DM
+    # beim Bot-Owner UND beim letzten Empfänger werden gelöscht, sonst nichts.
+    await users[424242424242424242].create_dm()
+    await users[888888888888888888].create_dm()
+    dm_owner = users[424242424242424242].dm_channel
+    dm_last = users[888888888888888888].dm_channel
+    assert dm_owner is not None and dm_last is not None
+    m_owner_doc = _Msg(9, "server-dokument-555.pdf")
+    m_owner_keep = _Msg(10, "wichtiges-protokoll.pdf")
+    m_last_doc = _Msg(77, "server-dokument-999.pdf")
+    dm_owner.messages = [m_owner_doc, m_owner_keep]
+    dm_last.messages = [m_last_doc]
+    current = {"last_delivery": {"recipient_id": 888888888888888888, "message_id": 77}}
+    json.dump(current, open(state_path, "w", encoding="utf-8"))
 
-        deleted = await client._cleanup_previous_documents()
-        check("Legacy-Zustellung (Server-Owner) wird beim Aufräumen gelöscht",
-              deleted == 2 and m_old1.deleted and m_old2.deleted, f"{deleted} gelöscht")
-        check("Fremde DMs bleiben unberührt", not m_keep.deleted)
-        state = json.load(open(state_path, encoding="utf-8"))
-        check("Legacy-Empfänger als bereinigt markiert",
-              1015212381619626014 in (state.get("cleaned_recipient_ids") or []), str(state))
+    deleted = await client._cleanup_previous_documents(424242424242424242)
+    check("Prä-Zustellung: alte Dokument-DMs beim Bot-Owner und letzten Empfänger gelöscht",
+          deleted == 2 and m_owner_doc.deleted and m_last_doc.deleted, f"{deleted} gelöscht")
+    check("Fremde DMs bleiben unberührt", not m_owner_keep.deleted)
+    state = json.load(open(state_path, encoding="utf-8"))
+    check("Status-File: last_delivery entfernt, Empfänger als bereinigt markiert",
+          "last_delivery" not in state
+          and set(state.get("cleaned_recipient_ids") or []) == {424242424242424242, 888888888888888888},
+          str(state))
 
-        deleted_again = await client._cleanup_previous_documents()
-        check("Zweiter Start scannt die Legacy-Empfänger nicht erneut", deleted_again == 0)
-
-        # Letzte Zustellung aus dem Status-File wird ebenfalls gelöscht
-        await users[888888888888888888].create_dm()
-        record_channel = users[888888888888888888].dm_channel
-        m_last = _Msg(77, "server-dokument-999.pdf")
-        record_channel.messages = [m_last]
-        current = json.load(open(state_path, encoding="utf-8"))
-        current["last_delivery"] = {"recipient_id": 888888888888888888, "message_id": 77}
-        json.dump(current, open(state_path, "w", encoding="utf-8"))
-        deleted = await client._cleanup_previous_documents()
-        check("Letzte Zustellung (Status-File) wird vor neuem Versand gelöscht",
-              deleted == 1 and m_last.deleted, f"{deleted} gelöscht")
-        state = json.load(open(state_path, encoding="utf-8"))
-        check("Status-File räumt die alte Zustellung ab (last_delivery entfernt)",
-              "last_delivery" not in state, str(state))
-    finally:
-        db.LEGACY_DOCUMENT_RECIPIENTS = legacy_saved
+    # Gelöschte Nachrichten verschwinden real aus dem DM-Verlauf:
+    dm_owner.messages = [m for m in dm_owner.messages if not getattr(m, "deleted", False)]
+    dm_last.messages = [m for m in dm_last.messages if not getattr(m, "deleted", False)]
+    deleted_again = await client._cleanup_previous_documents(424242424242424242)
+    check("Erneutes Aufräumen ohne alte Zustellung: keine Löschungen mehr",
+          deleted_again == 0, str(deleted_again))
 
 
 async def t_security(h: Harness) -> None:
