@@ -844,7 +844,7 @@ async def t_prompt(h: Harness) -> None:
         check(f"capabilities.conventions nennt '{key}'", key in conventions)
 
     from bot.discord_bot import (
-        ARENA_URL, _bridge_prompt_line, connected_view, CID_ADMIN_CREATE_DOC,
+        ARENA_URL, _bridge_prompt_line, connected_view,
         admin_panel_view, admin_guild_detail_view, admin_guild_leave_confirm_view,
     )
     p_line = _bridge_prompt_line("https://relay.example.com", "adse_smoke123")
@@ -967,7 +967,7 @@ async def t_prompt(h: Harness) -> None:
           detail_text[:300])
     detail_buttons = [b.get("custom_id", "") for b in _view_parts(detail_v)["buttons"]]
     check("Server-Übersicht: 'Server-Dokument erstellen'-Button vorhanden",
-          CID_ADMIN_CREATE_DOC in detail_buttons,
+          any(cid.startswith("relay:admin:create_doc:") for cid in detail_buttons),
           str(detail_buttons))
 
     leave_cleanup = guild_remove_notify_view(g_smoke, None, "Bot wurde gekickt — Grund: Test", cleanup={
