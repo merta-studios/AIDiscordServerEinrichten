@@ -334,6 +334,40 @@ async def run_tests() -> int:
         # 3) Tabellenbreiten: Summe der colWidths entspricht CONTENT_WIDTH
         check("CONTENT_WIDTH ist A4 abzüglich Ränder",
               abs(CONTENT_WIDTH / 2.8346 - (210 - 36)) < 1.0, f"{CONTENT_WIDTH / 2.8346:.1f} mm")
+
+        # ── Regression: Riesige Nachrichten dürfen den Build nicht crashen ──
+        # Discord erlaubt 4000–8000 Zeichen pro Nachricht und Embeds mit je
+        # 4096 Zeichen. Vor dem Fix landete alles in EINER Tabellenzeile —
+        # höher als eine Seite, ReportLab brach mit LayoutError ab
+        # („too large on page … tallest cell … points"). Jetzt: splittbare
+        # Flowables + Kapselung.
+        print("\n  ── Regression: Riesige Nachrichten / Embeds ──\n")
+        giant_guild = _build_guild(f"http://127.0.0.1:{port_box[0]}/")
+        giant_channel = giant_guild.text_channels[0]
+        big_embed = discord.Embed(title="Riesiges Embed",
+                                  description="X" * 4096, color=discord.Colour(0x5865F2))
+        for i in range(3):
+            big_embed.add_field(name=f"Feld {i}", value="Y" * 1000, inline=True)
+
+        def _giant_history(limit=None):
+            async def gen():
+                yield FakeMessage(999000000000000001, giant_channel, giant_guild.owner,
+                                  content="Z" * 8000, embeds=[big_embed])
+            return gen()
+
+        giant_channel.history = _giant_history
+
+        async def _silent_progress(pct: int, text: str) -> None:
+            pass
+
+        async with aiohttp.ClientSession() as session:
+            giant_pdf = await build_server_document(giant_guild, session, progress=_silent_progress)
+
+        check("Riesige Nachricht (8000 Zeichen + 4096-Zeichen-Embed): Build crasht nicht",
+              giant_pdf[:5] == b"%PDF-" and giant_pdf.rstrip().endswith(b"%%EOF"),
+              f"{len(giant_pdf)} bytes")
+        check("Riesige Nachricht wird gekürzt, nicht verworfen",
+              len(giant_pdf) > 40_000, f"{len(giant_pdf) // 1024} KB")
     finally:
         await runner.cleanup()
 
