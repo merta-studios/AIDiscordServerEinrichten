@@ -764,10 +764,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 289 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 301 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
+python scripts/pdf_document_test.py   # 29 Prüfungen: Server-Dokument (PDF) mit eingebetteten Bildern & Fonts
 python scripts/login_recovery_test.py # 210 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
@@ -788,6 +789,7 @@ Discord-Client ([`scripts/_fake_discord.py`](scripts/_fake_discord.py)) und prü
 | `write` | **Alle sechs Vorlagen werden wirklich ausgeführt** — Rollen, Kategorien, Kanäle, Nachrichten, Invites, AutoMod |
 | `arena` | Webhook-Personen (Anlegen/Wiederverwenden/`/send`), Bot-Profil via `PATCH /members/me`, Guides, echte `<#key>`-Mentions im Setup, Purge vor dem Erneuern, Platzhalter-Warnung |
 | `prompt` | Prompt-Varianten transportieren Hygiene/Personas/Branding/Grenzen; `capabilities.conventions` komplett |
+| `pdf` | Server-Dokument: DejaVu-Fonts eingebettet, Emojis → deutsche Wörter, Notdef-frei, Build läuft auch ohne erreichbare Avatare |
 | `limit` | Sitzungs-Limit pro Server, Auto-Revoke des ältesten Tokens |
 | `security` | Kein Token-Leak in Antworten, Logs oder der Console; CORS; Header |
 
@@ -1034,7 +1036,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        289 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        301 Prüfungen ohne Discord-Verbindung
+│   ├── pdf_document_test.py 29 Prüfungen: Server-Dokument (PDF) — Bilder & Fonts eingebettet
 │   ├── login_recovery_test.py 210 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
