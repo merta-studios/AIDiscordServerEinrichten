@@ -18,8 +18,7 @@
 2. [Schnellstart (≈ 15 Minuten)](#schnellstart)
 3. [Betrieb auf einem eigenen Server (VPS / Fly.io / Proxy)](#betrieb-auf-einem-eigenen-server)
 4. [Der `/connect`-Command](#der-connect-command)
-5. [Der `/manage_database`-Command & Turso](#der-manage_database-command)
-6. [Owner-Features: Presence, Adminpanel & Benachrichtigungen](#owner-features)
+5. [Owner-Features: Presence, Adminpanel & Benachrichtigungen](#owner-features)
 7. [Sicherheitsmodell](#sicherheitsmodell)
 8. [Die REST-API](#die-rest-api)
 9. [Die Console](#die-console)
@@ -354,28 +353,6 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 
 ---
 
-## Der `/manage_database`-Command & Turso
-
-Um interaktive Server-Systeme wie **Self Roles (Reaction Roles)**, **Willkommensnachrichten**, **Auto-Responder**, **Levels** oder **zeitgesteuerte Cron-Aktionen (z. B. jeden Tag um 5:00 Uhr)** direkt und ohne Drittanbieter-Bots auszuführen, bringt der Bot eine native Integration mit [Turso](https://turso.tech) (libSQL) mit.
-
-### Kostenlose Turso-Datenbank in 2 Minuten:
-1. Registriere dich kostenlos auf [turso.tech](https://turso.tech) (Free Plan: bis zu 9 GB Speicher und 1 Mrd. Lesevorgänge).
-2. Erstelle eine neue Datenbank (z. B. `my-server-db`).
-3. Kopiere die Datenbank-URL (z. B. `libsql://my-server-db-...turso.io`) und erstelle ein Auth-Token (`turso db tokens create ...`).
-4. Führe auf deinem Discord-Server `/manage_database` aus und klicke auf **Datenbank verknüpfen**.
-5. Trage URL und Token in das Modal ein — fertig!
-
-### Features von `/manage_database`:
-- **Live-Speicheranzeige:** Belegter Speicher, Turso-Free-Quota (9 GB) und visuelle Statusübersicht.
-- **System-Verwaltung:** Alle aktiven Systeme (Self Roles, Welcome, Cron, Responder) geordnet einsehen und bei Bedarf mit einem Klick löschen.
-- **Sicher & flexibel:** Standardmäßig hat jeder Server seine eigene Datenbank. Der Bot speichert die Server-Zuordnung in einer Master-Datenbank und hält Konfigurationen im schnellen In-Memory-Cache.
-- **Datenbank wiederverwenden (blauer Button):** Der Bot merkt sich, **welcher Admin** die Zugangsdaten eingegeben hat. Richtet dieser Admin auf einem anderen Server `/manage_database` ein, erscheint dort neben dem grünen **„Datenbank verknüpfen“** ein **blauer Button „♻️ DB von … nutzen“** — ein Klick verknüpft seine bereits eingerichtete (dort noch aktive) Datenbank, ohne URL und Token neu eintippen zu müssen. Die Daten eines fremden Admins lassen sich nicht übernehmen (der Button prüft die Admin-ID gegen die Master-Datenbank).
-- **Mehrere Server, eine Datenbank:** Server, die sich eine Datenbank teilen, teilen sich auch eine Verbindung und dieselben Systeme — eine Änderung (z. B. ein neuer Trigger) ist sofort für alle beteiligten Server aktiv, und Anzeige/Cache bleiben konsistent. Beim Verlassen eines Servers bleibt eine geteilte Datenbank für die übrigen Server selbstverständlich erhalten.
-- **Automatisches Aufräumen beim Verlassen:** Verlässt der Bot einen Server (Kick, Ban oder freiwillig), werden **alle Daten des Servers gelöscht**: aktive KI-Tokens werden sofort widerrufen und die Datenbank-Verknüpfung entfernt. Ist die Server-Datenbank **exklusiv** (kein anderer Server teilt sie), wird sie zusätzlich komplett geleert.
-- **Arena AI Anbindung:** Fordert ein Nutzer Arena AI auf, Self Roles oder automatisierte Abläufe zu bauen, prüft Arena die Turso-Verbindung (`GET /api/v1/database/status`). Ist noch keine Datenbank verknüpft, stoppt Arena sofort und bittet den Admin, `/manage_database` auf Discord auszuführen. Sobald verknüpft, registriert Arena die Trigger und Aktionen automatisch über `POST /api/v1/systems`!
-
----
-
 Wer den Bot betreibt, will den Überblick behalten — ohne Discord Developer
 Portal oder Render-Logs zu öffnen. Drei Dinge laufen von selbst:
 
@@ -416,10 +393,6 @@ die Owner-ID. Die Liste zeigt:
 - **KI-Verbindungsstatus:** Zeigt sofort an, ob die Bridge auf dem Server
   aktiv ist (inkl. Token-Präfix, Ablaufzeit, Request-Anzahl und letzter Nutzung)
   oder ob noch keine aktiven Sitzungen existieren.
-- **🗄️ Datenbank-Status:** Ob eine Turso-Datenbank verknüpft ist (mit Anzahl
-  der Systeme, Speicherauslastung und wer sie wann eingerichtet hat) — inklusive
-  Hinweis, ob es eine **geteilte Datenbank** ist und mit welchen anderen
-  Servern sie geteilt wird.
 - **Einladungslink für den Owner:** Button ✉️ *Einladung erstellen* generiert
   einen 1-Stunde gültigen Einzellink (`max_uses=1, max_age=3600`) und zeigt
   ihn direkt im Panel an (ehrliche Fehlermeldung bei fehlendem
@@ -1028,7 +1001,7 @@ AIDiscordServerEinrichten/
 ├── bot/
 │   ├── main.py              Einstiegspunkt: Bot + Web-Server in einem Loop
 │   ├── __main__.py          python -m bot
-│   ├── discord_bot.py       /connect, /manage_database, privates /adminpanel, Container-V2-Buttons, Gateway-Events
+│   ├── discord_bot.py       /connect, privates /adminpanel, Container-V2-Buttons, Gateway-Events
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
@@ -1037,7 +1010,6 @@ AIDiscordServerEinrichten/
 │   ├── serializers.py       discord.py-Objekte → JSON-sichere Dicts
 │   ├── util.py              Parsing: IDs, Farben, Permissions, Enums, Overwrites
 │   ├── web_errors.py        ApiError mit code/message/hint/status
-│   ├── turso/               Turso libSQL-Client, Master-DB, Guild-DB Manager, Trigger-Engine & Service
 │   └── web/
 │       ├── app.py           aiohttp-App, Middleware, Rate-Limit, CORS
 │       ├── console.py       Das Dashboard (eine HTML-Datei, kein Build)
@@ -1060,12 +1032,10 @@ AIDiscordServerEinrichten/
 │           ├── expressions.py Emojis und Sticker
 │           ├── invites.py   Invites auflisten, anlegen, aufräumen
 │           ├── events.py    Scheduled Events
-│           ├── systems.py   Turso-Datenbankstatus, Queries, Variablen & native Systeme
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
 │   ├── smoke_test.py        289 Prüfungen ohne Discord-Verbindung
 │   ├── login_recovery_test.py 210 Prüfungen: 429/1015 + Client-Setup + Owner-Features
-│   └── turso_systems_test.py Turso Client, Master-DB, Trigger-Engine & REST-APIs
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile

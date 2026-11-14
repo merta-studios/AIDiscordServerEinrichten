@@ -1357,7 +1357,7 @@ async def test_owner_features() -> None:
     check("Live-Kick: Grund + Ausführender aus dem Gateway-Event in der Leave-DM",
           "gekickt" in leave_live and "Bot-Regeln verletzt" in leave_live
           and "Moderator Klaus" in leave_live, leave_live[:300])
-    check("Live-Kick: Aufräumen-Info in der DM (Sessions gestoppt, DB bereinigt)",
+    check("Live-Kick: Aufräumen-Info in der DM (Sessions gestoppt)",
           "Aufräumen" in leave_live and "gestoppt" in leave_live, leave_live[:300])
 
     # Ban OHNE Grund (GUILD_BAN_ADD liefet keinen Grund, Audit-Eintrag blieb aus):
@@ -1604,55 +1604,6 @@ async def test_owner_features() -> None:
     check("Admin-Custom-ID bleibt unter Discords 100-Zeichen-Limit",
           len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40)) <= 100,
           str(len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40))))
-
-    # ── Blauer Wiederverwenden-Button: End-to-End über on_interaction ─────────
-    # Admin richtet auf Server A eine DB ein → klickt auf Server B auf
-    # „♻️ DB von „QuellServer“ nutzen“ → Server B ist mit derselben DB verbunden.
-    import tempfile
-    import shutil as _shutil
-    _reuse_dir = tempfile.mkdtemp(prefix="adse_reuse_")
-    try:
-        guild_a = FakeGuild(gid=1100, name="QuellServer")
-        guild_b = FakeGuild(gid=1101, name="ZielServer")
-        client._connection._guilds[guild_a.id] = guild_a
-        client._connection._guilds[guild_b.id] = guild_b
-        srv = client.state.turso_service
-        ok, msg = await srv.connect_guild_database(
-            guild_id=guild_a.id, guild_name=guild_a.name,
-            database_url=f"sqlite:///{_reuse_dir}/shared.db", auth_token="",
-            configured_by=f"Owner ({cfg.bot_owner_id})", configured_by_id=str(cfg.bot_owner_id),
-        )
-        check("Reuse-Setup: Quell-Server-Datenbank eingerichtet", ok, msg)
-
-        admin_role_b = FakeRole(6000, "Admin", 9, discord.Permissions(administrator=True).value)
-        admin_b = FakeMember(cfg.bot_owner_id, "Owner", [guild_b.default_role, admin_role_b], guild=guild_b)
-        reuse_it = _panel_interaction(cfg.bot_owner_id, guild=guild_b)
-        reuse_it.user = admin_b
-        reuse_it.data = {"custom_id": f"relay:v2_db_reuse:{guild_a.id}"}
-        reuse_it.type = discord.InteractionType.component
-        await client.on_interaction(reuse_it)
-        check("Blauer Button: Erfolg mit konfiguriertem Status-View",
-              len(reuse_it.response.messages) == 1
-              and reuse_it.response.messages[0]["view"] is not None
-              and "Status & Auslastung" in _view_text(reuse_it.response.messages[0]["view"]),
-              str(len(reuse_it.response.messages)))
-        check("Blauer Button: Ziel-Server nutzt dieselbe Datenbank",
-              await srv.is_guild_db_configured(guild_b.id))
-
-        # Ein fremder Admin darf den Button nicht für sich nutzen:
-        admin_role_x = FakeRole(6001, "Admin", 9, discord.Permissions(administrator=True).value)
-        admin_x = FakeMember(987654321, "FremdAdmin", [guild_b.default_role, admin_role_x], guild=guild_b)
-        deny_it = _panel_interaction(987654321, guild=guild_b)
-        deny_it.user = admin_x
-        deny_it.data = {"custom_id": f"relay:v2_db_reuse:{guild_a.id}"}
-        deny_it.type = discord.InteractionType.component
-        await client.on_interaction(deny_it)
-        check("Blauer Button: fremder Admin wird abgewiesen (ephemeral Fehlermeldung)",
-              len(deny_it.response.messages) == 1
-              and "anderen Admin" in (deny_it.response.messages[0].get("content") or ""),
-              str(deny_it.response.messages))
-    finally:
-        _shutil.rmtree(_reuse_dir, ignore_errors=True)
 
     # Kein Owner konfiguriert → gar nichts tun (kein Crash, keine DM).
     cfg_no_owner = Config(discord_token="x", bot_owner_id=0)

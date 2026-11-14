@@ -55,6 +55,7 @@ mit der Kurzanleitung.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import time
@@ -68,6 +69,7 @@ from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, now_utc
+from .web.pdf_document import build_server_document
 
 log = logging.getLogger("relay.discord")
 
@@ -75,7 +77,6 @@ __all__ = (
     "RelayClient", "build_intents", "ADMIN_INVITE_SCOPES", "ARENA_URL",
     "connected_view", "welcome_view", "admin_panel_view",
     "admin_guild_detail_view", "admin_guild_leave_confirm_view",
-    "database_unconfigured_view", "database_configured_view",
 )
 
 ADMIN_INVITE_SCOPES = ("bot", "applications.commands")
@@ -99,23 +100,15 @@ CID_CONNECT = "relay:v2_connect"
 CID_DISCONNECT = "relay:v2_disconnect"
 CID_REGENERATE = "relay:v2_regenerate"
 
-# Turso-Datenbank Buttons
-CID_DB_CONNECT = "relay:v2_db_connect"
-CID_DB_DISCONNECT = "relay:v2_db_disconnect"
-CID_DB_REFRESH = "relay:v2_db_refresh"
-CID_DB_SYSTEMS = "relay:v2_db_systems"
-CID_DB_SYS_DEL = "relay:v2_db_sys_del"
-#: Blauer Wiederverwenden-Button: eine auf einem anderen Server bereits
-#: eingerichtete Datenbank auch für diesen Server nutzen. Die Custom-ID
-#: trägt die Quell-Guild-ID: ``relay:v2_db_reuse:<guild_id>``.
-CID_DB_REUSE = "relay:v2_db_reuse"
-
 # Legacy-IDs der Buttons vor dem Components-V2-Upgrade. Nachrichten aus der
 # Zeit vor dem Deploy sollen nicht ins Leere laufen: Ihre Klicks werden auf
 # die neuen Handler gemappt (die bearbeiten die alte Nachricht dann in die
 # neue Optik).
 CID_LEGACY_REGENERATE = "relay:regenerate"
 CID_LEGACY_REVOKE_ALL = "relay:revoke_all"
+
+#: Adminpanel: „Server-Dokument erstellen“-Button (Detailansicht eines Servers).
+CID_ADMIN_CREATE_DOC = "relay:admin:create_doc"
 
 #: Adminpanel: Buttons + Suchen-Modal. Die Custom-IDs tragen die Ziel-Seite
 #: und den Suchbegriff in sich (``relay:admin:nav:<seite>:<suche>``), damit
@@ -273,233 +266,38 @@ def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
     view.add_item(container)
     return view
 
-
-def database_unconfigured_view(
-    reusable: Optional[List[Dict[str, Any]]] = None,
-) -> discord.ui.LayoutView:
+def manage_database_unavailable_view() -> discord.ui.LayoutView:
     """
-    Container-V2-Nachricht für /manage_database wenn noch keine DB verknüpft ist.
+    Container-V2-Nachricht für /manage_database.
 
-    Hat der ausführende Admin auf einem **anderen** Server bereits eine
-    Datenbank eingerichtet (und sie dort noch aktiv), erscheint neben dem
-    grünen „Datenbank verknüpfen“-Button ein **blauer** Wiederverwenden-Button
-    pro gespeicherter Datenbank — ein Klick verbindet diesen Server mit der
-    bestehenden Datenbank, ohne dass URL und Token neu eingetippt werden müssen.
+    Das Datenbank-System (Turso) wurde entfernt. Der Command existiert nur noch,
+    um diesen Hinweis anzuzeigen: die Funktion ist aktuell nicht verfügbar,
+    weil die Entwickler sie noch überarbeiten — damit Arena AI später Dinge
+    coden kann, die der Bot auf dem Server immer ausführt.
     """
-    reusable = [r for r in (reusable or []) if r.get("source_guild_id") is not None][:4]
-
-    intro_text = (
-        "# 🗄️ Turso-Datenbank einrichten\n"
-        "Für diesen Server ist noch keine Turso-Datenbank verknüpft.\n\n"
-        "**Warum Turso?**\n"
-        "Mit Turso kann Arena AI eigene Server-Systeme völlig autonom für dich "
-        "scripten: **Self Roles / Reaction Roles**, **Willkommensnachrichten & Auto-Rollen**, "
-        "**Auto-Responder**, **Leveling** und **tägliche Timer** (z. B. um 5 Uhr morgens) — "
-        "komplett ohne Drittanbieter-Bots!\n\n"
-        "**100% Kostenlos:**\n"
-        "Turso bietet im kostenlosen Free-Plan **9 GB Speicher** und **1 Milliarde Abfragen/Monat** "
-        "(keine Kreditkarte erforderlich).\n\n"
-        "**Schritt-für-Schritt Anleitung:**\n"
-        "1️⃣ Erstelle einen Account auf https://turso.tech (Free Tier)\n"
-        "2️⃣ Erstelle eine neue Datenbank (Name frei wählbar, z.B. für diesen Server)\n"
-        "3️⃣ Kopiere die **Database URL** (`https://...` oder `libsql://...`)\n"
-        "4️⃣ Erzeuge ein **Auth Token** und kopiere es\n"
-        "5️⃣ Klicke unten auf **„Datenbank verknüpfen“** und füge beides ein!"
-    )
-    if reusable:
-        names = ", ".join(f"**{r.get('source_guild_name') or 'Server'}**" for r in reusable)
-        intro_text += (
-            f"\n\n♻️ **Bereits eingerichtet:** Du hast auf {names} schon eine Datenbank "
-            "verknüpft — mit dem blauen Button kannst du sie direkt auch für diesen Server "
-            "verwenden (mehrere Server können sich eine Datenbank teilen)."
-        )
-
-    buttons = [
-        discord.ui.Button(
-            label="Datenbank verknüpfen",
-            emoji="🗄️",
-            style=discord.ButtonStyle.success,
-            custom_id=CID_DB_CONNECT,
-        ),
-    ]
-    for entry in reusable:
-        source_name = entry.get("source_guild_name") or "anderem Server"
-        buttons.append(
-            discord.ui.Button(
-                label=f"DB von „{source_name}“ nutzen"[:80],
-                emoji="♻️",
-                style=discord.ButtonStyle.primary,  # blau
-                custom_id=f"{CID_DB_REUSE}:{entry['source_guild_id']}",
-            ),
-        )
-
-    container = discord.ui.Container(
-        discord.ui.TextDisplay(intro_text),
-        discord.ui.Separator(),
-        discord.ui.ActionRow(*buttons),
-        accent_colour=WELCOME_ACCENT,
-    )
-    view = discord.ui.LayoutView(timeout=None)
-    view.add_item(container)
-    return view
-
-
-def database_configured_view(status_data: Dict[str, Any]) -> discord.ui.LayoutView:
-    """Container-V2-Nachricht für /manage_database wenn die DB bereits aktiv ist."""
-    storage = status_data.get("storage", {})
-    used_str = storage.get("used_formatted", "0 B")
-    quota_str = storage.get("quota_formatted", "9.00 GB")
-    free_str = storage.get("free_formatted", "9.00 GB")
-    pct = storage.get("usage_percent", 0.0)
-    tables_cnt = storage.get("tables_count", 0)
-    db_url = status_data.get("database_url", "Turso Cloud")
-
-    cache_stats = status_data.get("cache_stats", {})
-    total_hits = cache_stats.get("total_cache_hits", 0)
-
-    systems = status_data.get("systems", [])
-    if systems:
-        sys_lines = []
-        for s in systems[:8]:
-            status_emoji = "🟢" if s.get("enabled") else "⚪"
-            trig_count = len(s.get("triggers", []))
-            sys_lines.append(f"{status_emoji} **{s.get('name')}** (`{s.get('type')}`, {trig_count} Trigger)")
-        systems_text = "\n".join(sys_lines)
-    else:
-        systems_text = "_Noch keine Systeme angelegt. Beauftrage Arena AI, Self Roles oder Welcome-Systeme für dich zu scripten!_"
-
     container = discord.ui.Container(
         discord.ui.TextDisplay(
-            f"# 🗄️ Turso-Datenbank — Status & Auslastung\n"
-            f"**Status:** 🟢 Verbunden mit Turso (`{db_url}`)\n\n"
-            f"**📊 Speicherauslastung:**\n"
-            f"• Verbraucht: `{used_str}` von `{quota_str}` ({pct}%)\n"
-            f"• Freier Speicher: `{free_str}`\n"
-            f"• Tabellen: `{tables_cnt}` in der Datenbank\n"
-            f"• Cache-Vorteil: `{total_hits}` Abfragen aus Speicher bedient (Rate Limits geschont!)\n\n"
-            f"**⚙️ Geordnete Systeme ({len(systems)}):**\n"
-            f"{systems_text}"
+            "# 🗄️ Server-Datenbank\n\n"
+            "Diese Funktion ist **aktuell nicht mehr verfügbar**.\n\n"
+            "Die Entwickler arbeiten noch daran, die Funktion zu verbessern — "
+            "damit **Arena AI Sachen coden kann, die der Bot immer ausführt**.\n\n"
+            "Sobald das System wieder bereitsteht, wird `/manage_database` hier "
+            "die Verwaltung der Server-Datenbank anbieten."
         ),
         discord.ui.Separator(),
         discord.ui.ActionRow(
             discord.ui.Button(
-                label="Systeme verwalten",
-                emoji="📋",
-                style=discord.ButtonStyle.primary,
-                custom_id=CID_DB_SYSTEMS,
-            ),
-            discord.ui.Button(
-                label="Aktualisieren",
-                emoji="🔄",
+                label="Schließen",
+                emoji="✖️",
                 style=discord.ButtonStyle.secondary,
-                custom_id=CID_DB_REFRESH,
-            ),
-            discord.ui.Button(
-                label="Neu einrichten",
-                emoji="⚙️",
-                style=discord.ButtonStyle.secondary,
-                custom_id=CID_DB_CONNECT,
-            ),
-            discord.ui.Button(
-                label="Verbindung trennen",
-                emoji="⛔",
-                style=discord.ButtonStyle.danger,
-                custom_id=CID_DB_DISCONNECT,
+                custom_id=_admin_custom_id("close", 0, ""),
             ),
         ),
-        accent_colour=CONNECTED_ACCENT,
+        accent_colour=WARN_COLOR,
     )
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     return view
-
-
-def database_manage_systems_view(systems: List[Dict[str, Any]]) -> discord.ui.View:
-    """View mit Select-Menü zum Löschen von Systemen."""
-    view = discord.ui.View(timeout=300)
-    if not systems:
-        return view
-
-    options = []
-    for s in systems[:25]:
-        options.append(
-            discord.SelectOption(
-                label=s.get("name", "System")[:100],
-                value=s["id"][:100],
-                description=f"Typ: {s.get('type')}"[:100],
-                emoji="🗑️",
-            )
-        )
-    select = discord.ui.Select(
-        placeholder="Wähle ein System zum Löschen aus...",
-        options=options,
-        custom_id=CID_DB_SYS_DEL,
-    )
-    view.add_item(select)
-    return view
-
-
-class TursoConnectModal(discord.ui.Modal, title="🗄️ Turso-Datenbank verknüpfen"):
-    """Modal zur Eingabe von Database-URL und Auth-Token."""
-
-    db_url = discord.ui.TextInput(
-        label="Turso Database URL",
-        placeholder="https://deine-db-user.turso.io oder libsql://...",
-        min_length=5,
-        max_length=200,
-        required=True,
-    )
-    auth_token = discord.ui.TextInput(
-        label="Turso Auth Token",
-        placeholder="eyJhbGciOi...",
-        min_length=10,
-        max_length=1000,
-        required=True,
-    )
-
-    def __init__(self, client: "RelayClient", guild: discord.Guild) -> None:
-        super().__init__(timeout=300)
-        self.client = client
-        self.guild = guild
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        url = (self.db_url.value or "").strip()
-        token = (self.auth_token.value or "").strip()
-
-        if not self.client.state or not getattr(self.client.state, "turso_service", None):
-            await interaction.followup.send("❌ Turso-Service ist noch nicht bereit.", ephemeral=True)
-            return
-
-        ok, msg = await self.client.state.turso_service.connect_guild_database(
-            guild_id=self.guild.id,
-            guild_name=self.guild.name,
-            database_url=url,
-            auth_token=token,
-            configured_by=f"{interaction.user.display_name} ({interaction.user.id})",
-            configured_by_id=str(interaction.user.id),
-        )
-        if not ok:
-            await interaction.followup.send(f"❌ {msg}", ephemeral=True)
-            return
-
-        status_data = await self.client.state.turso_service.get_guild_status(self.guild.id)
-        view = database_configured_view(status_data)
-        await interaction.followup.send(
-            content=f"✅ {msg}",
-            view=view,
-            ephemeral=True
-        )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        log.exception("Fehler im TursoConnectModal", exc_info=error)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"⚠️ Fehler: {error}", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"⚠️ Fehler: {error}", ephemeral=True)
-        except Exception:
-            pass
 
 
 def _button_registration_view() -> discord.ui.LayoutView:
@@ -517,13 +315,6 @@ def _button_registration_view() -> discord.ui.LayoutView:
                 discord.ui.Button(label="Verbinden", custom_id=CID_CONNECT),
                 discord.ui.Button(label="Verbindung trennen", custom_id=CID_DISCONNECT),
                 discord.ui.Button(label="Neues Token generieren", custom_id=CID_REGENERATE),
-            ),
-            discord.ui.ActionRow(
-                discord.ui.Button(label="DB Verbinden", custom_id=CID_DB_CONNECT),
-                discord.ui.Button(label="DB Trennen", custom_id=CID_DB_DISCONNECT),
-                discord.ui.Button(label="DB Refresh", custom_id=CID_DB_REFRESH),
-                discord.ui.Button(label="DB Systeme", custom_id=CID_DB_SYSTEMS),
-                discord.ui.Button(label="DB Wiederverwenden", custom_id=f"{CID_DB_REUSE}:0"),
             ),
         )
     )
@@ -748,36 +539,6 @@ def _admin_guild_stats_lines(guild: discord.Guild) -> List[str]:
         )
     return lines
 
-
-def _admin_db_status_text(db_status: Optional[Dict[str, Any]]) -> str:
-    """Datenbank-Sektion der Server-Übersicht (Turso-Status inkl. Teilen-Info)."""
-    if not db_status or not db_status.get("configured"):
-        return (
-            "**🗄️ Server-Datenbank:**\n"
-            "⚪ Nicht eingerichtet — der Server-Owner kann mit `/manage_database` "
-            "kostenlos eine Turso-Datenbank verknüpfen."
-        )
-    storage = db_status.get("storage") or {}
-    pct = storage.get("usage_percent", 0.0)
-    used = storage.get("used_formatted", "0 B")
-    systems_count = db_status.get("systems_count", len(db_status.get("systems", []) or []))
-    by = db_status.get("configured_by") or "unbekannt"
-    updated = str(db_status.get("updated_at") or "")[:10]
-    lines = [
-        f"🟢 Verbunden (`{db_status.get('database_url', 'Turso')}`)",
-        f"• **{systems_count}** System(e) · Speicher: `{used}` ({pct}%)",
-        f"• Eingerichtet von **{by}**" + (f" am {updated}" if updated else ""),
-    ]
-    if db_status.get("shared"):
-        shared_names = ", ".join(
-            s.get("guild_name") or f"`{s.get('guild_id')}`" for s in (db_status.get("shared_with") or [])
-        )
-        lines.append(f"• 🔗 **Geteilte Datenbank** mit: {shared_names or 'anderen Servern'}")
-    else:
-        lines.append("• Exklusive Datenbank (nur dieser Server)")
-    return "**🗄️ Server-Datenbank:**\n" + "\n".join(lines)
-
-
 def admin_guild_detail_view(
     guild: discord.Guild,
     *,
@@ -788,7 +549,6 @@ def admin_guild_detail_view(
     query: str,
     invite_url: Optional[str] = None,
     notice: Optional[str] = None,
-    db_status: Optional[Dict[str, Any]] = None,
 ) -> discord.ui.LayoutView:
     """Server-Übersicht (Container V2) im Adminpanel."""
     count = f"{(guild.member_count or 0):,}".replace(",", ".")
@@ -828,11 +588,6 @@ def admin_guild_detail_view(
             )
         )
 
-    components.extend([
-        discord.ui.Separator(),
-        discord.ui.TextDisplay(_admin_db_status_text(db_status)),
-    ])
-
     if invite_url:
         components.extend([
             discord.ui.Separator(),
@@ -859,6 +614,10 @@ def admin_guild_detail_view(
         discord.ui.Button(
             label="Server verlassen", emoji="🚪", style=discord.ButtonStyle.danger,
             custom_id=_admin_guild_custom_id("leave", guild.id, page, query),
+        ),
+        discord.ui.Button(
+            label="Server-Dokument erstellen", emoji="📄", style=discord.ButtonStyle.secondary,
+            custom_id=CID_ADMIN_CREATE_DOC,
         ),
         discord.ui.Button(
             label="Schließen", emoji="✖️", style=discord.ButtonStyle.secondary,
@@ -1022,21 +781,9 @@ def guild_remove_notify_view(
         discord.ui.TextDisplay(f"**Grund:** {reason}"),
     ]
     if cleanup is not None:
-        summary = cleanup.get("database_summary") or {}
-        parts: List[str] = [f"🧹 **Aufräumen:** {cleanup.get('sessions_revoked', 0)} KI-Verbindung(en) gestoppt,"]
-        if cleanup.get("database_purged"):
-            if summary.get("exclusive"):
-                parts.append(
-                    f"Datenbank komplett gelöscht ({len(summary.get('dropped_tables', []))} Tabellen geleert)."
-                )
-            else:
-                shared = summary.get("shared_with") or []
-                parts.append(
-                    "Datenbank-Verknüpfung entfernt (die Datenbank wird von anderen Servern "
-                    f"weiterverwendet: {', '.join(str(s) for s in shared) or 'andere'})."
-                )
-        else:
-            parts.append("keine Datenbank-Verknüpfung vorhanden.")
+        parts: List[str] = [
+            f"🧹 **Aufräumen:** {cleanup.get('sessions_revoked', 0)} KI-Verbindung(en) gestoppt."
+        ]
         items.append(discord.ui.Separator())
         items.append(discord.ui.TextDisplay(" ".join(parts)))
     container = discord.ui.Container(*items, accent_colour=ERR_COLOR)
@@ -1338,46 +1085,6 @@ class RelayClient(discord.Client):
         except Exception as exc:  # noqa: BLE001
             log.debug("member_ban konnte nicht verarbeitet werden: %s", exc)
 
-    async def on_member_join(self, member: discord.Member) -> None:
-        """Turso-Engine: Begrüßungen, Auto-Rollen und Join-Aktionen."""
-        if self.state and getattr(self.state, "turso_service", None):
-            try:
-                await self.state.turso_service.engine.handle_member_join(member)
-            except Exception as exc:  # noqa: BLE001
-                log.error("Fehler in Turso handle_member_join: %s", exc)
-
-    async def on_member_remove(self, member: discord.Member) -> None:
-        """Turso-Engine: Verlassen-Nachrichten und Cleanup."""
-        if self.state and getattr(self.state, "turso_service", None):
-            try:
-                await self.state.turso_service.engine.handle_member_remove(member)
-            except Exception as exc:  # noqa: BLE001
-                log.error("Fehler in Turso handle_member_remove: %s", exc)
-
-    async def on_message(self, message: discord.Message) -> None:
-        """Turso-Engine: Auto-Responder, Keyword-Filter, Leveling-Aktionen."""
-        if self.state and getattr(self.state, "turso_service", None):
-            try:
-                await self.state.turso_service.engine.handle_message(message)
-            except Exception as exc:  # noqa: BLE001
-                log.error("Fehler in Turso handle_message: %s", exc)
-
-    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
-        """Turso-Engine: Self Roles / Reaction Roles vergeben."""
-        if self.state and getattr(self.state, "turso_service", None):
-            try:
-                await self.state.turso_service.engine.handle_reaction_add(self, payload)
-            except Exception as exc:  # noqa: BLE001
-                log.error("Fehler in Turso handle_reaction_add: %s", exc)
-
-    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
-        """Turso-Engine: Self Roles / Reaction Roles entfernen."""
-        if self.state and getattr(self.state, "turso_service", None):
-            try:
-                await self.state.turso_service.engine.handle_reaction_remove(self, payload)
-            except Exception as exc:  # noqa: BLE001
-                log.error("Fehler in Turso handle_reaction_remove: %s", exc)
-
     async def on_resumed(self) -> None:
         log.info("Gateway-Verbindung wiederhergestellt.")
 
@@ -1561,19 +1268,15 @@ class RelayClient(discord.Client):
 
     async def _cleanup_guild_data(self, guild: discord.Guild) -> Dict[str, Any]:
         """
-        Löscht alle Daten des Servers — läuft bei **jedem** Verlassen
+        Löscht alle Server-abhängigen Daten — läuft bei **jedem** Verlassen
         (Kick, Ban oder freiwillig), noch bevor der Owner informiert wird.
 
-        * Alle aktiven KI-Sitzungen (Tokens) werden sofort widerrufen.
-        * Die Datenbank-Verknüpfung des Servers wird aus der Master-DB entfernt.
-        * Ist die Server-Datenbank **exklusiv** (kein anderer Server teilt sie),
-          wird sie komplett geleert. Bei **geteilten** Datenbanken bleiben die
-          Daten für die übrigen Server bestehen.
+        * Alle aktiven KI-Sitzungen (Tokens) des Servers werden sofort widerrufen.
 
-        Alles davon darf niemals die Leave-Benachrichtigung blockieren —
-        Fehler werden geloggt und als Summary zurückgegeben.
+        Darf niemals die Leave-Benachrichtigung blockieren — Fehler werden
+        geloggt und als Summary zurückgegeben.
         """
-        cleanup: Dict[str, Any] = {"sessions_revoked": 0, "database_purged": False}
+        cleanup: Dict[str, Any] = {"sessions_revoked": 0}
 
         try:
             revoked = await self.store.revoke(guild_id=guild.id, by="server verlassen")
@@ -1587,16 +1290,6 @@ class RelayClient(discord.Client):
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning("Sitzungen von '%s' konnten nicht widerrufen werden: %s", guild.name, exc)
-
-        turso = getattr(self.state, "turso_service", None) if self.state is not None else None
-        if turso is None:
-            return cleanup
-        try:
-            summary = await turso.purge_guild(guild.id)
-            cleanup["database_purged"] = bool(summary.get("had_database"))
-            cleanup["database_summary"] = summary
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Datenbank-Bereinigung für '%s' fehlgeschlagen: %s", guild.name, exc)
         return cleanup
 
     async def _notify_owner_remove(
@@ -1691,15 +1384,6 @@ class RelayClient(discord.Client):
 
         sessions = self.store.active_for_guild(guild.id)
 
-        db_status: Optional[Dict[str, Any]] = None
-        turso = getattr(self.state, "turso_service", None) if self.state is not None else None
-        if turso is not None:
-            try:
-                db_status = await turso.get_guild_status(guild.id)
-            except Exception as exc:  # noqa: BLE001 — DB-Status darf die Übersicht nie sprengen
-                log.debug("DB-Status für '%s' nicht ladbar: %s", guild.name, exc)
-                db_status = None
-
         return admin_guild_detail_view(
             guild,
             owner=guild_owner,
@@ -1709,7 +1393,6 @@ class RelayClient(discord.Client):
             query=query,
             invite_url=invite_url,
             notice=notice,
-            db_status=db_status,
         )
 
     async def _handle_admin_button(self, interaction: discord.Interaction, custom_id: str) -> None:
@@ -1858,6 +1541,104 @@ class RelayClient(discord.Client):
         # nav, back oder sonstige Navigation
         view = await self._admin_panel_view(page=page, query=query)
         await self._show(interaction, view)
+
+    async def _handle_admin_create_doc(self, interaction: discord.Interaction) -> None:
+        """
+        Erstellt ein Server-Dokument (PDF) und sendet es per DM an den Server-Owner.
+
+        Der Ablauf:
+        1. Deferred Antwort an den Admin ("Dokument wird erstellt …").
+        2. ``build_server_document`` generiert das PDF (Kanäle, Rollen, Mitglieder, …).
+        3. Das PDF wird als Datei per DM an ``guild.owner`` gesendet.
+        4. Der Admin erhält eine finale Bestätigung (ephemeral).
+
+        Der Server selbst bekommt nichts mit — alles läuft über die Owner-DM.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "Dieser Befehl kann nur in einem Server genutzt werden.",
+                ephemeral=True,
+            )
+            return
+
+        owner = guild.owner
+        if owner is None and guild.owner_id:
+            try:
+                owner = await guild.fetch_member(guild.owner_id)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                owner = None
+
+        if owner is None:
+            await interaction.followup.send(
+                "Der Server-Owner konnte nicht ermittelt werden — das Dokument kann nicht versandt werden.",
+                ephemeral=True,
+            )
+            return
+
+        # Fortschrittsmeldung als Follow-up, damit der Admin sieht, dass etwas passiert
+        progress_msg = await interaction.followup.send(
+            "Server-Dokument wird erstellt (0 %) …", ephemeral=True, wait=True
+        )
+
+        async def _progress(percent: int, text: str) -> None:
+            try:
+                await progress_msg.edit(content=f"Server-Dokument wird erstellt ({percent} %) — {text}")
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
+
+        try:
+            http_session = getattr(self.state, "http_session", None)
+            if http_session is None:
+                http_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=60, connect=15),
+                )
+                own_session = True
+            else:
+                own_session = False
+            try:
+                pdf_bytes = await build_server_document(guild, http_session, progress=_progress)
+            finally:
+                if own_session:
+                    await http_session.close()
+
+            file = discord.File(io.BytesIO(pdf_bytes), filename=f"server-dokument-{guild.id}.pdf")
+
+            try:
+                await owner.send(
+                    content=(
+                        f"📄 **Server-Dokument für {guild.name}** (ID `{guild.id}`)\n\n"
+                        "Dieses Dokument enthält eine vollständige Übersicht deines Servers: "
+                        "Kanäle & Kategorien, Rollen mit Farben und Berechtigungen, Emojis & Sticker, "
+                        "Mitglieder sowie die letzten Nachrichten pro Textkanal.\n\n"
+                        "Es wurde auf Anfrage über das Adminpanel erstellt und per DM an dich versendet. "
+                        "Der Server selbst hat nichts davon bemerkt."
+                    ),
+                    file=file,
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("Server-Dokument konnte nicht per DM an Owner von '%s' gesendet werden: %s", guild.name, exc)
+                await progress_msg.edit(
+                    content=(
+                        f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an den Owner** ({owner.display_name}) zugestellt werden.\n"
+                        "Mögliche Ursache: Der Owner hat DMs vom Bot deaktiviert oder der Bot ist nicht gemeinsam mit dem Owner in einem Server."
+                    ),
+                )
+                return
+
+            await progress_msg.edit(
+                content=(
+                    f"✅ Server-Dokument für **{guild.name}** erstellt und per DM an **{owner.display_name}** gesendet."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt
+            log.exception("Fehler beim Erstellen des Server-Dokuments für '%s'", guild.name)
+            try:
+                await progress_msg.edit(content=f"❌ Fehler beim Erstellen des Dokuments: {exc}")
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                await interaction.followup.send(f"❌ Fehler: {exc}", ephemeral=True)
 
     async def _new_session(self, guild: discord.Guild, member: discord.Member, *, note: str):
         """
@@ -2026,38 +1807,19 @@ class RelayClient(discord.Client):
 
         @self.tree.command(
             name="manage_database",
-            description="🗄️ Eigene Turso-Datenbank verwalten (Speicher, Systeme, Setup)",
+            description="🗄️ Server-Datenbank (aktuell nicht verfügbar)",
         )
         @app_commands.guild_only()
         async def manage_database(interaction: discord.Interaction) -> None:
-            """Verwaltung der Server-Datenbank: Speicher-Auslastung, geordnete Systeme & Setup."""
+            """Zeigt den Hinweis, dass die Server-Datenbank aktuell nicht verfügbar ist."""
             gate = await self._guard(interaction)
             if gate is None:
                 return
-            guild = gate["guild"]
-
-            if not self.state or not getattr(self.state, "turso_service", None):
-                await self._deny(interaction, "Dienst startet noch", "Turso-Service ist noch nicht bereit.")
-                return
-
-            configured = await self.state.turso_service.is_guild_db_configured(guild.id)
-            if configured:
-                status_data = await self.state.turso_service.get_guild_status(guild.id)
-                view = database_configured_view(status_data)
-            else:
-                # Noch keine DB hier — aber hat dieser Admin woanders schon eine
-                # eingerichtet? Dann gibt es den blauen Wiederverwenden-Button.
-                try:
-                    reusable = await self.state.turso_service.list_reusable_databases_for_user(
-                        interaction.user.id, exclude_guild_id=guild.id,
-                    )
-                except Exception as exc:  # noqa: BLE001 — Anzeige-Feature darf den Command nie blockieren
-                    log.warning("Wiederverwenden-Liste konnte nicht geladen werden: %s", exc)
-                    reusable = []
-                view = database_unconfigured_view(reusable=reusable)
 
             try:
-                await interaction.response.send_message(view=view, ephemeral=True)
+                await interaction.response.send_message(
+                    view=manage_database_unavailable_view(), ephemeral=True,
+                )
             except discord.HTTPException as exc:
                 log.error("Antwort auf /manage_database fehlgeschlagen: %s", exc)
 
@@ -2160,187 +1922,10 @@ class RelayClient(discord.Client):
             await self._handle_revoke_all(interaction)
         elif custom_id in (CID_REGENERATE, CID_LEGACY_REGENERATE):
             await self._handle_regenerate(interaction)
-        elif custom_id == CID_DB_CONNECT:
-            await self._handle_db_connect(interaction)
-        elif custom_id == CID_DB_DISCONNECT:
-            await self._handle_db_disconnect(interaction)
-        elif custom_id == CID_DB_REFRESH:
-            await self._handle_db_refresh(interaction)
-        elif custom_id == CID_DB_SYSTEMS:
-            await self._handle_db_systems(interaction)
-        elif custom_id == CID_DB_SYS_DEL:
-            await self._handle_db_delete_system(interaction)
-        elif custom_id.startswith(f"{CID_DB_REUSE}:"):
-            await self._handle_db_reuse(interaction, custom_id)
+        elif custom_id == CID_ADMIN_CREATE_DOC:
+            await self._handle_admin_create_doc(interaction)
         elif custom_id.startswith(CID_ADMIN_PREFIX):
             await self._handle_admin_button(interaction, custom_id)
-
-    async def _handle_connect(self, interaction: discord.Interaction) -> None:
-        """Grüner „Verbinden“-Button: erzeugt das Token und bearbeitet die Nachricht."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        member = gate["member"]
-
-        session, token = await self._new_session(guild, member, note="per Verbinden-Button erzeugt")
-        self.state.maybe_save(force=True)
-        await self._show(interaction, connected_view(self.state.base_url(), token))
-        log.info(
-            "Verbinden-Button von %s (%s) auf '%s' — Sitzung %s, Token %s, Modus %s.",
-            member.display_name, member.id, guild.name, session.id,
-            session.token_prefix, session.mode,
-        )
-
-    async def _handle_revoke_all(self, interaction: discord.Interaction) -> None:
-        """Roter „Verbindung trennen“-Button: alle Tokens widerrufen, zurück zum Willkommen."""
-        gate = await self._guard(interaction, require_bot_admin=False)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        revoked = await self.store.revoke(guild_id=guild.id, by=f"button:{interaction.user.id}")
-        self.state.maybe_save(force=True)
-        await self._show(interaction, welcome_view())
-        log.info(
-            "Verbindung getrennt: %s (%s) hat %d Sitzung(en) auf '%s' widerrufen.",
-            gate["member"].display_name, interaction.user.id, len(revoked), guild.name,
-        )
-
-    async def _handle_regenerate(self, interaction: discord.Interaction) -> None:
-        """„Neues Token generieren“-Button: alte Tokens ungültig, frisches Token zeigen."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        member = gate["member"]
-
-        await self.store.revoke(guild_id=guild.id, by=f"button:{interaction.user.id}")
-        session, token = await self._new_session(guild, member, note="per Button neu generiert")
-        self.state.maybe_save(force=True)
-        await self._show(interaction, connected_view(self.state.base_url(), token))
-        log.info(
-            "Neues Token generiert: %s (%s) auf '%s' — Sitzung %s, Token %s "
-            "(alte Tokens dieser Guild sind ungültig).",
-            member.display_name, member.id, guild.name, session.id, session.token_prefix,
-        )
-
-    async def _handle_db_connect(self, interaction: discord.Interaction) -> None:
-        """Öffnet das Modal zur Eingabe der Turso-Zugangsdaten."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        await interaction.response.send_modal(TursoConnectModal(self, gate["guild"]))
-
-    async def _handle_db_reuse(self, interaction: discord.Interaction, custom_id: str) -> None:
-        """
-        Blauer „DB von … nutzen“-Button: verknüpft diesen Server mit der
-        bereits vorhandenen Datenbank desselben Admins von einem anderen Server.
-        """
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        service = getattr(self.state, "turso_service", None) if self.state else None
-        if service is None:
-            await interaction.response.send_message("❌ Turso-Service ist noch nicht bereit.", ephemeral=True)
-            return
-
-        raw = custom_id[len(CID_DB_REUSE) + 1:]
-        try:
-            source_guild_id = int(raw)
-        except ValueError:
-            await interaction.response.send_message(
-                "⚠️ Dieser Button ist nicht mehr gültig — führe `/manage_database` erneut aus.",
-                ephemeral=True,
-            )
-            return
-
-        ok, msg = await service.reuse_guild_database(
-            guild_id=guild.id,
-            guild_name=guild.name,
-            source_guild_id=source_guild_id,
-            configured_by=f"{interaction.user.display_name} ({interaction.user.id})",
-            configured_by_id=str(interaction.user.id),
-        )
-        if not ok:
-            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
-            return
-
-        status_data = await service.get_guild_status(guild.id)
-        await interaction.response.send_message(
-            content=f"✅ {msg}",
-            view=database_configured_view(status_data),
-            ephemeral=True,
-        )
-        log.info(
-            "Bestehende Datenbank von Guild %s für '%s' (%s) wiederverwendet durch %s (%s).",
-            source_guild_id, guild.name, guild.id, gate["member"].display_name, interaction.user.id,
-        )
-
-    async def _handle_db_disconnect(self, interaction: discord.Interaction) -> None:
-        """Trennt die Turso-Datenbank und zeigt die unkonfigurierte Ansicht."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        if self.state and getattr(self.state, "turso_service", None):
-            await self.state.turso_service.disconnect_guild_database(guild.id)
-        await self._show(interaction, database_unconfigured_view())
-        log.info("Turso-DB für '%s' getrennt von %s (%s).", guild.name, gate["member"].display_name, interaction.user.id)
-
-    async def _handle_db_refresh(self, interaction: discord.Interaction) -> None:
-        """Aktualisiert die Status-Ansicht der Turso-Datenbank."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        if not self.state or not getattr(self.state, "turso_service", None):
-            return
-        configured = await self.state.turso_service.is_guild_db_configured(guild.id)
-        if configured:
-            status_data = await self.state.turso_service.get_guild_status(guild.id)
-            await self._show(interaction, database_configured_view(status_data))
-        else:
-            await self._show(interaction, database_unconfigured_view())
-
-    async def _handle_db_systems(self, interaction: discord.Interaction) -> None:
-        """Öffnet das System-Management-Menü."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        if not self.state or not getattr(self.state, "turso_service", None):
-            return
-        systems = await self.state.turso_service.list_systems(guild.id)
-        if not systems:
-            await interaction.response.send_message(
-                "Es sind noch keine Systeme eingerichtet. Sag Arena AI, was für ein System (z. B. Self Roles, Willkommen) er bauen soll!",
-                ephemeral=True,
-            )
-            return
-        view = database_manage_systems_view(systems)
-        await interaction.response.send_message(
-            "📋 **Systeme verwalten** — Wähle ein System aus dem Menü, um es zu löschen:",
-            view=view,
-            ephemeral=True,
-        )
-
-    async def _handle_db_delete_system(self, interaction: discord.Interaction) -> None:
-        """Löscht das ausgewählte System aus der Turso-Datenbank."""
-        gate = await self._guard(interaction)
-        if gate is None:
-            return
-        guild = gate["guild"]
-        values = (interaction.data or {}).get("values", [])
-        if not values or not self.state or not getattr(self.state, "turso_service", None):
-            return
-        sys_id = values[0]
-        deleted = await self.state.turso_service.delete_system(guild.id, sys_id)
-        if deleted:
-            await interaction.response.send_message(f"🗑️ System `{sys_id}` wurde erfolgreich gelöscht.", ephemeral=True)
-            log.info("System %s auf '%s' gelöscht von %s.", sys_id, guild.name, gate["member"].display_name)
-        else:
-            await interaction.response.send_message(f"System `{sys_id}` konnte nicht gefunden werden.", ephemeral=True)
 
     async def _show(self, interaction: discord.Interaction, view: discord.ui.LayoutView) -> None:
         """
