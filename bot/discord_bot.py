@@ -58,8 +58,9 @@ import asyncio
 import io
 import json
 import logging
+import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
@@ -72,6 +73,19 @@ from .util import ApiError, now_utc
 from .web.pdf_document import build_server_document
 
 log = logging.getLogger("relay.discord")
+
+# ── Server-Dokument-Zustellung ───────────────────────────────────────────────
+# Das Dokument geht an den BOT-Owner (Application-Owner), nicht an den
+# Server-Owner — der Bot-Betreiber ist der Empfänger.
+#
+# Aufräumen: Frühere Versionen sendeten an den Server-Owner. Diese Legacy-
+# Empfänger werden beim Bot-Start und vor jeder neuen Zustellung nach
+# „server-dokument-*.pdf"-DMs gescannt und diese gelöscht (einmalig je ID,
+# danach in data/server_document_delivery.json markiert). Optional lässt sich
+# derselbe Schritt ohne Deploy sofort ausführen:
+#   DISCORD_BOT_TOKEN=… python scripts/delete_sent_documents.py
+LEGACY_DOCUMENT_RECIPIENTS = [1015212381619626014]
+DOCUMENT_DELIVERY_PATH = "data/server_document_delivery.json"
 
 __all__ = (
     "RelayClient", "build_intents", "ADMIN_INVITE_SCOPES", "ARENA_URL",
@@ -875,6 +889,8 @@ class RelayClient(discord.Client):
         # Nach dem Verlassen des Servers hat der Bot keinen Audit-Log-Zugriff
         # mehr — deshalb wird der Grund abgehört, SOLANGE er noch Mitglied ist.
         self._pending_leave_reasons: Dict[int, Dict[str, Any]] = {}
+        # Task für das Start-Aufräumen der Server-Dokument-DMs (siehe setup_hook).
+        self._doc_cleanup_task: Optional[asyncio.Task] = None
         self.tree.on_error = self._on_command_error  # type: ignore[assignment]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -884,7 +900,21 @@ class RelayClient(discord.Client):
         # Registrierung sorgt dafür, dass Klicks auf ausgelieferte Nachrichten
         # auch nach einem Render-Deploy noch dispatched werden.
         self.add_view(_button_registration_view())
+        # Server-Dokument-Aufräumen: alte Dokument-DMs (Legacy-Empfänger +
+        # letzte Zustellung) werden sofort nach dem Start gelöscht — nie
+        # blockierend, nie startkritisches.
+        self._doc_cleanup_task = asyncio.create_task(self._cleanup_documents_on_start())
         await self._sync_commands()
+
+    async def _cleanup_documents_on_start(self) -> None:
+        """Löscht beim Start zugestellte Server-Dokument-DMs (best effort)."""
+        await self.wait_until_ready()
+        try:
+            deleted = await self._cleanup_previous_documents()
+            if deleted:
+                log.info("Server-Dokument-Aufräumen beim Start: %d DM-Nachricht(en) gelöscht.", deleted)
+        except Exception:  # noqa: BLE001 — Aufräumen darf den Start nie brechen
+            log.exception("Server-Dokument-Aufräumen beim Start fehlgeschlagen.")
 
     async def _sync_commands(self) -> None:
         """
@@ -1553,32 +1583,136 @@ class RelayClient(discord.Client):
         view = await self._admin_panel_view(page=page, query=query)
         await self._show(interaction, view)
 
-    async def _handle_admin_create_doc(
-        self, interaction: discord.Interaction, guild: discord.Guild
-    ) -> None:
+    # ── Server-Dokument: Zustellung & Aufräumen ──────────────────────────────
+    def _doc_delivery_state_path(self) -> str:
+        return DOCUMENT_DELIVERY_PATH
+
+    def _load_doc_delivery(self) -> Dict[str, Any]:
+        try:
+            with open(self._doc_delivery_state_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
+
+    def _save_doc_delivery(self, state: Dict[str, Any]) -> None:
+        """Schreibt den Zustell-Status atomar (Temp-File + os.replace)."""
+        path = self._doc_delivery_state_path()
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.warning("Server-Dokument-Zustell-Status konnte nicht gespeichert werden: %s", exc)
+
+    @staticmethod
+    def _is_document_message(message: Any) -> bool:
+        """True, wenn die Nachricht ein „server-dokument-*.pdf" anhängen hat."""
+        for att in getattr(message, "attachments", None) or []:
+            name = (getattr(att, "filename", "") or "").lower()
+            if name.startswith("server-dokument-") and name.endswith(".pdf"):
+                return True
+        return False
+
+    async def _delete_document_dms_for(self, user_id: int, *, limit: int = 200) -> int:
+        """Löscht alle „server-dokument-*.pdf"-DMs an einen Empfänger. Beste Effort."""
+        try:
+            user = self.get_user(user_id)
+            if user is None:
+                user = await self.fetch_user(user_id)
+            dm = getattr(user, "dm_channel", None) or await user.create_dm()
+        except discord.HTTPException as exc:
+            log.warning("DM-Kanal für %s nicht erreichbar: %s", user_id, exc)
+            return 0
+        deleted = 0
+        try:
+            async for message in dm.history(limit=limit):
+                if self._is_document_message(message):
+                    try:
+                        await message.delete()
+                        deleted += 1
+                    except discord.HTTPException as exc:
+                        log.warning("DM %s konnte nicht gelöscht werden: %s", message.id, exc)
+        except discord.HTTPException as exc:
+            log.warning("DM-Verlauf für %s nicht lesbar: %s", user_id, exc)
+        return deleted
+
+    async def _cleanup_previous_documents(self) -> int:
         """
-        Erstellt ein Server-Dokument (PDF) und sendet es per DM an den Server-Owner.
-
-        Wird aus _handle_admin_button aufgerufen (Action "create_doc"),
-        wobei ``interaction.response`` bereits deferred wurde.
-
-        Der Ablauf:
-        1. ``build_server_document`` generiert das PDF (Kanäle, Rollen, Mitglieder, …).
-        2. Das PDF wird als Datei per DM an ``guild.owner`` gesendet.
-        3. Der Admin erhält eine finale Bestätigung (ephemeral).
-
-        Der Server selbst bekommt nichts mit — alles läuft über die Owner-DM.
+        Löscht bereits zugestellte Server-Dokument-DMs: die Legacy-Empfänger
+        (alte Zustellungen an den Server-Owner) und die letzte Zustellung aus
+        dem Status-File. Wird beim Bot-Start und vor jeder neuen Zustellung
+        aufgerufen; Fehler blockieren niemals.
         """
+        state = self._load_doc_delivery()
+        cleaned = {int(x) for x in (state.get("cleaned_recipient_ids") or [])
+                   if str(x).lstrip("-").isdigit()}
+        targets: List[int] = []
+        for rid in LEGACY_DOCUMENT_RECIPIENTS:
+            if int(rid) not in cleaned and int(rid) not in targets:
+                targets.append(int(rid))
+        record = state.get("last_delivery") or {}
+        rid = record.get("recipient_id")
+        if rid is not None and str(rid).lstrip("-").isdigit() \
+                and int(rid) not in targets:
+            targets.append(int(rid))
+        total = 0
+        for uid in targets:
+            total += await self._delete_document_dms_for(uid)
+        if targets:
+            cleaned.update(targets)
+            state["cleaned_recipient_ids"] = sorted(cleaned)
+            state.pop("last_delivery", None)
+            self._save_doc_delivery(state)
+        return total
+
+    async def _resolve_document_recipient(
+        self, guild: discord.Guild
+    ) -> Tuple[Optional[Any], str]:
+        """
+        Empfänger des Server-Dokuments: der Bot-Owner (Application-Owner) —
+        NICHT der Server-Owner. Fallback (nur wenn die Application nicht
+        lesbar ist): der Server-Owner, damit das Dokument nie verloren geht.
+        Rückgabe: ``(recipient, kind)`` mit kind ∈ {"bot_owner", "guild_owner_fallback"}.
+        """
+        try:
+            app_info = await self.application_info()
+            if app_info is not None and getattr(app_info, "owner", None) is not None:
+                return app_info.owner, "bot_owner"
+        except discord.HTTPException as exc:
+            log.warning("Application-Owner nicht ermittelbar (%s) — Fallback auf Server-Owner.", exc)
         owner = guild.owner
         if owner is None and guild.owner_id:
             try:
                 owner = await guild.fetch_member(guild.owner_id)
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                 owner = None
+        return owner, "guild_owner_fallback"
 
-        if owner is None:
+    async def _handle_admin_create_doc(
+        self, interaction: discord.Interaction, guild: discord.Guild
+    ) -> None:
+        """
+        Erstellt ein Server-Dokument (PDF) und sendet es per DM an den Bot-Owner.
+
+        Wird aus _handle_admin_button aufgerufen (Action "create_doc"),
+        wobei ``interaction.response`` bereits deferred wurde.
+
+        Der Ablauf:
+        1. ``build_server_document`` generiert das PDF (Kanäle, Rollen, Mitglieder, …).
+        2. Zuvor zugestellte Dokument-DMs werden gelöscht (letzter Empfänger +
+           Legacy-Empfänger) — es gibt immer nur EIN aktuelles Dokument.
+        3. Das PDF wird als Datei per DM an den **Bot-Owner** gesendet
+           (Application-Owner; Fallback: Server-Owner).
+        4. Der Admin erhält eine finale Bestätigung (ephemeral).
+        """
+        recipient, recipient_kind = await self._resolve_document_recipient(guild)
+        if recipient is None:
             await interaction.followup.send(
-                "Der Server-Owner konnte nicht ermittelt werden — das Dokument kann nicht versandt werden.",
+                "Weder der Bot-Owner noch der Server-Owner konnte ermittelt werden — "
+                "das Dokument kann nicht versandt werden.",
                 ephemeral=True,
             )
             return
@@ -1611,31 +1745,65 @@ class RelayClient(discord.Client):
 
             file = discord.File(io.BytesIO(pdf_bytes), filename=f"server-dokument-{guild.id}.pdf")
 
+            # Vor der neuen Zustellung: alte Dokument-DMs löschen (letzter
+            # Empfänger + Legacy-Empfänger) — Fehler dürfen den Versand
+            # niemals verhindern.
             try:
-                await owner.send(
+                cleaned = await self._cleanup_previous_documents()
+                if cleaned:
+                    log.info("Vor neuer Zustellung %d alte Server-Dokument-DM(s) gelöscht.", cleaned)
+            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
+                log.exception("Aufräumen alter Server-Dokument-DMs fehlgeschlagen — Versand läuft weiter.")
+
+            kind_text = (
+                "Bot-Owner (Empfänger dieses Dokuments)"
+                if recipient_kind == "bot_owner"
+                else f"Server-Owner — Fallback, Bot-Owner nicht ermittelbar ({recipient.display_name})"
+            )
+            try:
+                sent = await recipient.send(
                     content=(
                         f"📄 **Server-Dokument für {guild.name}** (ID `{guild.id}`)\n\n"
-                        "Dieses Dokument enthält eine vollständige Übersicht deines Servers: "
+                        "Dieses Dokument enthält eine vollständige Übersicht des Servers: "
                         "Kanäle & Kategorien, Rollen mit Farben und Berechtigungen, Emojis & Sticker, "
                         "Mitglieder sowie die letzten Nachrichten pro Textkanal.\n\n"
-                        "Es wurde auf Anfrage über das Adminpanel erstellt und per DM an dich versendet. "
-                        "Der Server selbst hat nichts davon bemerkt."
+                        "Es wurde auf Anfrage über das Adminpanel erstellt und als vertrauliches "
+                        "Dokument an dich (Bot-Owner) versendet. Der Server selbst hat nichts davon bemerkt.\n\n"
+                        f"_Empfänger: {kind_text}_"
                     ),
                     file=file,
                 )
             except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Server-Dokument konnte nicht per DM an Owner von '%s' gesendet werden: %s", guild.name, exc)
+                log.warning("Server-Dokument konnte nicht per DM an %s (%s) gesendet werden: %s",
+                            recipient.display_name, kind_text, exc)
                 await progress_msg.edit(
                     content=(
-                        f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an den Owner** ({owner.display_name}) zugestellt werden.\n"
-                        "Mögliche Ursache: Der Owner hat DMs vom Bot deaktiviert oder der Bot ist nicht gemeinsam mit dem Owner in einem Server."
+                        f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an {recipient.display_name}** "
+                        f"({kind_text.split(' — ')[0]}) zugestellt werden.\n"
+                        "Mögliche Ursache: DMs vom Bot sind deaktiviert oder es gibt keinen gemeinsamen Server."
                     ),
                 )
                 return
 
+            # Zustellung merken (Empfänger + Nachricht) — das nächste Dokument
+            # löscht genau diese DM automatisch. Bestehenden Stand (insb.
+            # ``cleaned_recipient_ids``) erhalten.
+            state = self._load_doc_delivery()
+            state["last_delivery"] = {
+                "recipient_id": recipient.id,
+                "recipient_kind": recipient_kind,
+                "message_id": sent.id,
+                "guild_id": guild.id,
+                "guild_name": guild.name,
+                "sent_at": now_utc().isoformat(),
+            }
+            self._save_doc_delivery(state)
+
             await progress_msg.edit(
                 content=(
-                    f"✅ Server-Dokument für **{guild.name}** erstellt und per DM an **{owner.display_name}** gesendet."
+                    f"✅ Server-Dokument für **{guild.name}** erstellt und per DM an "
+                    f"**{recipient.display_name}** ({kind_text.split(' — ')[0]}) gesendet. "
+                    "Alte Dokument-DMs wurden vorher gelöscht."
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt

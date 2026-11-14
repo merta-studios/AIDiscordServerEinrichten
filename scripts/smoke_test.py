@@ -1088,6 +1088,137 @@ async def t_session_limit(h: Harness) -> None:
           bad_mode.mode == "read_write", bad_mode.mode)
 
 
+async def t_docdelivery(h: Harness) -> None:
+    """
+    Server-Dokument-Zustellung: Empfänger ist der BOT-Owner (Application-Owner),
+    nicht der Server-Owner. Zugestellte Dokument-DMs werden automatisch
+    gelöscht (letzte Zustellung + Legacy-Empfänger), bevor ein neues Dokument
+    geht — es gibt immer nur EIN aktuelles Dokument.
+    """
+    print("── Server-Dokument: Zustellung (Bot-Owner) & Aufräumen ───────")
+    import tempfile
+    from types import SimpleNamespace
+
+    import bot.discord_bot as db
+    from bot.discord_bot import RelayClient
+
+    bot_owner = SimpleNamespace(id=424242424242424242, display_name="Bot-Betreiber")
+    guild_owner = SimpleNamespace(id=1015212381619626014, display_name="Server-Owner")
+
+    class _User:
+        def __init__(self, uid: int) -> None:
+            self.id = uid
+            self.display_name = f"User-{uid}"
+            self.dm_channel = None
+
+        async def create_dm(self):
+            if self.dm_channel is None:
+                self.dm_channel = _DM()
+            return self.dm_channel
+
+    class _DM:
+        def __init__(self) -> None:
+            self.messages: List[Any] = []
+
+        def history(self, limit=None):
+            async def gen():
+                for m in self.messages[: limit or None]:
+                    yield m
+            return gen()
+
+    class _Att:
+        def __init__(self, filename: str) -> None:
+            self.filename = filename
+
+    class _Msg:
+        def __init__(self, mid: int, filename: str) -> None:
+            self.id = mid
+            self.attachments = [] if filename is None else [_Att(filename)]
+            self.deleted = False
+
+        async def delete(self) -> None:
+            self.deleted = True
+
+    # RelayClient ohne __init__ (keine Gateway-Verbindung nötig) — nur die
+    # Dokument-Helper werden getestet.
+    client = RelayClient.__new__(RelayClient)
+    users = {424242424242424242: _User(424242424242424242),
+             1015212381619626014: _User(1015212381619626014),
+             888888888888888888: _User(888888888888888888)}
+    client.get_user = lambda uid: users.get(uid)
+    client.fetch_user = users.get  # type: ignore[method-assign]
+
+    tmpdir = tempfile.mkdtemp(prefix="docdelivery-")
+    state_path = os.path.join(tmpdir, "delivery.json")
+    client._doc_delivery_state_path = lambda: state_path  # type: ignore[method-assign]
+
+    async def _app_info():
+        return SimpleNamespace(owner=bot_owner)
+    client.application_info = _app_info  # type: ignore[method-assign]
+
+    guild = SimpleNamespace(owner=guild_owner, owner_id=guild_owner.id)
+
+    recipient, kind = await client._resolve_document_recipient(guild)
+    check("Dokument-Empfänger ist der Bot-Owner (nicht Server-Owner)",
+          recipient is bot_owner and kind == "bot_owner", str(kind))
+
+    async def _app_info_fail():
+        raise discord.HTTPException(
+            SimpleNamespace(status=500, reason="Internal Server Error"),
+            "application nicht lesbar",
+        )
+    client.application_info = _app_info_fail  # type: ignore[method-assign]
+    recipient, kind = await client._resolve_document_recipient(guild)
+    check("Fallback: ohne Application-Info geht das Dokument an den Server-Owner",
+          recipient is guild_owner and kind == "guild_owner_fallback", str(kind))
+    client.application_info = _app_info  # type: ignore[method-assign]
+
+    check("Erkennung: server-dokument-*.pdf wird erkannt",
+          RelayClient._is_document_message(SimpleNamespace(attachments=[_Att("server-dokument-123.pdf")])))
+    check("Erkennung: fremde Anhänge werden ignoriert",
+          not RelayClient._is_document_message(SimpleNamespace(attachments=[_Att("anderes.pdf")])),
+          "anderes.pdf")
+
+    legacy_saved = list(db.LEGACY_DOCUMENT_RECIPIENTS)
+    try:
+        db.LEGACY_DOCUMENT_RECIPIENTS = [1015212381619626014]
+        await users[1015212381619626014].create_dm()
+        legacy_channel = users[1015212381619626014].dm_channel
+        assert legacy_channel is not None
+        m_old1 = _Msg(1, "server-dokument-555123888444222111.pdf")
+        m_keep = _Msg(2, "wichtiges-protokoll.pdf")
+        m_old2 = _Msg(3, "server-dokument-42.pdf")
+        legacy_channel.messages = [m_old1, m_keep, m_old2]
+
+        deleted = await client._cleanup_previous_documents()
+        check("Legacy-Zustellung (Server-Owner) wird beim Aufräumen gelöscht",
+              deleted == 2 and m_old1.deleted and m_old2.deleted, f"{deleted} gelöscht")
+        check("Fremde DMs bleiben unberührt", not m_keep.deleted)
+        state = json.load(open(state_path, encoding="utf-8"))
+        check("Legacy-Empfänger als bereinigt markiert",
+              1015212381619626014 in (state.get("cleaned_recipient_ids") or []), str(state))
+
+        deleted_again = await client._cleanup_previous_documents()
+        check("Zweiter Start scannt die Legacy-Empfänger nicht erneut", deleted_again == 0)
+
+        # Letzte Zustellung aus dem Status-File wird ebenfalls gelöscht
+        await users[888888888888888888].create_dm()
+        record_channel = users[888888888888888888].dm_channel
+        m_last = _Msg(77, "server-dokument-999.pdf")
+        record_channel.messages = [m_last]
+        current = json.load(open(state_path, encoding="utf-8"))
+        current["last_delivery"] = {"recipient_id": 888888888888888888, "message_id": 77}
+        json.dump(current, open(state_path, "w", encoding="utf-8"))
+        deleted = await client._cleanup_previous_documents()
+        check("Letzte Zustellung (Status-File) wird vor neuem Versand gelöscht",
+              deleted == 1 and m_last.deleted, f"{deleted} gelöscht")
+        state = json.load(open(state_path, encoding="utf-8"))
+        check("Status-File räumt die alte Zustellung ab (last_delivery entfernt)",
+              "last_delivery" not in state, str(state))
+    finally:
+        db.LEGACY_DOCUMENT_RECIPIENTS = legacy_saved
+
+
 async def t_security(h: Harness) -> None:
     print("── Sicherheits-Grundlagen ────────────────────────────────────")
     api = h.api("danger")
@@ -1204,7 +1335,7 @@ async def run_tests() -> int:
         ("errors", t_errors), ("setup", t_setup), ("lifecycle", t_session_lifecycle),
         ("ratelimit", t_ratelimit), ("write", t_write), ("arena", t_arena),
         ("prompt", t_prompt), ("pdf", t_pdf), ("limit", t_session_limit),
-        ("security", t_security),
+        ("docdelivery", t_docdelivery), ("security", t_security),
     )
     selected = [g for g in sys.argv[1:] if not g.startswith("-")] or [name for name, _ in groups]
 
