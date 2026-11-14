@@ -617,7 +617,7 @@ def admin_guild_detail_view(
         ),
         discord.ui.Button(
             label="Server-Dokument erstellen", emoji="📄", style=discord.ButtonStyle.secondary,
-            custom_id=CID_ADMIN_CREATE_DOC,
+            custom_id=_admin_guild_custom_id("create_doc", guild.id, page, query),
         ),
         discord.ui.Button(
             label="Schließen", emoji="✖️", style=discord.ButtonStyle.secondary,
@@ -1502,6 +1502,17 @@ class RelayClient(discord.Client):
             await self._show(interaction, view)
             return
 
+        if action == "create_doc":
+            guild_id = parsed.get("guild_id")
+            guild = self.get_guild(guild_id) if guild_id else None
+            if guild is None:
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await self._handle_admin_create_doc(interaction, guild)
+            return
+
         if action == "leave":
             guild_id = parsed.get("guild_id")
             guild = self.get_guild(guild_id) if guild_id else None
@@ -1542,28 +1553,22 @@ class RelayClient(discord.Client):
         view = await self._admin_panel_view(page=page, query=query)
         await self._show(interaction, view)
 
-    async def _handle_admin_create_doc(self, interaction: discord.Interaction) -> None:
+    async def _handle_admin_create_doc(
+        self, interaction: discord.Interaction, guild: discord.Guild
+    ) -> None:
         """
         Erstellt ein Server-Dokument (PDF) und sendet es per DM an den Server-Owner.
 
+        Wird aus _handle_admin_button aufgerufen (Action "create_doc"),
+        wobei ``interaction.response`` bereits deferred wurde.
+
         Der Ablauf:
-        1. Deferred Antwort an den Admin ("Dokument wird erstellt …").
-        2. ``build_server_document`` generiert das PDF (Kanäle, Rollen, Mitglieder, …).
-        3. Das PDF wird als Datei per DM an ``guild.owner`` gesendet.
-        4. Der Admin erhält eine finale Bestätigung (ephemeral).
+        1. ``build_server_document`` generiert das PDF (Kanäle, Rollen, Mitglieder, …).
+        2. Das PDF wird als Datei per DM an ``guild.owner`` gesendet.
+        3. Der Admin erhält eine finale Bestätigung (ephemeral).
 
         Der Server selbst bekommt nichts mit — alles läuft über die Owner-DM.
         """
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        guild = interaction.guild
-        if guild is None:
-            await interaction.followup.send(
-                "Dieser Befehl kann nur in einem Server genutzt werden.",
-                ephemeral=True,
-            )
-            return
-
         owner = guild.owner
         if owner is None and guild.owner_id:
             try:
@@ -1922,8 +1927,6 @@ class RelayClient(discord.Client):
             await self._handle_revoke_all(interaction)
         elif custom_id in (CID_REGENERATE, CID_LEGACY_REGENERATE):
             await self._handle_regenerate(interaction)
-        elif custom_id == CID_ADMIN_CREATE_DOC:
-            await self._handle_admin_create_doc(interaction)
         elif custom_id.startswith(CID_ADMIN_PREFIX):
             await self._handle_admin_button(interaction, custom_id)
 
