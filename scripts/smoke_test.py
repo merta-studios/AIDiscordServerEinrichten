@@ -59,7 +59,7 @@ VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _fake_discord import (  # noqa: E402
-    GUILD_ID, TEXT_ID, USER_ID, FakeClient, FakeGuild, MutableGuild, now,
+    GUILD_ID, TEXT_ID, USER_ID, FakeClient, FakeGuild, FakeMessage, MutableGuild, now,
 )
 
 OTHER_GUILD_ID = 1212121212121212
@@ -981,6 +981,85 @@ async def t_prompt(h: Harness) -> None:
     check("admin_guild_leave_confirm_view ist Components V2", leave_v.has_components_v2())
 
 
+async def t_pdf(h: Harness) -> None:
+    """
+    Server-Dokument (PDF): Build läuft komplett durch, DejaVu-Fonts sind
+    eingebettet (keine schwarzen Vierecke), und fehlende Avatare/Icons
+    (offline) crashen den Build nicht.
+    """
+    print("── Server-Dokument (PDF): Build & Fonts ──────────────────────")
+    import re as _re
+
+    import aiohttp as _aiohttp
+
+    from bot.web import pdf_document as pdf_mod
+    from bot.web.pdf_document import _ensure_fonts, _prepare_text, build_server_document
+
+    _ensure_fonts()
+    check("PDF: DejaVu-Sans registriert (kein Base-14-Fallback)",
+          pdf_mod._FONTS["sans"] != "Helvetica", pdf_mod._FONTS["sans"])
+    check("PDF: Glyph-Abdeckung ermittelt",
+          pdf_mod._GLYPH_COVERAGE is not None and len(pdf_mod._GLYPH_COVERAGE) > 3000)
+
+    # Text-Hygiene: Emojis → deutsche Wörter, keine Notdef-Kandidaten
+    prepared = _prepare_text("Willkommen 🎉 <:ping:123456789012345678> Привет 中文 ✓ <@123456789012345678>")
+    check("PDF: Emoji wird ins Deutsche übersetzt", "konfettibombe" in prepared.lower(), prepared)
+    check("PDF: Custom-Emoji-Syntax aufgelöst",
+          "ping" in prepared.lower() and "<:ping:" not in prepared, prepared)
+    check("PDF: Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
+    leftovers = [ch for ch in prepared
+                 if ord(ch) not in (pdf_mod._GLYPH_COVERAGE or set()) and ch != "\n"]
+    check("PDF: kein Zeichen ohne Glyphe im Ergebnis", not leftovers, repr(leftovers[:10]))
+    check("PDF: Zeitangaben bleiben unzerstört",
+          _prepare_text("Treffen 12:30:00 Uhr") == "Treffen 12:30:00 Uhr")
+    check("PDF: unsichtbare Bidi/Zero-Width-Zeichen entfernt",
+          all(c not in _prepare_text("a\u200bb\u202ec") for c in ("\u200b", "\u202e")))
+
+    # Build gegen den simulierten Server — offline: Avatar-Downloads scheitern
+    # und dürfen den Build NICHT abbrechen (Regression: Rostring in Listen-Zelle).
+    g = _standard_guild()
+
+    def _history_factory(msgs):
+        def history(limit=None):
+            async def gen():
+                for m in msgs[: limit or None]:
+                    yield m
+            return gen()
+        return history
+
+    channel = g.text_channels[0]
+    embed = discord.Embed(title="Regeln ✅", description="Sei nett «bitte»",
+                          color=discord.Colour(0x5865F2))
+    embed.add_field(name="Feld «Eins»", value="Wert eins", inline=True)
+    msgs = []
+    for i, author in enumerate((g.owner, g.me)):
+        m = FakeMessage(700000000000000000 + i, channel, author,
+                        content=f"Testnachricht {i} — 🎉 Привет ✓",
+                        embeds=[embed] if i == 0 else [])
+        msgs.append(m)
+    channel.history = _history_factory(msgs)
+
+    progress_seen: List[int] = []
+
+    async def _progress(pct: int, text: str) -> None:
+        progress_seen.append(pct)
+
+    async with _aiohttp.ClientSession() as session:
+        pdf_bytes = await build_server_document(g, session, progress=_progress)
+
+    check("PDF: Build liefert %PDF-Bytes", pdf_bytes[:5] == b"%PDF-", repr(pdf_bytes[:8]))
+    check("PDF: endet mit %%EOF", pdf_bytes.rstrip().endswith(b"%%EOF"))
+    check("PDF: Fortschritt läuft bis 100 %", bool(progress_seen) and progress_seen[-1] == 100,
+          str(progress_seen))
+    n_fonts = len(_re.findall(rb"/FontFile2", pdf_bytes))
+    check("PDF: DejaVu-Fonts eingebettet (≥ 3: Sans, Bold, Mono)",
+          n_fonts >= 3, f"{n_fonts} FontFile2-Streams")
+    check("PDF: mehrere Seiten", pdf_bytes.count(b"/Type /Page") >= 5,
+          str(pdf_bytes.count(b"/Type /Page")))
+    check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
+          f"{len(pdf_bytes) // 1024} KB")
+
+
 async def t_session_limit(h: Harness) -> None:
     print("── Sitzungs-Limit pro Server ─────────────────────────────────")
     from bot.sessions import SessionStore
@@ -1124,7 +1203,8 @@ async def run_tests() -> int:
         ("public", t_public), ("auth", t_auth), ("read", t_read), ("scopes", t_scopes),
         ("errors", t_errors), ("setup", t_setup), ("lifecycle", t_session_lifecycle),
         ("ratelimit", t_ratelimit), ("write", t_write), ("arena", t_arena),
-        ("prompt", t_prompt), ("limit", t_session_limit), ("security", t_security),
+        ("prompt", t_prompt), ("pdf", t_pdf), ("limit", t_session_limit),
+        ("security", t_security),
     )
     selected = [g for g in sys.argv[1:] if not g.startswith("-")] or [name for name, _ in groups]
 
