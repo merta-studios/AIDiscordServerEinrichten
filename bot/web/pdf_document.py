@@ -61,6 +61,7 @@ from reportlab.platypus import (
     Frame,
     HRFlowable,
     Image,
+    Indenter,
     KeepTogether,
     PageBreak,
     PageTemplate,
@@ -103,6 +104,23 @@ MAX_EMOJIS_SHOWN = 70
 MAX_STICKERS_SHOWN = 24
 EMOJI_GRID_COLUMNS = 7
 STICKER_GRID_COLUMNS = 4
+
+# Nachrichten-Rendering: Discord erlaubt 4000–8000 Zeichen pro Nachricht und
+# bis zu 10 Embeds mit je 4096 Zeichen. Würde alles in EINE Tabellenzeile
+# wandern, wäre diese Zeile höher als eine PDF-Seite — ReportLab kann
+# Tabellenzeilen nicht splitten und bricht mit „too large on page" ab
+# (in Produktion auf Seite 24 passiert). Deshalb: Nachrichten werden als
+# einzelne, splittbare Flowables gerendert und großzügig, aber begrenzt
+# gekürzt; Embed-Boxen haben eine Zeile pro Feld und können dadurch selbst
+# seitenumbruchfähig splitten.
+MESSAGE_CONTENT_MAX_CHARS = 3000
+MAX_EMBEDS_PER_MESSAGE = 5
+EMBED_TEXT_MAX_CHARS = 800
+EMBED_TEXT_MAX_LINES = 20
+EMBED_TITLE_MAX_CHARS = 120
+EMBED_LABEL_MAX_CHARS = 80
+MAX_ATTACHMENT_NAMES = 6
+COMPONENTS_TEXT_MAX_CHARS = 500
 
 #: Fortschritts-Callback: (prozent: int, text: str) -> None
 ProgressCallback = Callable[[int, str], None]
@@ -316,6 +334,23 @@ def _short(text: str, max_len: int) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def _cap(text: str, max_chars: int, max_lines: Optional[int] = None, note: str = " … (gekürzt)") -> str:
+    """
+    Kürzt bereits aufbereitetes (noch nicht escapedes) Textmaterial.
+
+    Erst auf ``max_chars`` Zeichen, dann (optional) auf ``max_lines``
+    Zeilenumbrüche — jeweils mit Hinweis am Ende. Verhindert, dass eine
+    einzelne Tabelle/Paragraph höher als eine PDF-Seite wird.
+    """
+    if len(text) > max_chars:
+        text = text[: max_chars - len(note)].rstrip() + note
+    if max_lines is not None:
+        lines = text.split("\n")
+        if len(lines) > max_lines:
+            text = "\n".join(lines[:max_lines]) + note
+    return text
+
+
 def _id_para(value: Any, *, col_mm: float = 26.0) -> str:
     """
     Discord-ID als Monospace-Font-Ausschnitt, dessen Größe so berechnet ist,
@@ -473,6 +508,14 @@ def _image_flow(
     scale = min(max_w / w_mm, max_h / h_mm)
     if not upscale:
         scale = min(scale, 1.0)
+    # Sicherheitsklemmen: kein Bild darf breiter als der Satzspiegel oder
+    # höher als ~40 % der Seitenhöhe werden — egal was der CDN liefert
+    # (pfadologische Bildmaße dürfen den Build niemals sprengen).
+    scale = min(
+        scale,
+        (CONTENT_WIDTH / mm) / max(w_mm, 0.01),
+        120.0 / max(h_mm, 0.01),
+    )
     w_mm, h_mm = w_mm * scale, h_mm * scale
     # Frisches BytesIO: das Image-Flowable liest erst beim Zeichnen
     return Image(io.BytesIO(payload), width=w_mm * mm, height=h_mm * mm)
@@ -801,17 +844,28 @@ def _components_to_text(components: List[discord.Component]) -> str:
 
 
 def _embed_rows(embed: discord.Embed) -> List[Tuple[str, str]]:
-    """Embed → Textzeilen (Titel, Inhalt, Felder, Fußzeile)."""
+    """
+    Embed → Textzeilen (Titel, Inhalt, Felder, Fußzeile).
+
+    Jede Zeile wird gekürzt (Zeichen + Zeilen), damit eine einzelne
+    Embed-Box-Zeile nie höher als eine PDF-Seite werden kann.
+    """
     rows: List[Tuple[str, str]] = []
     if embed.title:
-        rows.append(("Titel", _prepare_text(embed.title, keep_newlines=True)))
+        rows.append(("Titel", _cap(_prepare_text(embed.title, keep_newlines=True), EMBED_TITLE_MAX_CHARS)))
     if embed.description:
-        rows.append(("Inhalt", _prepare_text(embed.description, keep_newlines=True)))
-    for field in embed.fields or []:
-        value = _prepare_text(field.value, keep_newlines=True)
-        rows.append((f"Feld „{_prepare_text(field.name)}“", value))
+        rows.append((
+            "Inhalt",
+            _cap(_prepare_text(embed.description, keep_newlines=True),
+                 EMBED_TEXT_MAX_CHARS, EMBED_TEXT_MAX_LINES),
+        ))
+    for field in (embed.fields or [])[:10]:
+        value = _cap(_prepare_text(field.value, keep_newlines=True),
+                     EMBED_TEXT_MAX_CHARS, EMBED_TEXT_MAX_LINES)
+        label = _cap(_prepare_text(field.name), EMBED_LABEL_MAX_CHARS)
+        rows.append((f"Feld „{label}“", value))
     if embed.footer and embed.footer.text:
-        rows.append(("Fußzeile", _prepare_text(embed.footer.text)))
+        rows.append(("Fußzeile", _cap(_prepare_text(embed.footer.text), EMBED_LABEL_MAX_CHARS)))
     if embed.timestamp:
         rows.append(("Zeitstempel", _fmt_datetime(embed.timestamp)))
     return rows
@@ -1397,18 +1451,20 @@ async def build_server_document(
             continue
 
         any_messages = True
-        msg_rows: List[List[Any]] = []
+        first_in_channel = True
         for m in msgs:
             author = m.author
-            author_cell: List[Any] = []
+
+            # Kopfzeile der Nachricht: Avatar + Name/Zeit — bewusst eine
+            # winzige 1-Zeilen-Tabelle, die nie höher als ~10 mm wird.
+            avatar_cell: List[Any] = []
             av = avatar_img(getattr(author, "id", -1), 7)
             if av is not None:
-                author_cell.append(av)
-                author_cell.append(Spacer(1, 0.8 * mm))
+                avatar_cell.append(av)
             else:
                 # Achtung: niemals einen Rostring in eine Listen-Zelle —
                 # ReportLab bricht sonst beim wrapOn ab.
-                author_cell.append(Spacer(1, 1))
+                avatar_cell.append(Spacer(1, 1))
 
             head = f"<b>{_clean(getattr(author, 'display_name', None) or author.name)}</b>"
             if getattr(author, "bot", False):
@@ -1418,13 +1474,34 @@ async def build_server_document(
             head += (
                 f"  <font color='#9AA0AB' size='6.8'>{m.created_at.strftime('%d.%m.%Y %H:%M')} UTC</font>"
             )
-            content_cell: List[Any] = [Paragraph(head, styles["msg_head"])]
+            msg_header = Table(
+                [[avatar_cell, Paragraph(head, styles["msg_head"])]],
+                colWidths=[10 * mm, CONTENT_WIDTH - 10 * mm],
+            )
+            msg_header.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (0, 0), 1),
+                ("RIGHTPADDING", (0, 0), (0, 0), 2),
+                ("LEFTPADDING", (1, 0), (1, 0), 2),
+                ("RIGHTPADDING", (1, 0), (1, 0), 1),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+            ]))
 
-            body_text = _clean_ml(m.content)
-            if body_text:
-                content_cell.append(Paragraph(body_text, styles["msg_body"]))
+            # Inhalt: einzelne, jeweils selbst splittbare Flowables
+            # (Paragraphs können über Seiten umbrechen — Tabellenzeilen nicht).
+            body: List[Any] = []
 
-            for embed in m.embeds or []:
+            content_prepared = _cap(
+                _prepare_text(m.content, keep_newlines=True), MESSAGE_CONTENT_MAX_CHARS
+            )
+            if content_prepared:
+                body.append(
+                    Paragraph(_esc(content_prepared).replace("\n", "<br/>"), styles["msg_body"])
+                )
+
+            shown_embeds = (m.embeds or [])[:MAX_EMBEDS_PER_MESSAGE]
+            for embed in shown_embeds:
                 rows = _embed_rows(embed)
                 if not rows:
                     continue
@@ -1432,29 +1509,37 @@ async def build_server_document(
                     colors.HexColor(f"#{embed.color.value:06x}")
                     if embed.color is not None else _C.blurple
                 )
-                inner: List[Any] = []
-                for label, value in rows:
-                    inner.append(
-                        Paragraph(f"<b>{_clean(label)}:</b> {_clean_ml(value)}", styles["embed_text"])
-                    )
-                box = Table([[inner]], colWidths=[CONTENT_WIDTH - 24 * mm])
+                # Eine Tabellenzeile pro Embed-Zeile → die Box kann beim
+                # Seitenumbruch zwischen den Zeilen splitten.
+                box = Table(
+                    [
+                        [Paragraph(f"<b>{_clean(label)}:</b> {_clean_ml(value)}", styles["embed_text"])]
+                        for label, value in rows
+                    ],
+                    colWidths=[CONTENT_WIDTH - 22 * mm],
+                )
                 box.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F7")),
                     ("LINEBEFORE", (0, 0), (0, -1), 2.2, embed_color),
                     ("LEFTPADDING", (0, 0), (-1, -1), 5),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                    ("TOPPADDING", (0, 0), (-1, -1), 3),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2.2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.6),
                 ]))
-                content_cell.append(Spacer(1, 1.4 * mm))
-                content_cell.append(box)
+                body.append(Spacer(1, 1.4 * mm))
+                body.append(box)
+            hidden_embeds = len(m.embeds or []) - len(shown_embeds)
+            if hidden_embeds > 0:
+                body.append(Paragraph(f"(+{hidden_embeds} weitere Embeds gekürzt)", styles["table_muted"]))
 
             extras: List[str] = []
             if m.attachments:
-                names = ", ".join(_prepare_text(a.filename) for a in m.attachments)
-                extras.append(
-                    f"Anhang: {names}" if len(m.attachments) == 1 else f"Anhänge: {names}"
+                names = ", ".join(
+                    _prepare_text(a.filename) for a in m.attachments[:MAX_ATTACHMENT_NAMES]
                 )
+                extra_count = len(m.attachments) - min(len(m.attachments), MAX_ATTACHMENT_NAMES)
+                label = "Anhang: " if len(m.attachments) == 1 else "Anhänge: "
+                extras.append(label + names + (f" (+{extra_count} weitere)" if extra_count > 0 else ""))
             if m.stickers:
                 extras.append("Sticker: " + ", ".join(_prepare_text(s.name) for s in m.stickers))
             try:
@@ -1462,25 +1547,23 @@ async def build_server_document(
             except Exception:  # pragma: no cover — ältere discord.py-Versionen
                 comps = []
             if comps:
-                extras.append("Komponenten: " + _components_to_text(comps))
+                comps_text = _short(_components_to_text(comps), COMPONENTS_TEXT_MAX_CHARS)
+                extras.append("Komponenten: " + comps_text)
             if extras:
-                content_cell.append(Spacer(1, 0.8 * mm))
-                content_cell.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
+                body.append(Spacer(1, 0.8 * mm))
+                body.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
 
-            msg_rows.append([author_cell, content_cell])
-
-        msg_table = Table(msg_rows, colWidths=[10 * mm, CONTENT_WIDTH - 10 * mm])
-        msg_table.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (0, -1), 1),
-            ("RIGHTPADDING", (0, 0), (0, -1), 2),
-            ("LEFTPADDING", (1, 0), (1, -1), 2),
-            ("RIGHTPADDING", (1, 0), (1, -1), 1),
-            ("TOPPADDING", (0, 0), (-1, -1), 2.4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.HexColor("#E4E7EC")),
-        ]))
-        flowables.append(KeepTogether([head_line, msg_table, Spacer(1, 3 * mm)]))
+            # Nachricht ausgeben: Kopf (winzige Tabelle) + eingerückter,
+            # splittbarer Inhalt. Kein KeepTogether über den gesamten Block —
+            # sonst würde eine lange Nachricht wieder eine zu große Einheit
+            # erzeugen. KeepTogether hier enthält nur winzige Teile.
+            flowables.append(KeepTogether([head_line, msg_header] if first_in_channel else [msg_header]))
+            first_in_channel = False
+            if body:
+                flowables.append(Indenter(left=12 * mm))
+                flowables.extend(body)
+                flowables.append(Indenter(left=-12 * mm))
+            flowables.append(Spacer(1, 2.2 * mm))
 
     if not any_messages:
         flowables.append(Spacer(1, 1.5 * mm))
