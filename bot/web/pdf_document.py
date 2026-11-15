@@ -2879,9 +2879,13 @@ async def build_channel_history_pdf(
     der Fortschritt auf ``progress`` (Global-Prozent) zurück.
 
     Rückgabe:
-    - ``send_part=None`` (Tests/Abwärtskompatibilität): die PDF-Bytes des
-      GESAMTEN Verlaufs in EINEM Dokument.
-    - sonst: Metadaten ``{"parts": N, "messages": M, "span": "…"}``.
+    - ``send_part=None`` (Tests/Abwärtskompatibilität, kleine Verläufe):
+      die PDF-Bytes. Größere Verläufe werden auch hier batchweise gebaut
+      (RAM-Schutz); zurückgegeben wird dann das ERSTE Teil — die Produktion
+      nutzt immer ``send_part``.
+    - sonst: Metadaten ``{"parts": N, "messages": M, "span": "…",
+      "bytes": [Größen]}`` — nur die GRÖSSEN der Teil-PDFs; die Bytes selbst
+      wurden sofort per ``send_part`` zugestellt und nicht behalten.
 
     Älteste Nachrichten zuerst; Apple-Emojis, Custom-Emojis, Bildanhänge,
     Komponenten, Embeds; Mention-Namen (@Rolle, #kanal, @Mitglied);
@@ -3172,11 +3176,12 @@ async def build_channel_history_pdf(
             asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
         )
 
-        # RAM-Hygiene nach JEDEM Teil („fertige Sachen senden, Daten löschen“):
-        # Bild-Cache leeren, Emoji-Zuordnungen leeren, das Apple-Sheet (69 MB!)
-        # schließen (wird fürs nächste Teil lazy neu geladen), GC + malloc_trim
-        # — glibc gibt freigegebenen Heap sonst NICHT ans OS zurück
-        # (Fragmentierung = der Kumulativ-OOM bei Teil 8).
+        # RAM-Hygiene nach JEDEM Teil: Bild-Cache leeren, Emoji-Zuordnungen
+        # leeren, das Apple-Sheet (69 MB!) schließen (wird fürs nächste Teil
+        # lazy neu geladen), GC + malloc_trim. (Der eigentliche Kumulativ-OOM
+        # war die Retention der Teil-PDFs in _finish_batch — diese Hygiene
+        # hält zusätzlich die Peak-Kurve flach: „fertige Sachen senden,
+        # Daten löschen, Platz für neue“.)
         image_cache.clear()
         _custom_png_cache.clear()
         _apple_png_cache.clear()
@@ -3199,7 +3204,8 @@ async def build_channel_history_pdf(
                  ch_name, len(pdf_bytes) // 1024, len(batch))
         return pdf_bytes
 
-    parts_bytes: List[bytes] = []
+    parts_bytes: List[bytes] = []  # NUR im Rückgabe-Modus (send_part=None)
+    part_sizes: List[int] = []     # Streaming: nur GRÖSSEN — Bytes werden gesendet & verworfen
     part_idx = 0
     batch: List[Any] = []
     loaded_since_guard = 0
@@ -3222,7 +3228,23 @@ async def build_channel_history_pdf(
         await _guard_before_part()
         full_span = _span(first_seen, last_seen) if seen_count else full_span
         pdf_bytes = await _build_and_deliver(part_idx, batch)
-        parts_bytes.append(pdf_bytes)
+        part_sizes.append(len(pdf_bytes))
+        if send_part is None:
+            parts_bytes.append(pdf_bytes)
+        else:
+            # Gesendet heißt VERGESSEN: Der Kumulativ-OOM (~10 MB pro Teil,
+            # Erst-OOM bei Teil 8, dann Teil 12 — RAM stieg monoton und fiel
+            # nie ab) kam daher, dass JEDE Teil-PDF bis zum Ende der Erstellung
+            # in ``parts_bytes`` referenziert blieb. GC und malloc_trim konnten
+            # den Speicher nicht freigeben, weil er die ganze Zeit benutzt
+            # wurde. Nur die GRÖSSE bleibt für die Rückgabe/Metadaten übrig.
+            pdf_bytes = None
+            gc.collect()
+            try:
+                from bot.ram import malloc_trim as _mtrim
+                _mtrim()
+            except Exception:  # noqa: BLE001 — Trim ist Best-Effort
+                pass
         part_idx += 1
         batch = []
 
@@ -3237,9 +3259,12 @@ async def build_channel_history_pdf(
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
             pass  # Historie bricht mitten im Stream ab — Bisheriges bleibt gültig
     await _finish_batch()
-    if not parts_bytes:
+    if not parts_bytes and not part_sizes:
         # Leerer Verlauf: genau ein (leeres) PDF mit Hinweis
-        parts_bytes.append(await _build_and_deliver(0, []))
+        pdf_bytes = await _build_and_deliver(0, [])
+        part_sizes.append(len(pdf_bytes))
+        if send_part is None:
+            parts_bytes.append(pdf_bytes)
         part_idx = 1
     total = part_idx
 
@@ -3254,4 +3279,4 @@ async def build_channel_history_pdf(
         return parts_bytes[0]
     return {"parts": total, "messages": seen_count,
             "span": _span(first_seen, last_seen),
-            "bytes": [len(b) for b in parts_bytes]}
+            "bytes": part_sizes}
