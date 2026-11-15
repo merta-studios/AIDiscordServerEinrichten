@@ -1764,18 +1764,15 @@ async def t_history_delivery(h: Harness) -> None:
             t1.close()
             check("Batching: Teil 1 enthält die ÄLTESTE Nachricht (Hallo …)",
                   "Hallo" in part1_text, part1_text[:120])
-            check("Batching: Teil-Kopf nennt 'Teil 1 des Verlaufs'",
-                  "Teil 1 des Verlaufs" in part1_text, part1_text[:200])
+            check("Batching: Teil-Kopf nennt 'Teil 1 von 3' (Zähl-Durchlauf kennt total)",
+                  "Teil 1 von 3" in part1_text, part1_text[:200])
 
-        # RAM-Guard: kritischer RAM → Abbruch, NACH Teil 1 (der wurde schon
-        # gesendet), kein weiterer Teil, Exception mit klarer Meldung.
+        # RAM-Guard: kritischer RAM → Abbruch VOR dem Teil (kein verlorener
+        # Aufbau), Exception mit klarer Meldung — BEVOR der Container stirbt.
         collected.clear()
-        guard_calls = [0]
 
         async def _critical_guard() -> None:
-            guard_calls[0] += 1
-            if guard_calls[0] >= 2:  # erst NACH Teil 1 kritisch
-                raise MemoryError("RAM kritisch (500 MB) — Aufbau abgebrochen.")
+            raise MemoryError("RAM kritisch (500 MB) — Aufbau abgebrochen.")
 
         raised_hist = None
         async with _aiohttp.ClientSession() as sb:
@@ -1786,8 +1783,8 @@ async def t_history_delivery(h: Harness) -> None:
                 )
             except MemoryError as exc:
                 raised_hist = str(exc)
-        check("RAM-Guard: Abbruch NACH Teil 1 mit klarer Meldung (vor OOM)",
-              len(collected) == 1 and raised_hist is not None
+        check("RAM-Guard: Abbruch VOR dem Teil mit klarer Meldung (vor OOM)",
+              len(collected) == 0 and raised_hist is not None
               and "RAM kritisch" in raised_hist,
               f"sent={len(collected)} exc={raised_hist}")
     finally:
