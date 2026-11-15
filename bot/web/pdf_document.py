@@ -2887,10 +2887,18 @@ def _render_pdf(
     footer_left: str,
     title: str,
     subject: str,
+    target: Optional[Any] = None,
 ) -> bytes:
-    """Flowables → PDF-Bytes (A4, Kopf/Fuß, „Seite X von Y")."""
+    """
+    Flowables → PDF (A4, Kopf/Fuß, „Seite X von Y").
+
+    Ohne ``target``: Rückgabe der PDF-Bytes. MIT ``target`` (dateiartiges
+    Objekt, z. B. eine Pipe): reportlab schreibt jede fertige Seite SOFORT
+    hinein (Streaming) — das PDF liegt nie vollständig im RAM des
+    Bau-Prozesses.
+    """
     _ensure_fonts()
-    buffer = io.BytesIO()
+    buffer = io.BytesIO() if target is None else target
     doc = BaseDocTemplate(
         buffer,
         pagesize=A4,
@@ -2917,6 +2925,8 @@ def _render_pdf(
             footer_left=_prepare_text(footer_left),
         ),
     )
+    if target is not None:
+        return b""
     pdf_bytes = buffer.getvalue()
     buffer.close()
     return pdf_bytes
@@ -3224,7 +3234,7 @@ async def build_channel_history_pdf(
         _ensure_fonts()
         _ensure_apple_emoji()
 
-        def _assemble() -> bytes:
+        def _assemble(target: Optional[Any] = None) -> bytes:
             ctx = _make_ctx(image_cache, avatar_urls, emoji_url_by_id)
             flowables: List[Any] = _head_flowables(image_cache, idx, batch)
             for m in batch:
@@ -3239,58 +3249,59 @@ async def build_channel_history_pdf(
                 ),
                 title=f"Chatverlauf #{ch_name} · {guild.name}",
                 subject=f"Chatverlauf von #{ch_name} in {guild.name} (ID {guild.id})",
+                target=target,
             )
-
-        _iso_counter = [0]
 
         async def _assemble_isolated() -> bytes:
             """
             Baut das Teil-PDF in einem ISOLIERTEN KINDPROZESS (fork).
 
-            Der Kumulativ-OOM (Teil 8, dann 12, dann 20 — RAM stieg ~3-10 MB
-            pro Teil und fiel nie wieder ab) kam vom Aufbau IM Bot-Prozess:
-            Allokations-Churn und Heap-Fragmentierung von reportlab/Pillow
-            bleiben dort über alle Teile liegen — selbst gc + malloc_trim
-            können das nicht vollständig beheben (Fragmente im Heap bleiben).
-            Ein Kindprozess, der NACH JEDEM TEIL endet, gibt seinen gesamten
+            Der Kumulativ-OOM (Teil 8, dann 12, dann 20, dann 76 — RAM stieg
+            ~3-10 MB pro Teil und fiel nie wieder ab) kam vom Aufbau IM
+            Bot-Prozess: Allokations-Churn und Heap-Fragmentierung von
+            reportlab/Pillow bleiben dort über alle Teile liegen — selbst
+            gc + malloc_trim können das nicht vollständig beheben. Ein
+            Kindprozess, der NACH JEDEM TEIL endet, gibt seinen gesamten
             Speicher garantiert ans OS zurück — Leaks und Fragmentierung
             sterben mit dem Prozess. Über fork erbt das Kind die Batch-
             Nachrichten und Bild-Daten direkt aus dem Speicher (kein Pickling,
-            keine Kopie — Copy-on-Write); übertragen wird nur die fertige
-            PDF-Datei über ein Temp-Verzeichnis.
+            keine Kopie — Copy-on-Write).
 
-            Fallback: In-Process-Bau im Thread, wenn fork nicht verfügbar ist
-            (Windows) oder der Kindprozess nicht gestartet werden kann.
+            Das Kind STREAMT das PDF seitenweise direkt in eine PIPE (reportlab
+            schreibt jede fertige Seite sofort) — kein Temp-File (kein
+            Page-Cache im Container-RAM) und das Kind hält nie das fertige PDF
+            im RAM. Der Parent liest die Pipe parallel mit. Bei Kind-Fehlern
+            (inkl. Timeout) baut dieser Teil als FALLBACK im Hauptprozess —
+            ein einzelnes Problem-Teil bricht den ganzen Lauf nicht mehr ab.
             """
             if not hasattr(os, "fork"):
                 return await asyncio.wait_for(
                     asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
                 )
-            out_path = os.path.join(
-                tempfile.gettempdir(),
-                f"verlauf-teil-{os.getpid()}-{_iso_counter[0]}.bin",
-            )
-            err_path = out_path + ".err"
-            _iso_counter[0] += 1
+            import multiprocessing as _mp
+            import warnings as _warnings
+
+            data_r, data_w = os.pipe()
+            err_r, err_w = os.pipe()
 
             def _child() -> None:  # läuft NUR im Kindprozess (sync, kein asyncio!)
                 try:
-                    data = _assemble()
-                    tmp_path = out_path + ".tmp"
-                    with open(tmp_path, "wb") as fh:
-                        fh.write(data)
-                    os.rename(tmp_path, out_path)  # atomar: nie halbe Dateien
+                    os.close(data_r)
+                    os.close(err_r)
+                    with os.fdopen(data_w, "wb") as out:
+                        _assemble(target=out)  # streamt seitenweise in die Pipe
+                    os.close(err_w)
                 except BaseException as exc:  # noqa: BLE001 — Kind meldet jeden Fehler
                     try:
-                        with open(err_path, "w", encoding="utf-8") as fh:
-                            fh.write(f"{type(exc).__name__}: {exc}")
+                        os.write(err_w, f"{type(exc).__name__}: {exc}".encode("utf-8")[:4000])
+                    except OSError:
+                        pass
+                    try:
+                        os.close(err_w)
                     except OSError:
                         pass
                     os._exit(1)  # keine Cleanup-Handler — Parent-Verbindungen unberührt
                 os._exit(0)
-
-            import multiprocessing as _mp
-            import warnings as _warnings
 
             try:
                 proc = _mp.get_context("fork").Process(target=_child, daemon=True)
@@ -3300,36 +3311,59 @@ async def build_channel_history_pdf(
             except Exception:  # noqa: BLE001 — fallback statt Abbruch
                 log.warning("Kindprozess für Teil-Bau nicht startbar — Bau im Hauptprozess.",
                             exc_info=True)
+                for fd in (data_r, data_w, err_r, err_w):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 return await asyncio.wait_for(
                     asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
                 )
-            await asyncio.to_thread(proc.join, _ASSEMBLY_TIMEOUT_S)
+            # Parent-Seite: eigene Schreib-Enden schließen (sonst kein EOF)
+            os.close(data_w)
+            os.close(err_w)
+
+            def _read_all(fd: int) -> bytes:
+                chunks: List[bytes] = []
+                while True:
+                    chunk = os.read(fd, 1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                os.close(fd)
+                return b"".join(chunks)
+
+            try:
+                pdf_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(_read_all, data_r), timeout=_ASSEMBLY_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await asyncio.to_thread(proc.join, 5)
+                for fd in (data_r, err_r):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                log.warning("Teil-Bau im Kindprozess überschreitet %ds-Budget — "
+                            "Fallback auf Hauptprozess.", int(_ASSEMBLY_TIMEOUT_S))
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
+                )
+            err_text = (await asyncio.to_thread(_read_all, err_r)).decode("utf-8", "replace")
+            await asyncio.to_thread(proc.join, 30)
             if proc.is_alive():
                 proc.kill()
                 await asyncio.to_thread(proc.join, 5)
-                raise TimeoutError(
-                    f"Teil-Aufbau hat {_ASSEMBLY_TIMEOUT_S:.0f}s überschritten — "
-                    "Kindprozess gestoppt."
-                )
-            if os.path.exists(out_path):
-                with open(out_path, "rb") as fh:
-                    data = fh.read()
-                os.unlink(out_path)
-                if os.path.exists(err_path):
-                    os.unlink(err_path)
+            if pdf_bytes and proc.exitcode == 0:
                 _FORK_BUILDS["ok"] += 1
-                return data
-            err_text = ""
-            if os.path.exists(err_path):
-                try:
-                    with open(err_path, "r", encoding="utf-8") as fh:
-                        err_text = fh.read()
-                    os.unlink(err_path)
-                except OSError:
-                    pass
-            raise RuntimeError(
-                f"Teil-Aufbau im isolierten Prozess fehlgeschlagen "
-                f"(Exit {proc.exitcode}) {err_text}".strip()
+                return pdf_bytes
+            # Kind fehlgeschlagen (Fehler/Timeout/hängengeblieben) → NICHT abbrechen,
+            # sondern diesen Teil im Hauptprozess bauen — der Lauf geht weiter.
+            log.warning("Kindprozess fehlgeschlagen (Exit %s) %s — Bau im Hauptprozess "
+                        "als Fallback.", proc.exitcode, err_text[:200])
+            return await asyncio.wait_for(
+                asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
             )
 
         await _part_report(48, f"{label}: PDF wird geschrieben …")

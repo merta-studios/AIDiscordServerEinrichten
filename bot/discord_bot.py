@@ -70,8 +70,8 @@ from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, now_utc
-from .ram import (RAM_CRITICAL_MB, container_memory_mb, current_rss_mb,
-                  ram_report_loop, relieve_ram)
+from .ram import (RAM_CRITICAL_MB, container_cache_mb, container_memory_mb,
+                  current_rss_mb, ram_report_loop, relieve_ram)
 from .web.pdf_document import build_channel_history_pdf, build_server_document
 
 log = logging.getLogger("relay.discord")
@@ -753,12 +753,18 @@ def _ram_used_mb() -> float:
 
 
 def _ram_line() -> str:
-    """🧠-Zeile für Lade-/Ergebnis-Nachrichten: „X/Y MB“ (Container) bzw. „X MB“."""
+    """
+    🧠-Zeile für Lade-/Ergebnis-Nachrichten: „X/Y MB“ (OOM-relevanter
+    Container-RAM = anonym); signifikanter Page-Cache wird separat
+    ausgewiesen, weil der Kernel ihn bei Druck automatisch freigibt.
+    """
     container_mb, container_limit = container_memory_mb()
     if container_mb > 0:
+        cache = container_cache_mb()
+        cache_txt = f" (+{cache:.0f} Cache)" if cache > 15 else ""
         if container_limit > 0:
-            return f"\n🧠 RAM: {container_mb:.0f}/{container_limit:.0f} MB"
-        return f"\n🧠 RAM: {container_mb:.0f} MB"
+            return f"\n🧠 RAM: {container_mb:.0f}/{container_limit:.0f} MB{cache_txt}"
+        return f"\n🧠 RAM: {container_mb:.0f} MB{cache_txt}"
     mb = current_rss_mb()
     return f"\n🧠 RAM: {mb:.0f} MB" if mb > 0 else ""
 
@@ -789,6 +795,48 @@ def _part_message_content(idx: int, total: int) -> str:
     return f"Teil {idx}/{total}:"
 
 
+class _ProgressRelay:
+    """
+    Lädt-Fortschritt robust editeren — überlebt die 15-Minuten-Grenze.
+
+    Interaktions-Antworten sind nur ~15 Minuten editierbar (Token-Ablauf);
+    danach schlägt JEDER Edit fehl. Der Relay schaltet dann automatisch auf
+    eine frische, NORMALE Kanalnachricht um (Eigene Nachrichten kann der Bot
+    OHNE Zeitlimit editieren) und editiert dort weiter — der zweistufige
+    Balken läuft damit über die GESAMTE Laufzeit, egal wie lange der Build
+    dauert (Beobachtung: Nachricht fror bei Teil 32 ein, obwohl bis Teil 76
+    gebaut wurde).
+    """
+
+    def __init__(self, msg: Optional[Any], channel: Optional[Any]) -> None:
+        self.msg = msg
+        self.channel = channel
+        self._switched = False
+
+    async def edit(self, content: str) -> bool:
+        """Editiert die aktive Nachricht; True = sichtbar aktualisiert."""
+        if self.msg is None:
+            return False
+        try:
+            await self.msg.edit(content=content)
+            return True
+        except Exception:  # noqa: BLE001 — z. B. Interaktions-Token abgelaufen
+            if self._switched:
+                return False
+            self._switched = True
+            # Neue NORMALE Nachricht im selben Kanal (Panel-DM/Panel-Kanal) —
+            # frei editierbar, kein Token, kein Verwerfen-Button.
+            try:
+                if self.channel is None:
+                    self.msg = None
+                    return False
+                self.msg = await self.channel.send(content)
+                return True
+            except Exception:  # noqa: BLE001 — Kanal nicht schreibbar
+                self.msg = None
+                return False
+
+
 def startup_notify_view(
     *,
     ram_mb: float,
@@ -796,6 +844,7 @@ def startup_notify_view(
     ready_at: Optional[Any] = None,
     container_mb: float = -1.0,
     container_limit_mb: float = -1.0,
+    container_cache_mb: float = -1.0,
 ) -> discord.ui.LayoutView:
     """
     Startup-DM an den Bot-Owner: bestätigt den (Neu)Start sofort — inkl.
@@ -804,10 +853,15 @@ def startup_notify_view(
     """
     ts = getattr(ready_at, "strftime", lambda _f: "?")("%d.%m.%Y, %H:%M UTC") if ready_at else "?"
     ram_text = f"{ram_mb:.0f} MB" if ram_mb and ram_mb > 0 else "unbekannt"
+    cache_txt = ""
+    if container_cache_mb > 15:
+        cache_txt = (f" (davon {container_cache_mb:.0f} MB Cache — "
+                     "gibt der Kernel bei Druck automatisch frei)")
     if container_mb > 0 and container_limit_mb > 0:
-        container_text = f"**RAM (Container):** {container_mb:.0f}/{container_limit_mb:.0f} MB (OOM-relevant)\n"
+        container_text = (f"**RAM (Container, OOM-relevant):** "
+                          f"{container_mb:.0f}/{container_limit_mb:.0f} MB{cache_txt}\n")
     elif container_mb > 0:
-        container_text = f"**RAM (Container):** {container_mb:.0f} MB (OOM-relevant)\n"
+        container_text = f"**RAM (Container, OOM-relevant):** {container_mb:.0f} MB{cache_txt}\n"
     else:
         container_text = ""
     container = discord.ui.Container(
@@ -882,15 +936,11 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
         except Exception:  # noqa: BLE001 — ohne Original-Nachricht: Followup
             progress_msg = None
 
+        _modal_relay = _ProgressRelay(progress_msg, getattr(interaction, "channel", None))
+
         async def _final(content: str) -> None:
-            if progress_msg is not None:
-                try:
-                    await progress_msg.edit(
-                        content=f"{content}\n{_progress_bar(100)}"
-                    )
-                    return
-                except Exception:  # noqa: BLE001 — Token/Netz egal
-                    pass
+            if await _modal_relay.edit(f"{content}\n{_progress_bar(100)}"):
+                return
             try:
                 await interaction.followup.send(content)
             except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
@@ -1090,7 +1140,12 @@ class RelayClient(discord.Client):
         Client und ``AppState`` verweisen aufeinander; ``main.amain`` erzeugt
         deshalb erst den Client und setzt ``client.state`` direkt danach.
         """
-        options: Dict[str, Any] = {"intents": intents or build_intents(True)}
+        # max_messages=200: discord.py cached intern bis zu N Nachrichten
+        # (Default 1000) — für unsere Features (cached_messages) ungenutzt.
+        # Der Cap verhindert, dass der Cache während großer Verlauf-Läufe
+        # unnötig RAM bindet.
+        options: Dict[str, Any] = {"intents": intents or build_intents(True),
+                                   "max_messages": 200}
         proxy = (getattr(config, "discord_proxy", "") or "").strip()
         if proxy:
             # discord.py reicht den Proxy an REST **und** Gateway weiter — genau
@@ -1260,10 +1315,12 @@ class RelayClient(discord.Client):
         if owner is None:
             log.debug("Startup-DM übersprungen — kein Bot-Owner konfiguriert.")
             return False
+        _cont_used, _cont_limit = container_memory_mb()
         view = startup_notify_view(
             ram_mb=current_rss_mb(),
-            container_mb=container_memory_mb()[0],
-            container_limit_mb=container_memory_mb()[1],
+            container_mb=_cont_used,
+            container_limit_mb=_cont_limit,
+            container_cache_mb=container_cache_mb(),
             version=__version__,
             ready_at=self.ready_at,
         )
@@ -2100,12 +2157,13 @@ class RelayClient(discord.Client):
             "Server-Daten werden gesammelt …",
             wait=True,
         )
+        _doc_relay = _ProgressRelay(progress_msg, getattr(interaction, "channel", None))
 
         async def _progress(percent: int, text: str) -> None:
             ram_line = _ram_line()
             try:
                 await asyncio.wait_for(
-                    progress_msg.edit(
+                    _doc_relay.edit(
                         content=(
                             f"📄 **Server-Dokument** für **{guild.name}**\n"
                             f"{_progress_bar(percent)} {percent} %\n{text}{ram_line}"
@@ -2229,18 +2287,18 @@ class RelayClient(discord.Client):
                 progress_msg = None
         if progress_msg is not None:
             log.info("Chatverlauf-Abruf #%s: Fortschritts-Nachricht aktiv.", ch_name)
+        # Relay: schaltet nach Ablauf des Interaktions-Tokens (~15 min) automatisch
+        # auf eine neue normale Nachricht um — der Balken läuft über die GESAMTE
+        # Laufzeit (fror früher bei Teil ~32 ein, obwohl bis Teil 76 gebaut wurde).
+        _relay = _ProgressRelay(progress_msg, getattr(interaction, "channel", None))
 
         async def _final(content: str) -> None:
             """Meldet das Ergebnis sichtbar — nie raisend, nie still."""
             ram_line = _ram_line()
             if progress_msg is not None:
-                try:
-                    await progress_msg.edit(
-                        content=f"{content}\n{_progress_bar(100)}{ram_line}"
-                    )
+                if await _relay.edit(f"{content}\n{_progress_bar(100)}{ram_line}"):
                     return
-                except Exception:  # noqa: BLE001 — z. B. Token nach 15 min abgelaufen
-                    log.warning("Ergebnis-Edit der Chatverlauf-Nachricht fehlgeschlagen — Fallback auf Followup.")
+                log.warning("Ergebnis-Edit der Chatverlauf-Nachricht fehlgeschlagen — Fallback auf Followup.")
             try:
                 await interaction.followup.send(f"{content}\n{_progress_bar(100)}{ram_line}")
             except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
@@ -2252,7 +2310,7 @@ class RelayClient(discord.Client):
             ram_line = _ram_line()
             try:
                 await asyncio.wait_for(
-                    progress_msg.edit(
+                    _relay.edit(
                         content=(
                             f"💬 **Chatverlauf von #{ch_name}**\n"
                             f"{_progress_bar(percent)} {percent} %\n{text}{ram_line}"
@@ -2279,7 +2337,7 @@ class RelayClient(discord.Client):
             cur = min(parts_done + 1, max(parts_total, 1))
             try:
                 await asyncio.wait_for(
-                    progress_msg.edit(
+                    _relay.edit(
                         content=(
                             f"💬 **Chatverlauf von #{ch_name}**\n"
                             f"**Teile:** {_progress_bar(p1)} {p1} % — "

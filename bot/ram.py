@@ -15,7 +15,8 @@ Der Bot zählt seinen eigenen RAM (VmRSS aus /proc/self/status):
 import asyncio
 import gc
 import logging
-from typing import Any, Optional, Tuple
+import os
+from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -47,38 +48,87 @@ def current_rss_mb() -> float:
         return -1.0
 
 
+def _configure_malloc() -> None:
+    """
+    glibc-Allokator-Strategie begrenzen: M_ARENA_MAX=2 (statt bis 8×Kerne).
+    Die PDF-Bildkonvertierung läuft in Worker-Threads — jeder Thread bekommt
+    sonst eine eigene malloc-Arena, deren freigegebener Speicher kaum noch
+    ans OS zurückgegeben wird (Beobachtung: langsamer RAM-Anstieg pro Teil).
+    Muss VOR dem Start von Threads laufen → beim Modul-Import.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-8, 2)  # M_ARENA_MAX = 2
+        libc.mallopt(-7, 4)  # M_ARENA_TEST = 4
+    except Exception:  # noqa: BLE001 — Best-Effort (nicht-Linux: egal)
+        pass
+
+
+_configure_malloc()
+
+
+def container_memory_stat() -> "Dict[str, float]":
+    """
+    Rohwerte des cgroup-Memory-Controllers (v2, Fallback v1):
+    ``used`` (memory.current — inkl. Page-Cache), ``anon`` (OOM-relevanter
+    Teil: anonyme Speicher der Prozesse), ``file`` (Page-Cache — gibt der
+    Kernel bei Speicherdruck automatisch frei, KEIN OOM-Risiko) und
+    ``limit``. Fehlende Werte: -1.
+    """
+    out = {"used": -1.0, "anon": -1.0, "file": -1.0, "limit": -1.0}
+    used_path = limit_path = stat_path = None
+    if os.path.isfile("/sys/fs/cgroup/memory.current"):
+        used_path = "/sys/fs/cgroup/memory.current"          # cgroup v2
+        limit_path = "/sys/fs/cgroup/memory.max"
+        stat_path = "/sys/fs/cgroup/memory.stat"
+    elif os.path.isfile("/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        used_path = "/sys/fs/cgroup/memory/memory.usage_in_bytes"  # cgroup v1
+        limit_path = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+        stat_path = "/sys/fs/cgroup/memory/memory.stat"
+    if used_path is None:
+        return out
+    try:
+        with open(used_path, "r", encoding="utf-8") as fh:
+            out["used"] = int(fh.read().strip()) / 1048576.0
+        with open(limit_path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        limit = -1 if raw in ("max",) or int(raw) >= (1 << 59) else int(raw)
+        out["limit"] = limit / 1048576.0
+        with open(stat_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2:
+                    key, val = parts[0], float(parts[1])
+                    if key in ("anon", "rss", "total_anon"):
+                        out["anon"] = val / 1048576.0
+                    elif key in ("file", "cache", "total_cache"):
+                        out["file"] = val / 1048576.0
+    except (OSError, ValueError):
+        pass
+    return out
+
+
 def container_memory_mb() -> "Tuple[float, float]":
     """
-    ``(genutzt MB, limit MB)`` des GESAMTEN Containers — aus dem cgroup-
-    Memory-Controller (v2, Fallback v1). Genau diese Zahl sieht Render, wenn
-    sie das Limit überschreitet: OOM-Kill.
+    ``(OOM-relevanter RAM MB, Limit MB)`` des Containers.
 
-    Der Prozess-RSS (``current_rss_mb``) ist NICHT die ganze Wahrheit: Der
-    Container zählt alle Prozesse + Seiten-Cache (z. B. Datei-Lese-Cache des
-    Emoji-Sheets) mit. Deshalb bauen Guards und Anzeigen auf dieser Zahl auf,
-    wenn sie lesbar ist.
-
-    Rückgabe: ``(-1.0, -1.0)``, wenn nicht lesbar (kein cgroup/andere Plattform).
+    OOM-relevant ist der ANONYME Anteil (``memory.stat: anon``) — der
+    Page-Cache (Datei-I/O) wird vom Kernel bei Speicherdruck automatisch
+    freigegeben und hat KEINEN OOM-Einfluss; ihn mitzuzählen ließ die
+    Anzeige/Guards künstlich hoch klettern. Ist ``anon`` nicht lesbar,
+    fällt die Messung auf ``memory.current`` zurück. Genau diese Zahl
+    triggert bei Überschreitung den OOM-Kill von Render.
     """
-    for used_path, limit_path in (
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),  # cgroup v2
-        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",                  # cgroup v1
-         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    ):
-        try:
-            with open(used_path, "r", encoding="utf-8") as fh:
-                used = int(fh.read().strip())
-            with open(limit_path, "r", encoding="utf-8") as fh:
-                raw = fh.read().strip()
-            limit = int(raw)
-            if limit >= (1 << 59):  # v1: „unbegrenzt“ = riesige Zahl
-                limit = -1
-            elif raw == "max":      # v2: „unbegrenzt“
-                limit = -1
-            return used / 1048576.0, limit / 1048576.0
-        except (OSError, ValueError):
-            continue
-    return -1.0, -1.0
+    st = container_memory_stat()
+    used = st["anon"] if st["anon"] > 0 else st["used"]
+    return used, st["limit"]
+
+
+def container_cache_mb() -> float:
+    """Page-Cache des Containers (MB) — freigebbar, nur zur Anzeige."""
+    return container_memory_stat()["file"]
 
 
 def malloc_trim() -> None:
@@ -135,7 +185,9 @@ async def ram_report_loop(interval_s: float = RAM_REPORT_INTERVAL_S) -> None:
             await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             return
-        container_mb, container_limit = container_memory_mb()
+        _st = container_memory_stat()
+        container_mb = _st["anon"] if _st["anon"] > 0 else _st["used"]
+        container_limit = _st["limit"]
         mb = container_mb if container_mb > 0 else current_rss_mb()
         if mb < 0:
             log.debug("RAM-Messung nicht verfügbar — Monitor beendet.")
@@ -145,6 +197,8 @@ async def ram_report_loop(interval_s: float = RAM_REPORT_INTERVAL_S) -> None:
         proc_mb = current_rss_mb()
         detail = (f" (Prozess {proc_mb:.0f} MB)"
                   if container_mb > 0 and proc_mb > 0 and abs(container_mb - proc_mb) > 8 else "")
+        if _st["file"] > 15:
+            detail += f" [Cache {_st['file']:.0f} MB — freigebbar]"
         if mb >= RAM_CRITICAL_MB:
             log.critical(
                 "RAM KRITISCH: %.0f/%s MB%s — räume aggressiv auf (Apple-Sheet, "
