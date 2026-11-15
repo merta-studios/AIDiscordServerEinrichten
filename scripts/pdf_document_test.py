@@ -56,6 +56,7 @@ from bot.web.pdf_document import (  # noqa: E402
     CONTENT_WIDTH,
     _ensure_fonts,
     _prepare_text,
+    build_channel_history_pdf,
     build_server_document,
 )
 
@@ -79,6 +80,23 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
         FAILED.append(f"{name} {('- ' + detail) if detail else ''}")
         print(f"  ❌ {name}  {detail[:300]}")
     return bool(condition)
+
+
+def _count_apple_images(pdf_bytes: bytes) -> int:
+    """Zählt eindeutige 66×66-Inline-Bilder (= Apple-Emoji-Crops) im PDF."""
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover — pymupdf ist optional
+        return -1
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    seen = set()
+    for page in doc:
+        for img in page.get_images(full=True):
+            if img[2] == 66 and img[3] == 66:
+                seen.add(img[0])
+    doc.close()
+    return len(seen)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,6 +199,8 @@ def _build_guild(base_url: str) -> Any:
     ]
 
     def _hist(msgs):
+        # discord.py liefert die Historie NEUESTE zuerst — die Liste unten ist
+        # nach created_at bereits neueste-zuerst sortiert (mid % 50 Stunden her).
         async def gen(limit=None):
             for m in msgs[: limit or None]:
                 yield m
@@ -215,7 +235,7 @@ def _build_guild(base_url: str) -> Any:
 
     t1.history = _hist([
         msg(1, owner, f"Willkommen 🎉 👋 <@455701000000000014> <:tada:455601000000000018> — Привет 中文 ✓ Unicode-Test: 𝗖𝗵𝗮𝘁 𝕏 {long_text}"),
-        msg(2, m2, "Ping 👍🏽 :tada: sieht cool aus"),
+        msg(2, m2, "Ping 👍🏽 :tada: sieht cool aus \U0001F9D1\U0001F3FB\u200D\U0001F91D\U0001F3FC (Mono-Fallback-Sequenz)"),
         msg(3, m3, "Bot-Nachricht", embeds=[embed]),
         m_webhook,
     ])
@@ -305,6 +325,36 @@ async def run_tests() -> int:
     prepared = _prepare_text(nasty)
     check("Custom-Emoji-Syntax aufgelöst", "custom emoji" in prepared or "custom emoji" in prepared.lower(), prepared)
     check("Member-Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
+    # ── Mention-Namen (neu): @Mitgliedsname, @Rollenname, #kanalname ──────
+    pdf_mod._MENTION_NAMES[123456789012345678] = "MaxMustermann"
+    pdf_mod._MENTION_NAMES[999999999999999998] = "Support-Team"
+    pdf_mod._MENTION_NAMES[999999999999999997] = "allgemein"
+    prepared_named = _prepare_text(
+        "<@123456789012345678> <@&999999999999999998> <#999999999999999997>"
+    )
+    check("Mitglied-Mention → @Name", "@MaxMustermann" in prepared_named, prepared_named)
+    check("Rollen-Mention → @Rollenname", "@Support-Team" in prepared_named, prepared_named)
+    check("Kanal-Mention → #kanalname", "#allgemein" in prepared_named, prepared_named)
+    del pdf_mod._MENTION_NAMES[123456789012345678]
+    del pdf_mod._MENTION_NAMES[999999999999999998]
+    del pdf_mod._MENTION_NAMES[999999999999999997]
+    # ── Apple-Emojis (neu): Inline-<img>-Tags statt Monochrom-Glyphen ─────
+    apple_markup = pdf_mod._message_content_markup(
+        "🎉 👋 👍🏽 🇩🇪", emoji_png_by_id=lambda _eid: None)
+    check("Apple-Emoji als Inline-Bild (iOS-Look)",
+          "<img src=" in apple_markup and 'valign="middle"' in apple_markup
+          and apple_markup.count("<img") == 4, apple_markup[:160])
+    check("Custom-Emoji-Renderer erzeugt Inline-Bild",
+          pdf_mod._custom_emoji_img_tag("/tmp/x.png") is not None
+          and pdf_mod._custom_emoji_img_tag(None) is None, "")
+    check("Nicht-Bild-Anhang erkannt",
+          not pdf_mod._attachment_is_image(type("A", (), {"filename": "datei.zip"})())
+          and pdf_mod._attachment_is_image(type("A", (), {
+              "filename": "bild.png", "content_type": "image/png",
+              "url": "http://x/bild.png", "width": 100, "height": 80})()), "")
+    check("Button-Chip hat Diskord-Farben (Link-Chip färbbar)",
+          len(pdf_mod._BUTTON_CHIP_COLORS) >= 5
+          and "link" in pdf_mod._BUTTON_CHIP_COLORS, str(list(pdf_mod._BUTTON_CHIP_COLORS)))
     check("Unicode-Emojis bleiben erhalten", "🎮" in prepared and "🎉" in prepared, prepared)
     check("Unicode-Schriftarten bleiben erhalten", "𝗖𝗵𝗮𝘁" in prepared and "𝕏" in prepared, prepared)
     check("Emoji-/Math-Font-Zusatzregister vorhanden",
@@ -384,8 +434,18 @@ async def run_tests() -> int:
             import pymupdf  # noqa: F401
         except ImportError:  # pragma: no cover — pymupdf ist optional
             pymupdf = None
-        check("Emoji-Font im PDF eingebettet & benutzt",
-              b"NotoEmoji-Regular" in pdf_bytes, "")
+        check("Apple-Emojis im PDF (66×66-Inline-Bilder aus dem Sheet)",
+              _count_apple_images(pdf_bytes) >= 4, str(_count_apple_images(pdf_bytes)))
+        # Mono-Fallback: OHNE Apple-Sheet übernimmt NotoEmoji (Monochrom)
+        _saved_index = dict(pdf_mod._apple_index)
+        pdf_mod._apple_index.clear()
+        try:
+            fallback_markup = _clean("🎉")
+        finally:
+            pdf_mod._apple_index.update(_saved_index)
+        check("Emoji-Fallback ohne Apple-Sheet: NotoEmoji-Monochrom",
+              f"<font name='{pdf_mod._FONTS['emoji']}'>🎉</font>" in fallback_markup,
+              fallback_markup[:120])
         check("Math-Font im PDF eingebettet & benutzt",
               b"NotoSansMath-Regular" in pdf_bytes, "")
         if pymupdf is not None:
@@ -400,10 +460,36 @@ async def run_tests() -> int:
                   "#allgemein" in full_text, "")
             check("Extraktion: Administrator-Zeile statt Aufzählung",
                   "ADMINISTRATOR — umfasst ALLE Berechtigungen" in full_text, "")
-            check("Extraktion: Komponenten strukturiert (Trennlinie, Medien-Galerie, Button)",
-                  "Trennlinie" in full_text and "Medien-Galerie (2 Medien)" in full_text
-                  and "Schaltfläche „Receive support“ (Link)" in full_text
-                  and "Komponenten:" in full_text, "")
+            check("Extraktion: Komponenten als echte Darstellung (Text, Buttons als Chips)",
+                  "Wähle unten eine Option" in full_text and "Receive support" in full_text
+                  and "Setup now!" in full_text and "Hilfe gibt es im Kanal" in full_text, "")
+            check("Extraktion: Mention mit Namen (@ServerBoss statt @nutzer-…)",
+                  "@ServerBoss" in full_text and "@nutzer-455701000000000014" not in full_text, "")
+            check("Extraktion: roter Hinweis für nicht mehr im Server",
+                  "nicht mehr im Server" in full_text, "")
+
+        # ── Chatverlauf-PDF (neu): komplette Kanal-Historie für den Bot-Owner ──
+        print("\n  ── Chatverlauf-PDF (Kanal-Historie) ──\n")
+        async with aiohttp.ClientSession() as session:
+            hist_bytes = await build_channel_history_pdf(
+                guild.text_channels[0], session, progress=progress)
+
+        check("Chatverlauf-PDF liefert PDF-Bytes", hist_bytes[:5] == b"%PDF-",
+              repr(hist_bytes[:8]))
+        check("Chatverlauf-PDF endet mit %%EOF", hist_bytes.rstrip().endswith(b"%%EOF"))
+        if pymupdf is not None:
+            hdoc = pymupdf.open(stream=hist_bytes, filetype="pdf")
+            hist_text = " ".join("\n".join(p.get_text() for p in hdoc).split())
+            hdoc.close()
+            check("Chatverlauf: Kopf (#willkommen, Chatverlauf, vertraulich)",
+                  "#willkommen" in hist_text and "Chatverlauf" in hist_text
+                  and "nur für den Bot-Owner" in hist_text, "")
+            check("Chatverlauf: älteste Nachricht zuerst (Webhook 30 h alt)",
+                  hist_text.find("Webhook-Nachricht") < hist_text.find("Willkommen"), "")
+            check("Chatverlauf: Mention-Namen aufgelöst",
+                  "@ServerBoss" in hist_text, "")
+            check("Chatverlauf: nicht mehr im Server (Webhook-Autor)",
+                  "nicht mehr im Server" in hist_text, "")
 
 
         # ── Regression: Riesige Nachrichten dürfen den Build nicht crashen ──

@@ -39,9 +39,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
+import os
 import random
 import re
+import tempfile
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -117,6 +120,8 @@ EMBED_TEXT_MAX_LINES = 20
 EMBED_TITLE_MAX_CHARS = 120
 EMBED_LABEL_MAX_CHARS = 80
 MAX_ATTACHMENT_NAMES = 6
+#: Bildanhänge, die als Bild gerendert werden (global pro Dokument)
+MAX_ATTACHMENT_IMAGES = 60
 COMPONENTS_TEXT_MAX_CHARS = 500
 #: Max. Höhe einer Nachrichten-Kästchen-Box in Punkt — darüber wird die
 #: Nachricht unboxiert (splittbar) gerendert (LayoutError-Schutz).
@@ -291,7 +296,7 @@ def _ensure_fonts() -> Dict[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 #: Custom-Discord-Emojis ``<:name:id>`` / ``<a:name:id>``
-_DISCORD_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]{2,32}):\d{10,25}>")
+_DISCORD_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]{2,32}):(\d{10,25})>")
 #: Mentions in Nachrichtsinhalten — lesbar umschreiben statt Roh-Syntax
 _MEMBER_MENTION_RE = re.compile(r"<@!?(\d{10,25})>")
 _ROLE_MENTION_RE = re.compile(r"<@&(\d{10,25})>")
@@ -299,14 +304,10 @@ _CHANNEL_MENTION_RE = re.compile(r"<#(\d{10,25})>")
 #: Demojize-Tokens ``:party_popper:`` / ``:reißzwecke:`` — muss mit einem
 #: Buchstaben beginnen, damit Zeitangaben wie „12:30:00“ nicht zerstört werden.
 _DEMOJI_TOKEN_RE = re.compile(r":([^\W\d_][\w+\-]{1,59}):", re.UNICODE)
-#: Kontroll- und unsichtbare Zeichen (Bidi-Overrides, Zero-Width …)
+#: Kontroll- und unsichtbare Zeichen (Bidi-Overrides, Zero-Width …). ZWJ
+#: (U+200D) bleibt erhalten — es verbindet Emoji-Sequenzen (👨‍👩‍👦)!
 _CONTROL_RE = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\uFEFF]"
-)
-#: Hautton-Modifier + Variationsselektoren: NotoEmoji zeichnet sie einzeln
-#: als leere Kästchen — für Monochrom-Darstellung bedeutungslos → strippen.
-_EMOJI_MODIFIER_RE = re.compile(
-    "[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F]"
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f\u200b-\u200c\u200e-\u202e\u2066-\u2069\uFEFF]"
 )
 _MULTI_SPACE_RE = re.compile(r"[ \t\f\v]{2,}")
 
@@ -323,10 +324,27 @@ def _coverage_filter(s: str) -> str:
     return "".join(ch for ch in s if ch == "\n" or ord(ch) in _GLYPH_COVERAGE)
 
 
+#: Auflösung von Mentions zu Namen (wird pro Build gesetzt): ID → Name für
+#: Mitglieder (@Name), Rollen (@Rollenname) und Kanäle (#kanalname).
+_MENTION_NAMES: Dict[int, str] = {}
+
+
 def _mentions_to_text(text: str) -> str:
-    text = _MEMBER_MENTION_RE.sub(r"@nutzer-\1", text)
-    text = _ROLE_MENTION_RE.sub(r"@rolle-\1", text)
-    text = _CHANNEL_MENTION_RE.sub(r"#kanal-\1", text)
+    def _member(m: "re.Match[str]") -> str:
+        name = _MENTION_NAMES.get(int(m.group(1)))
+        return f"@{name}" if name else f"@nutzer-{m.group(1)}"
+
+    def _role(m: "re.Match[str]") -> str:
+        name = _MENTION_NAMES.get(int(m.group(1)))
+        return f"@{name}" if name else f"@rolle-{m.group(1)}"
+
+    def _channel(m: "re.Match[str]") -> str:
+        name = _MENTION_NAMES.get(int(m.group(1)))
+        return f"#{name}" if name else f"#kanal-{m.group(1)}"
+
+    text = _MEMBER_MENTION_RE.sub(_member, text)
+    text = _ROLE_MENTION_RE.sub(_role, text)
+    text = _CHANNEL_MENTION_RE.sub(_channel, text)
     return text
 
 
@@ -348,7 +366,6 @@ def _prepare_text(text: Optional[str], *, keep_newlines: bool = False) -> str:
     )
     s = _mentions_to_text(s)
     s = _DEMOJI_TOKEN_RE.sub(_emoji_token_to_text, s)
-    s = _EMOJI_MODIFIER_RE.sub("", s)
     s = _CONTROL_RE.sub(" ", s)
     s = s.replace("\r", "\n")
     if keep_newlines:
@@ -366,6 +383,117 @@ def _esc(text: Optional[str]) -> str:
     if text is None:
         return ""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Apple-Emoji-Darstellung: Sprite-Sheet (iamcal/emoji-data) + Positions-Index.
+#  Emojis werden als farbige <img>-Inline-Bilder gerendert (iOS-Look), statt
+#  als monochrome Noto-Glyphen. Fallback (Sheet fehlt): monochromer Font.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EMOJI_APPLE_DIR = Path(__file__).resolve().parent / "emoji_apple"
+_APPLE_INDEX_PATH = _EMOJI_APPLE_DIR / "index.json"
+_APPLE_SHEET_PATH = _EMOJI_APPLE_DIR / "sheet_apple_64.webp"
+#: Zellgröße im Apple-Sheet (4158 px / 66 px = 63 Spalten)
+_APPLE_CELL = 66.0
+#: Inline-Bildgröße in Paragraphs (Punkt)
+_APPLE_IMG_PT = 10.6
+_apple_sheet_img: Optional[Any] = None  # PIL-Image (lazy)
+_apple_index: Dict[str, List[int]] = {}
+_apple_tmpdir: Optional[str] = None
+_apple_png_cache: Dict[str, str] = {}  # Key → Pfad der zugeschnittenen PNG
+
+#: Candidate-Ranges für den Beginn/Fortlauf von Emoji-Sequenzen
+def _emoji_cp(o: int) -> bool:
+    return (
+        0x1F000 <= o <= 0x1FAFF
+        or 0x2600 <= o <= 0x27BF
+        or 0x2B00 <= o <= 0x2BFF
+        or 0x2300 <= o <= 0x23FF
+        or 0x25A0 <= o <= 0x25FF
+        or o in (0x200D, 0x20E3, 0xFE0E, 0xFE0F)
+        or 0x1F1E6 <= o <= 0x1F1FF  # Regional-Indikatoren (Flaggen)
+    )
+
+
+def _ensure_apple_emoji() -> bool:
+    """Lädt Index + Sheet (lazy). False, wenn Assets fehlen."""
+    global _apple_tmpdir
+    if _apple_tmpdir is not None:
+        return bool(_apple_index)
+    if not (_APPLE_INDEX_PATH.is_file() and _APPLE_SHEET_PATH.is_file()):
+        _apple_tmpdir = ""
+        return False
+    try:
+        with open(_APPLE_INDEX_PATH, "r", encoding="utf-8") as fh:
+            _apple_index.update(json.load(fh))
+        _apple_tmpdir = tempfile.mkdtemp(prefix="apple-emoji-")
+        return True
+    except (OSError, ValueError) as exc:
+        log.warning("Apple-Emoji-Assets nicht ladbar: %s", exc)
+        _apple_tmpdir = ""
+        return False
+
+
+def _apple_emoji_png(key: str, pos: List[int]) -> Optional[str]:
+    """Schneidet ein Emoji aus dem Apple-Sheet und liefert den PNG-Pfad."""
+    global _apple_sheet_img
+    cached = _apple_png_cache.get(key)
+    if cached:
+        return cached
+    try:
+        if _apple_sheet_img is None:
+            if _PILImage is None:
+                return None
+            _apple_sheet_img = _PILImage.open(str(_APPLE_SHEET_PATH))
+        x, y = pos
+        c = _APPLE_CELL
+        tile = _apple_sheet_img.crop(
+            (round(x * c), round(y * c), round((x + 1) * c), round((y + 1) * c))
+        )
+        if tile.mode != "RGBA":
+            tile = tile.convert("RGBA")
+        path = os.path.join(_apple_tmpdir or "", f"{key}.png")
+        tile.save(path, "PNG")
+        _apple_png_cache[key] = path
+        return path
+    except Exception:  # noqa: BLE001 — Emoji-Bild darf nie den Build brechen
+        log.debug("Apple-Emoji-Crop fehlgeschlagen: %s", key, exc_info=True)
+        return None
+
+
+def _apple_emoji_seq_img(run: str) -> Optional[str]:
+    """
+    Versucht, eine Emoji-Zeichenfolge (bereits aus dem Text gegriffen) als
+    Apple-Sprite zu rendern → Pfad der PNG, sonst None. VS16/Variationen
+    werden normalisiert (Sheet indiziert ohne/mit FE0F).
+    """
+    if not _ensure_apple_emoji():
+        return None
+    norm = []
+    for ch in run:
+        o = ord(ch)
+        if o == 0xFE0E:  # VS15 (Text-Stil) — Sheet kennt nur Farb-Stil
+            continue
+        norm.append(o)
+    keys = [
+        "-".join(f"{cp:X}" for cp in norm),
+        "-".join(f"{cp:X}" for cp in norm if cp != 0xFE0F),
+    ]
+    for key in keys:
+        pos = _apple_index.get(key)
+        if pos is not None:
+            return _apple_emoji_png(key, pos)
+    return None
+
+
+def _apple_img_tag(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return (
+        f'<img src="{path}" width="{_APPLE_IMG_PT}" height="{_APPLE_IMG_PT}" '
+        'valign="middle"/>'
+    )
 
 
 def _font_markup(escaped: str) -> str:
@@ -389,6 +517,10 @@ def _font_markup(escaped: str) -> str:
     def _cls(ch: str) -> Optional[str]:
         """None = Sans/Base (kein Tag), sonst Rolle — oder „drop“ als Sentinel."""
         o = ord(ch)
+        if o in (0xFE0E, 0xFE0F, 0x200D, 0x20E3) or 0x1F3FB <= o <= 0x1F3FF:
+            # Emoji-Modifier ohne eigene Bedeutung: im Mono-Fallback lieber
+            # weglassen (Apple-Pfad rendert sie IN der Sequenz-Bilddatei).
+            return "drop"
         if cov_sans is not None:
             if o in cov_sans:
                 return None
@@ -399,19 +531,47 @@ def _font_markup(escaped: str) -> str:
                 return role
         return "drop"
 
-    for ch in escaped:
+    use_apple = _ensure_apple_emoji()
+    i = 0
+    n = len(escaped)
+    while i < n:
+        ch = escaped[i]
         if ch == "\n":
             if cur is not None:
                 out.append("</font>")
                 cur = None
             out.append("<br/>")
+            i += 1
             continue
+        o = ord(ch)
+        if use_apple and _emoji_cp(o):
+            # Möglichst langen Emoji-Run greifen (Sequenzen mit VS16,
+            # Hauttönen, ZWJ, Flaggen) und den längsten im Sheet bekannten
+            # Prefix als Apple-Bild rendern — Rest fällt in die Kaskade.
+            j = i + 1
+            while j < n and _emoji_cp(ord(escaped[j])):
+                j += 1
+            run = escaped[i:j]
+            matched = False
+            for k in range(len(run), 0, -1):
+                img = _apple_emoji_seq_img(run[:k])
+                if img:
+                    if cur is not None:
+                        out.append("</font>")
+                        cur = None
+                    out.append(_apple_img_tag(img) or "")
+                    i += k
+                    matched = True
+                    break
+            if matched:
+                continue
         cls = _cls(ch)
         if cls == "drop":
             # Kein Font kennt das Zeichen → wegfiltern (No-Notdef-Garantie).
             if cur is not None:
                 out.append("</font>")
                 cur = None
+            i += 1
             continue
         if cls != cur:
             if cur is not None:
@@ -420,6 +580,7 @@ def _font_markup(escaped: str) -> str:
                 out.append(f"<font name='{_FONTS[cls]}'>")
             cur = cls
         out.append(ch)
+        i += 1
     if cur is not None:
         out.append("</font>")
     return "".join(out)
@@ -808,6 +969,310 @@ def _chips_row(chips: List[Tuple[str, colors.Color, bool]]) -> Table:
 _ZEBRA = ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_C.white, _C.lighter])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Inline-Bilder in Nachrichten: Custom-Emojis + Bildanhänge
+# ─────────────────────────────────────────────────────────────────────────────
+
+_custom_png_cache: Dict[str, str] = {}
+
+
+def _custom_emoji_png(data: Optional[bytes], key: str) -> Optional[str]:
+    """Custom-Emoji-Bytes → kleine PNG-Datei (64 px) für Inline-Bilder."""
+    cached = _custom_png_cache.get(key)
+    if cached:
+        return cached
+    if not data or _PILImage is None or not _ensure_apple_emoji():
+        return None
+    try:
+        im = _PILImage.open(io.BytesIO(data))
+        im.seek(0)  # animierte GIFs: erster Frame
+        if im.mode != "RGBA":
+            im = im.convert("RGBA")
+        im.thumbnail((64, 64))
+        path = os.path.join(_apple_tmpdir or "", f"custom-{key}.png")
+        im.save(path, "PNG")
+        _custom_png_cache[key] = path
+        return path
+    except Exception:  # noqa: BLE001 — Bildfehler darf nie crashen
+        log.debug("Custom-Emoji-PNG fehlgeschlagen: %s", key, exc_info=True)
+        return None
+
+
+def _custom_emoji_img_tag(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return (
+        f'<img src="{path}" width="{_APPLE_IMG_PT}" height="{_APPLE_IMG_PT}" '
+        'valign="middle"/>'
+    )
+
+
+def _message_content_markup(
+    raw_text: str, *, emoji_png_by_id: Callable[[int], Optional[str]]
+) -> str:
+    """
+    Nachrichteninhalt → Paragraph-Markup; Custom-Emojis (<:name:id>) werden
+    als echte Inline-Bilder gerendert (statt als Name-Text).
+    """
+    parts: List[str] = []
+    last = 0
+
+    def _plain(seg: str) -> str:
+        return _font_markup(_esc(_prepare_text(seg, keep_newlines=True))).replace("\n", "<br/>")
+
+    for m in _DISCORD_EMOJI_RE.finditer(raw_text):
+        parts.append(_plain(raw_text[last:m.start()]))
+        name = m.group(1).replace("_", " ").replace("-", " ").strip()
+        try:
+            eid = int(m.group(2))
+        except ValueError:
+            eid = -1
+        tag = _custom_emoji_img_tag(emoji_png_by_id(eid))
+        if tag:
+            parts.append(tag)
+        else:
+            parts.append(_esc(name))
+        last = m.end()
+    parts.append(_plain(raw_text[last:]))
+    return "".join(parts)
+
+
+def _attachment_is_image(att: Any) -> bool:
+    ctype = (getattr(att, "content_type", None) or "").lower()
+    if ctype.startswith("image/"):
+        return True
+    name = (getattr(att, "filename", "") or "").lower()
+    return name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Komponenten (Bot-Nachrichten, Layouts v2) als echte Mini-Darstellung
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUTTON_CHIP_COLORS = {
+    "primary": (_C.blurple, False),
+    "secondary": (colors.HexColor("#4E5058"), False),
+    "success": (_C.green, False),
+    "danger": (colors.HexColor("#DA373C"), False),
+    "link": (colors.HexColor("#4E5058"), False),
+    "premium": (colors.HexColor("#F47B67"), False),
+}
+_MAX_COMPONENT_MEDIA = 30
+_MAX_COMPONENT_TEXT_CHARS = 300
+
+
+def _component_media_urls(components: List[Any]) -> List[str]:
+    """Sammelt Media-URLs aus Komponenten (Galerien, Vorschaubilder, Dateien)."""
+    urls: List[str] = []
+
+    def _walk(comps: Any) -> None:
+        for comp in comps or []:
+            cname = getattr(getattr(comp, "type", None), "name", None) or ""
+            if cname == "media_gallery":
+                for item in (getattr(comp, "items", None) or getattr(comp, "attachments", None) or []):
+                    u = getattr(getattr(item, "media", None), "url", None) or getattr(item, "url", None)
+                    if u:
+                        urls.append(u)
+            elif cname == "thumbnail":
+                u = getattr(getattr(comp, "media", None), "url", None) or getattr(comp, "url", None)
+                if u:
+                    urls.append(u)
+            elif cname == "file":
+                u = getattr(getattr(comp, "file", None), "url", None) or getattr(getattr(comp, "media", None), "url", None)
+                if u:
+                    urls.append(u)
+            _walk(getattr(comp, "children", None))
+
+    _walk(components)
+    return urls[:_MAX_COMPONENT_MEDIA]
+
+
+def _button_chip(label: str, style_name: str, *, is_link: bool) -> Table:
+    """Rundet eine Schaltfläche als Farb-Chip ab (nicht klickbar im PDF)."""
+    bg, dark_text = _BUTTON_CHIP_COLORS.get(style_name, (colors.HexColor("#4E5058"), False))
+    text = _prepare_text(label) or ("Link" if is_link else "Button")
+    if is_link:
+        text = "↗ " + text
+    font = _FONTS["sans"]
+    size = 7.2
+    width = min(pdfmetrics.stringWidth(text, font, size) + 10, CONTENT_WIDTH * 0.55)
+    inner = Table([[Paragraph(
+        _font_markup(_esc(text)),
+        ParagraphStyle(
+            "btn_chip", fontName=font, fontSize=size, leading=9.2,
+            textColor=(colors.white if not dark_text else _C.dark),
+        ),
+    )]], colWidths=[width])
+    inner._btn_w = width
+    inner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), bg),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+    ]))
+    return inner
+
+
+def _select_chip(label: str, option_count: int) -> Table:
+    text = "▾ " + (_prepare_text(label) or "Auswählen")
+    if option_count:
+        text += f"  ({option_count} Optionen)"
+    width = min(pdfmetrics.stringWidth(text, _FONTS["sans"], 7.2) + 10, CONTENT_WIDTH * 0.6)
+    inner = Table([[Paragraph(
+        _font_markup(_esc(text)),
+        ParagraphStyle("sel_chip", fontName=_FONTS["sans"], fontSize=7.2, leading=9.2, textColor=_C.text),
+    )]], colWidths=[width])
+    inner._btn_w = width
+    inner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#E7E9EE")),
+        ("BOX", (0, 0), (-1, -1), 0.7, _C.border),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+    ]))
+    return inner
+
+
+def _chips_row_of(chips: List[Table]) -> Table:
+    """Mehrere fertige Chips mit Abstand nebeneinander (zeilenumbruchfrei)."""
+    cells: List[Any] = []
+    widths: List[float] = []
+    for i, chip in enumerate(chips):
+        if i:
+            cells.append(Spacer(2 * mm, 1))
+            widths.append(2 * mm)
+        cells.append(chip)
+        widths.append(chip._btn_w)
+    t = Table([cells], colWidths=widths, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
+
+
+def _components_flowables(components: List[Any], ctx: Dict[str, Any]) -> List[Any]:
+    """
+    Bot-Komponenten als echte Mini-Darstellung: Text-Displays als Text,
+    Trennlinien als Linien, Medien als Bilder, Buttons/Auswahlmenüs als Chips.
+    """
+    out: List[Any] = []
+    styles = ctx["styles"]
+
+    def _walk(comps: Any) -> None:
+        for comp in comps or []:
+            cname = getattr(getattr(comp, "type", None), "name", None) or ""
+            if cname in ("action_row",):
+                chips: List[Table] = []
+                for child in getattr(comp, "children", None) or []:
+                    ch_name = getattr(getattr(child, "type", None), "name", None) or ""
+                    if ch_name == "button":
+                        chips.append(_button_chip(
+                            _prepare_text(getattr(child, "label", None) or ""),
+                            str(getattr(getattr(child, "style", None), "name", "") or "").lower(),
+                            is_link=str(getattr(getattr(child, "style", None), "name", "") or "").lower() == "link",
+                        ))
+                    elif ch_name in ("string_select", "user_select", "role_select",
+                                     "channel_select", "mentionable_select"):
+                        chips.append(_select_chip(
+                            _prepare_text(getattr(child, "placeholder", None) or ""),
+                            len(getattr(child, "options", None) or []),
+                        ))
+                if chips:
+                    out.append(Spacer(1, 0.8 * mm))
+                    out.append(_chips_row_of(chips[:5]))
+            elif cname == "container":
+                # Container: Kinder rekursiv rendern, dann als Box mit
+                # Akzentkante zusammenfassen (wie ein Embed).
+                start = len(out)
+                _walk(getattr(comp, "children", None))
+                children_flows = out[start:]
+                if children_flows:
+                    del out[start:]
+                    box = Table([[children_flows]], colWidths=[CONTENT_WIDTH - 30 * mm])
+                    box.setStyle(TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F7")),
+                        ("LINEBEFORE", (0, 0), (0, -1), 2.2, _C.blurple),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
+                    ]))
+                    out.append(Spacer(1, 1 * mm))
+                    out.append(box)
+            elif cname == "text_display":
+                content = _prepare_text(getattr(comp, "content", None) or "", keep_newlines=True)
+                if content:
+                    out.append(Paragraph(
+                        _font_markup(_esc(_cap(content, _MAX_COMPONENT_TEXT_CHARS, 8))),
+                        styles["msg_body"],
+                    ))
+            elif cname == "separator":
+                out.append(Spacer(1, 1 * mm))
+                out.append(HRFlowable(width="100%", thickness=0.7, color=_C.border, spaceAfter=1))
+            elif cname == "media_gallery":
+                media = getattr(comp, "items", None) or getattr(comp, "attachments", None) or []
+                imgs: List[Any] = []
+                for item in media[:4]:
+                    u = getattr(getattr(item, "media", None), "url", None) or getattr(item, "url", None)
+                    flow = ctx["img"](u, max_w=44, max_h=44) if u else None
+                    if flow is not None:
+                        imgs.append(flow)
+                if imgs:
+                    out.append(Spacer(1, 1 * mm))
+                    row: List[Any] = []
+                    for i, f in enumerate(imgs):
+                        if i:
+                            row.append(Spacer(2 * mm, 1))
+                        row.append(f)
+                    t = Table([row], hAlign="LEFT")
+                    t.setStyle(TableStyle([
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                        ("TOPPADDING", (0, 0), (-1, -1), 0),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                    ]))
+                    out.append(t)
+            elif cname == "thumbnail":
+                u = getattr(getattr(comp, "media", None), "url", None) or getattr(comp, "url", None)
+                flow = ctx["img"](u, max_w=26, max_h=26) if u else None
+                if flow is not None:
+                    out.append(Spacer(1, 1 * mm))
+                    out.append(flow)
+            elif cname == "section":
+                _walk(getattr(comp, "children", None))
+                _walk([getattr(comp, "accessory", None)] if getattr(comp, "accessory", None) else [])
+            elif cname == "file":
+                fobj = getattr(comp, "file", None) or getattr(comp, "media", None)
+                name = _prepare_text(getattr(fobj, "filename", None) or "") or "Datei"
+                out.append(Paragraph(f"📎 {_clean(name)}", styles["table_muted"]))
+            elif cname == "button":
+                out.append(Spacer(1, 0.8 * mm))
+                out.append(_button_chip(
+                    _prepare_text(getattr(comp, "label", None) or ""),
+                    str(getattr(getattr(comp, "style", None), "name", "") or "").lower(),
+                    is_link=str(getattr(getattr(comp, "style", None), "name", "") or "").lower() == "link",
+                ))
+            elif cname in ("string_select", "user_select", "role_select",
+                           "channel_select", "mentionable_select"):
+                out.append(Spacer(1, 0.8 * mm))
+                out.append(_select_chip(
+                    _prepare_text(getattr(comp, "placeholder", None) or ""),
+                    len(getattr(comp, "options", None) or []),
+                ))
+
+    _walk(components)
+    return out
+
+
 def _gray_chip(label: str, max_width: Optional[float] = None) -> Table:
     """
     Abgerundetes graues Kästchen (Mitglieder-Rollen). Breite = Label-Breite;
@@ -979,6 +1444,33 @@ def _premium_label(guild: discord.Guild) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Wichtigste Mitglieder (seltenste Rollen, sonst zufällig)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _ensure_member_list(
+    guild: discord.Guild, member_count: int, members: List[Any],
+    progress: Optional[ProgressCallback] = None,
+) -> Tuple[int, List[Any]]:
+    """
+    Stellt sicher, dass die Mitgliederliste aussagekräftig ist: Der Cache kann
+    bei großen Servern (Mitglieder-Intent/Chunking nicht gelaufen) LEER sein —
+    dann zeigte das Dokument „Alle 1 Mitglieder“ mit nur dem Bot. Fallback:
+    ``fetch_members`` (best effort); Misslingen wird transparent dokumentiert.
+    """
+    target = min(member_count or 0, MAX_MEMBERS_DETAILED)
+    if len(members) >= max(target, 1):
+        return member_count, members
+    try:
+        fetched = [m async for m in guild.fetch_members(limit=max(target, 1))]
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound, AttributeError, TypeError):
+        fetched = []
+    if fetched:
+        by_id = {m.id: m for m in fetched}
+        by_id.update({m.id: m for m in members})
+        members = list(by_id.values())
+        if progress is not None:
+            await progress(6, f"Mitgliederliste geladen ({len(members)}) …")
+    member_count = max(member_count or 0, len(members))
+    return member_count, members
 
 
 def _select_important_members(members: List[discord.Member], guild: discord.Guild) -> List[discord.Member]:
@@ -1186,6 +1678,180 @@ class _NumberedCanvas(pdf_canvas.Canvas):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _message_flowables(m: Any, styles: Dict[str, ParagraphStyle], ctx: Dict[str, Any]) -> List[Any]:
+    """
+    Eine Discord-Nachricht als fertige Flowables (graue, abgerundete Box —
+    oder unboxiert/splittbar, wenn die Box zu hoch für eine Seite wäre).
+
+    Enthält: Kopf (Avatar, Name, BOT/Webhook, Zeit, ggf. roter
+    „nicht mehr im Server"-Hinweis), Inhalt (Apple-Emojis, Custom-Emojis als
+    Inline-Bilder), Embed-Boxen, Bildanhänge, Komponenten als Mini-Darstellung.
+    """
+    avatar_img = ctx["avatar_img"]
+    img = ctx["img"]
+    emoji_png_by_id = ctx["emoji_png"]
+    member_ids: set = ctx.get("member_ids") or set()
+    content_width = ctx.get("content_width", CONTENT_WIDTH)
+
+    flows: List[Any] = []
+    author = m.author
+
+    # Kopfzeile: Avatar + Name/Zeit — winzige 1-Zeilen-Tabelle.
+    avatar_cell: List[Any] = []
+    av = avatar_img(getattr(author, "id", -1), 7)
+    if av is not None:
+        avatar_cell.append(av)
+    else:
+        # Achtung: niemals einen Rostring in eine Listen-Zelle —
+        # ReportLab bricht sonst beim wrapOn ab.
+        avatar_cell.append(Spacer(1, 1))
+
+    head = f"<b>{_clean(getattr(author, 'display_name', None) or author.name)}</b>"
+    if getattr(author, "bot", False):
+        head += " <font color='#5865F2' size='6.6'><b>BOT</b></font>"
+    if m.webhook_id is not None:
+        head += f" <font color='#6B7280' size='6.8'>Webhook {m.webhook_id}</font>"
+    if getattr(author, "id", None) and member_ids and author.id not in member_ids:
+        head += " <font color='#ED4245' size='6.8'><b>• nicht mehr im Server</b></font>"
+    head += (
+        f"  <font color='#9AA0AB' size='6.8'>{m.created_at.strftime('%d.%m.%Y %H:%M')} UTC</font>"
+    )
+    box_inner_w = content_width - 14
+    msg_header = Table(
+        [[avatar_cell, Paragraph(head, styles["msg_head"])]],
+        colWidths=[10 * mm, box_inner_w - 10 * mm],
+    )
+    msg_header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (0, 0), 1),
+        ("RIGHTPADDING", (0, 0), (0, 0), 2),
+        ("LEFTPADDING", (1, 0), (1, 0), 2),
+        ("RIGHTPADDING", (1, 0), (1, 0), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+    ]))
+
+    # Inhalt: einzelne Paragraphs/Tabellen (splittbar im Notfall-Pfad).
+    body: List[Any] = []
+
+    if _prepare_text(m.content, keep_newlines=True):
+        # Discord-Nachrichten sind ≤ 4000 Zeichen; der Cap ist ein
+        # Sicherheitsnetz gegen pathologische Webhook-/System-Inhalte.
+        raw_content = (m.content or "")[:MESSAGE_CONTENT_MAX_CHARS]
+        body.append(Paragraph(
+            _message_content_markup(raw_content, emoji_png_by_id=emoji_png_by_id),
+            styles["msg_body"],
+        ))
+
+    shown_embeds = (m.embeds or [])[:MAX_EMBEDS_PER_MESSAGE]
+    for embed in shown_embeds:
+        rows = _embed_rows(embed)
+        if not rows:
+            continue
+        embed_color = (
+            colors.HexColor(f"#{embed.color.value:06x}")
+            if embed.color is not None else _C.blurple
+        )
+        box = Table(
+            [
+                [Paragraph(f"<b>{_clean(label)}:</b> {_clean_ml(value)}", styles["embed_text"])]
+                for label, value in rows
+            ],
+            colWidths=[box_inner_w - 6],
+        )
+        box.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("LINEBEFORE", (0, 0), (0, -1), 2.2, embed_color),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.6),
+        ]))
+        body.append(Spacer(1, 1.4 * mm))
+        body.append(box)
+    hidden_embeds = len(m.embeds or []) - len(shown_embeds)
+    if hidden_embeds > 0:
+        body.append(Paragraph(f"(+{hidden_embeds} weitere Embeds gekürzt)", styles["table_muted"]))
+
+    # Bildanhänge als echte Bilder, Rest als Dateiname
+    atts = getattr(m, "attachments", None) or []
+    image_atts = [a for a in atts if _attachment_is_image(a) and getattr(a, "url", None)]
+    other_atts = [a for a in atts if a not in image_atts]
+    for att in image_atts[:4]:
+        flow = img(att.url, max_w=48, max_h=48)
+        if flow is not None:
+            body.append(Spacer(1, 1.2 * mm))
+            body.append(flow)
+
+    extras: List[str] = []
+    if other_atts:
+        names = ", ".join(
+            _prepare_text(a.filename) for a in other_atts[:MAX_ATTACHMENT_NAMES]
+        )
+        extra_count = len(other_atts) - min(len(other_atts), MAX_ATTACHMENT_NAMES)
+        label = "Anhang: " if len(other_atts) == 1 else "Anhänge: "
+        extras.append(label + names + (f" (+{extra_count} weitere)" if extra_count > 0 else ""))
+    if m.stickers:
+        extras.append("Sticker: " + ", ".join(_prepare_text(s.name) for s in m.stickers))
+    try:
+        comps = m.components or []
+    except Exception:  # pragma: no cover — ältere discord.py-Versionen
+        comps = []
+    if extras:
+        body.append(Spacer(1, 0.8 * mm))
+        body.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
+
+    # Komponenten als echte Mini-Darstellung (Buttons, Galerien, …);
+    # Fallback: Stichpunktliste.
+    if comps:
+        comp_flows = _components_flowables(comps, {**ctx, "styles": styles})
+        if comp_flows:
+            body.append(Spacer(1, 1 * mm))
+            body.extend(comp_flows)
+        else:
+            items = _component_items(comps)
+            if items:
+                body.append(Spacer(1, 0.6 * mm))
+                body.append(Paragraph("<b>Komponenten:</b>", styles["table_muted"]))
+                for item in items[:12]:
+                    body.append(Paragraph(
+                        f"•&nbsp;&nbsp;{_font_markup(_esc(_short(item, 160)))}",
+                        ParagraphStyle(
+                            "comp_item", parent=styles["table_muted"],
+                            leftIndent=8, firstLineIndent=-8,
+                        ),
+                    ))
+
+    # Nachricht als graues, abgerundetes Kästchen. Sicherheitsnetz
+    # (LayoutError-Schutz): die Box-Höhe wird vorher gemessen — passt
+    # sie nicht sicher auf eine Seite, wird die Nachricht unboxiert
+    # mit splittbaren Flowables ausgegeben (Tabellenzeilen splitten
+    # nicht!). Siehe LayoutError-Fix: never KeepTogether unbounded.
+    msg_box = Table([[ [msg_header] + body ]], colWidths=[content_width])
+    msg_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F3F7")),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    try:
+        _bw, _bh = msg_box.wrap(content_width, 100000)
+    except Exception:  # noqa: BLE001 — Messung darf nie crashen
+        _bh = MAX_MESSAGE_BOX_PT + 1
+    if _bh <= MAX_MESSAGE_BOX_PT:
+        flows.append(msg_box)
+    else:
+        # Box zu hoch für eine Seite → unboxiert, splittbar ausgeben.
+        flows.append(msg_header)
+        if body:
+            flows.append(Indenter(left=7))
+            flows.extend(body)
+            flows.append(Indenter(left=-7))
+    return flows
+
+
 async def build_server_document(
     guild: discord.Guild,
     http_session: aiohttp.ClientSession,
@@ -1211,7 +1877,11 @@ async def build_server_document(
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
             owner = None
 
-    member_count = guild.member_count or len(getattr(guild, "members", []))
+    roles = sorted(guild.roles, key=lambda r: r.position, reverse=True)
+    members = list(guild.members)
+    member_count = guild.member_count or len(members)
+    member_count, members = await _ensure_member_list(guild, member_count, members, progress)
+
     categories = list(guild.categories)
     text_channels = list(guild.text_channels)
     voice_channels = list(guild.voice_channels)
@@ -1221,14 +1891,21 @@ async def build_server_document(
         c for c in guild.channels
         if c.category is None and c.type is not discord.ChannelType.category
     ]
-    roles = sorted(guild.roles, key=lambda r: r.position, reverse=True)
     emojis = list(guild.emojis)
     stickers = list(guild.stickers)
-    members = list(guild.members)
     detailed_members = (
         members if len(members) <= MAX_MEMBERS_DETAILED
         else _select_important_members(members, guild)
     )
+
+    # Mention-Namen (Rollen/Kanäle/Mitglieder) für @Name statt @id
+    _MENTION_NAMES.clear()
+    for r in roles:
+        _MENTION_NAMES[r.id] = r.name
+    for ch in guild.channels:
+        _MENTION_NAMES[ch.id] = ch.name
+    for mb in members:
+        _MENTION_NAMES[mb.id] = getattr(mb, "display_name", None) or mb.name
 
     def _member_avatar(m: Any) -> Optional[str]:
         return getattr(getattr(m, "display_avatar", None), "url", None) or None
@@ -1256,6 +1933,17 @@ async def build_server_document(
                 url = _member_avatar(m.author)
                 if url:
                     avatar_urls.setdefault(getattr(m.author, "id", 0), url)
+                # Mention-Namen aus den Nachrichten ergänzen (Autoren,
+                # Erwähnte, Rollen) — auch für nicht gecachte Mitglieder.
+                if getattr(m, "author", None) is not None:
+                    _MENTION_NAMES.setdefault(getattr(m.author, "id", 0),
+                                              getattr(m.author, "display_name", None) or m.author.name)
+                for u in getattr(m, "mentions", None) or []:
+                    _MENTION_NAMES.setdefault(u.id, getattr(u, "display_name", None) or u.name)
+                for r in getattr(m, "role_mentions", None) or []:
+                    _MENTION_NAMES.setdefault(r.id, r.name)
+                for c in getattr(m, "channel_mentions", None) or []:
+                    _MENTION_NAMES.setdefault(c.id, c.name)
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
             channel_messages[channel.id] = []
 
@@ -1272,6 +1960,20 @@ async def build_server_document(
     for sticker in stickers:
         image_urls.append(getattr(sticker, "url", None))
 
+    # Bildanhänge + Komponenten-Medien (mit globalen Obergrenzen)
+    all_msgs = [m for msgs in channel_messages.values() for m in msgs]
+    emoji_url_by_id: Dict[int, Optional[str]] = {e.id: getattr(e, "url", None) for e in emojis}
+    att_image_urls: List[str] = []
+    for m in all_msgs:
+        for att in getattr(m, "attachments", None) or []:
+            if _attachment_is_image(att) and getattr(att, "url", None):
+                att_image_urls.append(att.url)
+    att_image_urls = att_image_urls[:MAX_ATTACHMENT_IMAGES]
+    image_urls.extend(att_image_urls)
+    image_urls.extend(_component_media_urls(
+        [c for m in all_msgs for c in (getattr(m, "components", None) or [])]
+    ))
+
     image_cache = await _download_images(http_session, image_urls)
 
     # ── 4. PDF-Datenstrukturen ─────────────────────────────────────────────
@@ -1284,6 +1986,20 @@ async def build_server_document(
 
     def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
         return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
+
+    def emoji_png(eid: int) -> Optional[str]:
+        return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"emoji-{eid}")
+
+    # Kontext für den gemeinsamen Nachrichten-Renderer (auch vom
+    # Chatverlauf-PDF genutzt).
+    msg_ctx: Dict[str, Any] = {
+        "styles": styles,
+        "img": img,
+        "avatar_img": avatar_img,
+        "emoji_png": emoji_png,
+        "member_ids": {getattr(m, "id", None) for m in members if getattr(m, "id", None)},
+        "content_width": CONTENT_WIDTH,
+    }
 
     # ---- Titelkopf ----
     icon_url = getattr(guild.icon, "url", None) if guild.icon else None
@@ -1723,11 +2439,16 @@ async def build_server_document(
 
     # ---- 4. Mitglieder ----
     _section(flowables, "4", "Mitglieder", styles)
-    if len(members) <= MAX_MEMBERS_DETAILED:
+    if len(members) <= MAX_MEMBERS_DETAILED and len(members) >= member_count:
         flowables.append(Paragraph(f"Alle {len(members)} Mitglieder des Servers:", styles["body"]))
+    elif len(members) <= MAX_MEMBERS_DETAILED:
+        flowables.append(Paragraph(
+            f"{len(members)} von {member_count} Mitgliedern im Cache — die Mitgliederliste "
+            "könnte unvollständig sein (Bot konnte nicht alle Mitglieder laden):",
+            styles["body"]))
     else:
         flowables.append(Paragraph(
-            f"Der Server hat {len(members)} Mitglieder — mehr als {MAX_MEMBERS_DETAILED}. "
+            f"Der Server hat {member_count} Mitglieder — mehr als {MAX_MEMBERS_DETAILED}. "
             f"Angezeigt werden die {MAX_MEMBERS_DETAILED} wichtigsten Mitglieder "
             "(Inhaber der seltensten Rollen zuerst).", styles["body"]))
     flowables.append(Spacer(1, 3 * mm))
@@ -1818,150 +2539,7 @@ async def build_server_document(
         # ÄLTESTE zuerst: Discord liefert die Historie neueste-zuerst —
         # umgekehrt lesen wir sie von oben (alt) nach unten (neu).
         for m in reversed(msgs):
-            author = m.author
-
-            # Kopfzeile der Nachricht: Avatar + Name/Zeit — bewusst eine
-            # winzige 1-Zeilen-Tabelle, die nie höher als ~10 mm wird.
-            # Breite = Boxen-Innenmaß (Box-Padding 7 pt links/rechts).
-            avatar_cell: List[Any] = []
-            av = avatar_img(getattr(author, "id", -1), 7)
-            if av is not None:
-                avatar_cell.append(av)
-            else:
-                # Achtung: niemals einen Rostring in eine Listen-Zelle —
-                # ReportLab bricht sonst beim wrapOn ab.
-                avatar_cell.append(Spacer(1, 1))
-
-            head = f"<b>{_clean(getattr(author, 'display_name', None) or author.name)}</b>"
-            if getattr(author, "bot", False):
-                head += " <font color='#5865F2' size='6.6'><b>BOT</b></font>"
-            if m.webhook_id is not None:
-                head += f" <font color='#6B7280' size='6.8'>Webhook {m.webhook_id}</font>"
-            head += (
-                f"  <font color='#9AA0AB' size='6.8'>{m.created_at.strftime('%d.%m.%Y %H:%M')} UTC</font>"
-            )
-            box_inner_w = CONTENT_WIDTH - 14
-            msg_header = Table(
-                [[avatar_cell, Paragraph(head, styles["msg_head"])]],
-                colWidths=[10 * mm, box_inner_w - 10 * mm],
-            )
-            msg_header.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (0, 0), 1),
-                ("RIGHTPADDING", (0, 0), (0, 0), 2),
-                ("LEFTPADDING", (1, 0), (1, 0), 2),
-                ("RIGHTPADDING", (1, 0), (1, 0), 1),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
-            ]))
-
-            # Inhalt: einzelne Paragraphs/Tabellen (splittbar im Notfall-Pfad).
-            body: List[Any] = []
-
-            content_prepared = _cap(
-                _prepare_text(m.content, keep_newlines=True), MESSAGE_CONTENT_MAX_CHARS
-            )
-            if content_prepared:
-                body.append(
-                    Paragraph(_font_markup(_esc(content_prepared)), styles["msg_body"])
-                )
-
-            shown_embeds = (m.embeds or [])[:MAX_EMBEDS_PER_MESSAGE]
-            for embed in shown_embeds:
-                rows = _embed_rows(embed)
-                if not rows:
-                    continue
-                embed_color = (
-                    colors.HexColor(f"#{embed.color.value:06x}")
-                    if embed.color is not None else _C.blurple
-                )
-                # Weiße Box mit Akzentkante — hebt sich vom grauen
-                # Nachrichten-Kästchen ab (und funktioniert im Notfall-Pfad
-                # auf weißem Grund ebenfalls).
-                box = Table(
-                    [
-                        [Paragraph(f"<b>{_clean(label)}:</b> {_clean_ml(value)}", styles["embed_text"])]
-                        for label, value in rows
-                    ],
-                    colWidths=[box_inner_w - 6],
-                )
-                box.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                    ("LINEBEFORE", (0, 0), (0, -1), 2.2, embed_color),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                    ("TOPPADDING", (0, 0), (-1, -1), 2.2),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.6),
-                ]))
-                body.append(Spacer(1, 1.4 * mm))
-                body.append(box)
-            hidden_embeds = len(m.embeds or []) - len(shown_embeds)
-            if hidden_embeds > 0:
-                body.append(Paragraph(f"(+{hidden_embeds} weitere Embeds gekürzt)", styles["table_muted"]))
-
-            extras: List[str] = []
-            if m.attachments:
-                names = ", ".join(
-                    _prepare_text(a.filename) for a in m.attachments[:MAX_ATTACHMENT_NAMES]
-                )
-                extra_count = len(m.attachments) - min(len(m.attachments), MAX_ATTACHMENT_NAMES)
-                label = "Anhang: " if len(m.attachments) == 1 else "Anhänge: "
-                extras.append(label + names + (f" (+{extra_count} weitere)" if extra_count > 0 else ""))
-            if m.stickers:
-                extras.append("Sticker: " + ", ".join(_prepare_text(s.name) for s in m.stickers))
-            try:
-                comps = m.components or []
-            except Exception:  # pragma: no cover — ältere discord.py-Versionen
-                comps = []
-            comp_items: List[str] = _component_items(comps) if comps else []
-            if extras:
-                body.append(Spacer(1, 0.8 * mm))
-                body.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
-
-            # Komponenten strukturiert: eine Überschrift, dann je Komponente
-            # eine Bullet-Zeile (statt ein langer „·"-Ketten-Text).
-            if comp_items:
-                body.append(Spacer(1, 0.6 * mm))
-                body.append(Paragraph("<b>Komponenten:</b>", styles["table_muted"]))
-                for item in comp_items[:12]:
-                    body.append(Paragraph(
-                        f"•&nbsp;&nbsp;{_font_markup(_esc(_short(item, 160)))}",
-                        ParagraphStyle(
-                            "comp_item", parent=styles["table_muted"],
-                            leftIndent=8, firstLineIndent=-8,
-                        ),
-                    ))
-                if len(comp_items) > 12:
-                    body.append(Paragraph(
-                        f"(+{len(comp_items) - 12} weitere Komponenten)", styles["table_muted"]))
-
-            # Nachricht als graues, abgerundetes Kästchen. Sicherheitsnetz
-            # (LayoutError-Schutz): die Box-Höhe wird vorher gemessen — passt
-            # sie nicht sicher auf eine Seite, wird die Nachricht unboxiert
-            # mit splittbaren Flowables ausgegeben (Tabellenzeilen splitten
-            # nicht!). Siehe LayoutError-Fix: never KeepTogether unbounded.
-            msg_box = Table([[ [msg_header] + body ]], colWidths=[CONTENT_WIDTH])
-            msg_box.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F3F7")),
-                ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ]))
-            try:
-                _bw, _bh = msg_box.wrap(CONTENT_WIDTH, 100000)
-            except Exception:  # noqa: BLE001 — Messung darf nie crashen
-                _bh = MAX_MESSAGE_BOX_PT + 1
-            if _bh <= MAX_MESSAGE_BOX_PT:
-                flowables.append(msg_box)
-            else:
-                # Box zu hoch für eine Seite → unboxiert, splittbar ausgeben.
-                flowables.append(msg_header)
-                if body:
-                    flowables.append(Indenter(left=7))
-                    flowables.extend(body)
-                    flowables.append(Indenter(left=-7))
+            flowables.extend(_message_flowables(m, styles, msg_ctx))
             flowables.append(Spacer(1, 2.4 * mm))
 
     if not any_messages:
@@ -1972,12 +2550,39 @@ async def build_server_document(
     # ── 5. Bauen ────────────────────────────────────────────────────────────
     await progress(88, "PDF-Datei wird geschrieben …")
 
-    header_left = _prepare_text(f"{guild.name} · Server-Dokument")
-    footer_left = (
-        "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
-        + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+    pdf_bytes = _render_pdf(
+        flowables,
+        header_left=f"{guild.name} · Server-Dokument",
+        footer_left=(
+            "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
+            + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+        ),
+        title=f"Server-Dokument · {guild.name}",
+        subject=f"Komplette Server-Übersicht für {guild.name} (ID {guild.id})",
     )
 
+    await progress(100, "PDF fertiggestellt.")
+    log.info(
+        "Server-Dokument für '%s' (ID %s) erstellt: %d KB, %d Kategorien, %d Rollen, %d Emojis, "
+        "%d Sticker, %d Mitglieder detailliert, %d Kanäle mit Nachrichten, %d/%d Bilder",
+        guild.name, guild.id, len(pdf_bytes) // 1024,
+        len(categories), len(roles), len(emojis), len(stickers),
+        len(detailed_members), sum(1 for v in channel_messages.values() if v),
+        sum(1 for v in image_cache.values() if v), len(image_cache),
+    )
+    return pdf_bytes
+
+
+def _render_pdf(
+    flowables: List[Any],
+    *,
+    header_left: str,
+    footer_left: str,
+    title: str,
+    subject: str,
+) -> bytes:
+    """Flowables → PDF-Bytes (A4, Kopf/Fuß, „Seite X von Y")."""
+    _ensure_fonts()
     buffer = io.BytesIO()
     doc = BaseDocTemplate(
         buffer,
@@ -1986,9 +2591,9 @@ async def build_server_document(
         rightMargin=MARGIN,
         topMargin=TOP_MARGIN,
         bottomMargin=BOTTOM_MARGIN,
-        title=_prepare_text(f"Server-Dokument · {guild.name}"),
+        title=_prepare_text(title),
         author="AIDiscordServerEinrichten",
-        subject=_prepare_text(f"Komplette Server-Übersicht für {guild.name} (ID {guild.id})"),
+        subject=_prepare_text(subject),
         creator="AIDiscordServerEinrichten · Adminpanel",
     )
     frame = Frame(
@@ -1999,18 +2604,198 @@ async def build_server_document(
     ])
     doc.build(
         flowables,
-        canvasmaker=partial(_NumberedCanvas, header_left=header_left, footer_left=footer_left),
+        canvasmaker=partial(
+            _NumberedCanvas,
+            header_left=_prepare_text(header_left),
+            footer_left=_prepare_text(footer_left),
+        ),
     )
     pdf_bytes = buffer.getvalue()
     buffer.close()
+    return pdf_bytes
 
+
+async def build_channel_history_pdf(
+    channel: Any,
+    http_session: aiohttp.ClientSession,
+    *,
+    progress: ProgressCallback,
+    max_messages: int = 1000,
+) -> bytes:
+    """
+    Kompletter Chatverlauf eines Textkanals/Threads als PDF — NUR für den
+    Bot-Owner bestimmt. Älteste Nachrichten zuerst, mit Apple-Emojis,
+    Custom-Emojis, Bildanhängen, Komponenten und Embeds; Mention-Namen
+    (@Rollenname, #kanalname, @Mitglied) statt IDs; verlassene Mitglieder
+    mit rotem „nicht mehr im Server"-Hinweis.
+    """
+    guild = channel.guild
+    styles = _styles()
+    now_utc = datetime.now(timezone.utc)
+
+    await progress(5, "Chatverlauf wird geladen …")
+
+    # Mention-Namen vorbefüllen (Rollen, Kanäle, gecachte Mitglieder)
+    _MENTION_NAMES.clear()
+    for r in guild.roles:
+        _MENTION_NAMES[r.id] = r.name
+    for c in guild.channels:
+        _MENTION_NAMES[c.id] = c.name
+    members = list(guild.members)
+    member_count = guild.member_count or len(members)
+    member_count, members = await _ensure_member_list(guild, member_count, members, progress)
+    member_ids = {getattr(m, "id", None) for m in members if getattr(m, "id", None)}
+    for mb in members:
+        _MENTION_NAMES[mb.id] = getattr(mb, "display_name", None) or mb.name
+
+    msgs: List[Any] = []
+    history = getattr(channel, "history", None)
+    if history is not None:
+        try:
+            msgs = [m async for m in history(limit=max_messages)]
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            msgs = []
+    msgs.reverse()  # ÄLTESTE zuerst
+
+    # Mention-Namen aus den Nachrichten ergänzen (Autoren, Erwähnte, Rollen)
+    for m in msgs:
+        if getattr(m, "author", None) is not None:
+            _MENTION_NAMES.setdefault(
+                getattr(m.author, "id", 0),
+                getattr(m.author, "display_name", None) or m.author.name,
+            )
+        for u in getattr(m, "mentions", None) or []:
+            _MENTION_NAMES.setdefault(u.id, getattr(u, "display_name", None) or u.name)
+        for r in getattr(m, "role_mentions", None) or []:
+            _MENTION_NAMES.setdefault(r.id, r.name)
+        for c in getattr(m, "channel_mentions", None) or []:
+            _MENTION_NAMES.setdefault(c.id, c.name)
+
+    await progress(30, f"{len(msgs)} Nachrichten geladen — Bilder werden geladen …")
+
+    # Bild-URLs sammeln: Avatare (Autoren), Icon, Bildanhänge,
+    # Komponenten-Medien, Custom-Emojis aus den Nachrichten
+    image_urls: List[Optional[str]] = [
+        getattr(guild.icon, "url", None) if guild.icon else None,
+    ]
+    avatar_urls: Dict[int, str] = {}
+    att_image_urls: List[str] = []
+    custom_emoji_ids: List[int] = []
+    for m in msgs:
+        av = getattr(getattr(m, "author", None), "display_avatar", None)
+        if av is not None and getattr(av, "url", None):
+            avatar_urls.setdefault(getattr(m.author, "id", 0), av.url)
+        for att in getattr(m, "attachments", None) or []:
+            if _attachment_is_image(att) and getattr(att, "url", None):
+                att_image_urls.append(att.url)
+        for em in _DISCORD_EMOJI_RE.finditer(m.content or ""):
+            try:
+                custom_emoji_ids.append(int(em.group(2)))
+            except ValueError:
+                pass
+    seen: set = set()
+    att_image_urls = [u for u in att_image_urls[:MAX_ATTACHMENT_IMAGES] if not (u in seen or seen.add(u))]
+    comp_media = _component_media_urls(
+        [c for m in msgs for c in (getattr(m, "components", None) or [])]
+    )
+    custom_ids_unique = list(dict.fromkeys(custom_emoji_ids))[:40]
+    emoji_url_by_id: Dict[int, Optional[str]] = {}
+    for e in guild.emojis:
+        if e.id in custom_ids_unique:
+            emoji_url_by_id[e.id] = getattr(e, "url", None)
+            image_urls.append(getattr(e, "url", None))
+
+    for uid in list(avatar_urls)[:60]:
+        image_urls.append(avatar_urls[uid])
+    image_urls.extend(att_image_urls)
+    image_urls.extend(comp_media)
+
+    image_cache = await _download_images(http_session, image_urls)
+
+    await progress(62, "Nachrichten werden aufbereitet …")
+
+    def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
+        return _image_flow(image_cache.get(url) if url else None, **kwargs)
+
+    def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
+        return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
+
+    def emoji_png(eid: int) -> Optional[str]:
+        return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"hist-emoji-{eid}")
+
+    msg_ctx: Dict[str, Any] = {
+        "styles": styles,
+        "img": img,
+        "avatar_img": avatar_img,
+        "emoji_png": emoji_png,
+        "member_ids": member_ids,
+        "content_width": CONTENT_WIDTH,
+    }
+
+    flowables: List[Any] = []
+
+    # ---- Kopfbereich ----
+    icon_url = getattr(guild.icon, "url", None) if guild.icon else None
+    icon_flow = _avatar_flow(image_cache.get(icon_url), 18) if icon_url else None
+    span = ""
+    if msgs:
+        first, last = msgs[0].created_at, msgs[-1].created_at
+        span = f"{first.strftime('%d.%m.%Y %H:%M')} – {last.strftime('%d.%m.%Y %H:%M')} UTC"
+    ch_type_name = str(getattr(getattr(channel, "type", None), "name", "kanal") or "kanal")
+
+    head_bits = [
+        f"Server <b>{_clean(guild.name)}</b> (ID {_clean(guild.id)})",
+        f"{_clean(ch_type_name.replace('_', ' ').title())}: <b>#{_clean(channel.name)}</b> "
+        f"(ID {_clean(channel.id)})",
+        f"{len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}"
+        + (f" · Zeitraum {span}" if span else ""),
+    ]
+    head_cells: List[Any] = ([icon_flow] if icon_flow is not None else []) + [[
+        Paragraph("Chatverlauf", ParagraphStyle(
+            "hist_title", fontName=_FONTS["bold"], fontSize=17, leading=21, textColor=_C.dark,
+        )),
+        Paragraph(" · ".join(head_bits), styles["subtitle"]),
+        Paragraph(
+            "<font color='#ED4245'>Vertraulich — nur für den Bot-Owner bestimmt.</font> "
+            "Nicht weitergeben.", styles["subtitle"],
+        ),
+    ]]
+    head_widths = [24 * mm, CONTENT_WIDTH - 24 * mm] if icon_flow is not None else [CONTENT_WIDTH]
+    head = Table([head_cells], colWidths=head_widths)
+    head.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    flowables.append(head)
+    flowables.append(HRFlowable(width="100%", thickness=1.1, color=_C.blurple, spaceAfter=3 * mm))
+    if not msgs:
+        flowables.append(Paragraph(
+            "Keine Nachrichten abrufbar (leer, keine Historie-Rechte oder Kanal nicht gefunden).",
+            styles["body"]))
+
+    for m in msgs:
+        flowables.extend(_message_flowables(m, styles, msg_ctx))
+        flowables.append(Spacer(1, 2.4 * mm))
+
+    await progress(88, "PDF-Datei wird geschrieben …")
+    pdf_bytes = _render_pdf(
+        flowables,
+        header_left=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
+        footer_left=(
+            "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
+            + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+        ),
+        title=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
+        subject=f"Chatverlauf von #{getattr(channel, 'name', '?')} "
+                f"in {guild.name} (ID {guild.id})",
+    )
     await progress(100, "PDF fertiggestellt.")
     log.info(
-        "Server-Dokument für '%s' (ID %s) erstellt: %d KB, %d Kategorien, %d Rollen, %d Emojis, "
-        "%d Sticker, %d Mitglieder detailliert, %d Kanäle mit Nachrichten, %d/%d Bilder",
-        guild.name, guild.id, len(pdf_bytes) // 1024,
-        len(categories), len(roles), len(emojis), len(stickers),
-        len(detailed_members), sum(1 for v in channel_messages.values() if v),
-        sum(1 for v in image_cache.values() if v), len(image_cache),
+        "Chatverlauf-PDF für #%s in '%s' (ID %s) erstellt: %d KB, %d Nachrichten",
+        getattr(channel, "name", "?"), guild.name, guild.id,
+        len(pdf_bytes) // 1024, len(msgs),
     )
     return pdf_bytes

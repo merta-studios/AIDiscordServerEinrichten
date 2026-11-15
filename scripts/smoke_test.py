@@ -969,6 +969,9 @@ async def t_prompt(h: Harness) -> None:
     check("Server-Übersicht: 'Server-Dokument erstellen'-Button vorhanden",
           any(cid.startswith("relay:admin:create_doc:") for cid in detail_buttons),
           str(detail_buttons))
+    check("Server-Übersicht: 'Chatverlauf abrufen'-Button vorhanden",
+          any(cid.startswith("relay:admin:history:") for cid in detail_buttons),
+          str(detail_buttons))
 
     leave_cleanup = guild_remove_notify_view(g_smoke, None, "Bot wurde gekickt — Grund: Test", cleanup={
         "sessions_revoked": 2,
@@ -1009,8 +1012,8 @@ async def t_pdf(h: Harness) -> None:
           "ping" in prepared.lower() and "<:ping:" not in prepared, prepared)
     check("PDF: Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
     markup = _clean("👋 👍🏽 🎉 𝗖𝗵𝗮𝘁 𝕏 𝔊 ✓ 中文 Привет")
-    check("PDF: Emoji-Font-Markup wird gesetzt (👋 sichtbar)",
-          "name='DejaVu-emoji'" in markup and "👋" in markup, markup[:220])
+    check("PDF: Emojis werden als Apple-Inline-Bilder gesetzt (iOS-Look)",
+          "<img src=" in markup and 'valign="middle"' in markup, markup[:220])
     check("PDF: Math-Font-Markup für 𝗖𝗵𝗮𝘁 & Co.",
           "name='DejaVu-math'" in markup and "𝗖" in markup and "𝕏" in markup, markup[:220])
     check("PDF: DejaVu-fähige Zeichen bleiben ohne Font-Tag",
@@ -1070,8 +1073,10 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: Fortschritt läuft bis 100 %", bool(progress_seen) and progress_seen[-1] == 100,
           str(progress_seen))
     n_fonts = len(_re.findall(rb"/FontFile2", pdf_bytes))
-    check("PDF: Fonts eingebettet (≥ 5: Sans, Bold, Mono, Emoji, Math)",
-          n_fonts >= 5, f"{n_fonts} FontFile2-Streams")
+    # Emojis laufen über Apple-Inline-Bilder — NotoEmoji wird nur noch im
+    # Fallback (fehlendes Sheet) eingebettet, daher ≥ 4 statt ≥ 5.
+    check("PDF: Fonts eingebettet (≥ 4: Sans, Bold, Mono, Math — Emoji via Apple-Bilder)",
+          n_fonts >= 4, f"{n_fonts} FontFile2-Streams")
     check("PDF: mehrere Seiten", pdf_bytes.count(b"/Type /Page") >= 5,
           str(pdf_bytes.count(b"/Type /Page")))
     check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
@@ -1230,6 +1235,187 @@ async def t_docdelivery(h: Harness) -> None:
           deleted_again == 0, str(deleted_again))
 
 
+async def t_history_delivery(h: Harness) -> None:
+    """
+    Chatverlauf-Abruf aus dem Adminpanel: Button → Kanal-ID-Modal → PDF —
+    AUSSCHLIESSLICH per DM an den Bot-Owner (Application-Owner), niemals an
+    einen Server oder den Server-Owner. Alte „chatverlauf-*.pdf“-DMs werden
+    vor der neuen Zustellung gelöscht; Kanäle werden serverübergreifend
+    gefunden (der Bot muss im Server des Kanals sein).
+    """
+    print("── Chatverlauf-Abruf: Bot-Owner-Zustellung & Aufräumen ───────")
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    from types import SimpleNamespace
+
+    from bot.discord_bot import RelayClient
+
+    bot_owner = SimpleNamespace(id=424242424242424242, display_name="Bot-Betreiber")
+    bot_owner_user = None  # wird unten als _HUser angelegt
+
+    check("Erkennung: chatverlauf-*.pdf wird erkannt",
+          RelayClient._is_history_document_message(SimpleNamespace(
+              attachments=[SimpleNamespace(filename="chatverlauf-123-456.pdf")])))
+    check("Erkennung: Server-Dokument ist KEIN Chatverlauf-PDF",
+          not RelayClient._is_history_document_message(SimpleNamespace(
+              attachments=[SimpleNamespace(filename="server-dokument-123.pdf")])),
+          "server-dokument-123.pdf")
+
+    class _HDM:
+        def __init__(self) -> None:
+            self.messages: List[Any] = []
+
+        def history(self, limit=None):
+            async def gen():
+                for m in self.messages[: limit or None]:
+                    yield m
+            return gen()
+
+    class _HUser:
+        def __init__(self, uid: int, name: str) -> None:
+            self.id = uid
+            self.display_name = name
+            self.dm_channel: Optional[_HDM] = None
+            self.sent: List[Dict[str, Any]] = []
+
+        async def create_dm(self) -> _HDM:
+            if self.dm_channel is None:
+                self.dm_channel = _HDM()
+            return self.dm_channel
+
+        async def send(self, **kwargs: Any) -> Any:
+            self.sent.append(kwargs)
+            return SimpleNamespace(id=4242)
+
+    class _ProgMsg:
+        def __init__(self) -> None:
+            self.content = ""
+            self.edits: List[Optional[str]] = []
+
+        async def edit(self, content: Optional[str] = None, **kw: Any) -> None:
+            self.content = content or self.content
+            self.edits.append(content)
+
+    class _Followup:
+        def __init__(self) -> None:
+            self.msg = _ProgMsg()
+            self.calls: List[Any] = []
+
+        async def send(self, content: Optional[str] = None, wait: bool = True,
+                       ephemeral: bool = False, **kw: Any) -> Any:
+            self.calls.append((content, ephemeral))
+            if wait:
+                return self.msg
+            return SimpleNamespace(id=1)
+
+    users = {bot_owner.id: _HUser(bot_owner.id, "Bot-Betreiber")}
+    bot_owner_user = users[bot_owner.id]
+    client = RelayClient.__new__(RelayClient)
+    client.config = SimpleNamespace(bot_owner_id=bot_owner.id)
+    client.get_user = lambda uid: users.get(uid)  # type: ignore[method-assign]
+    client.fetch_user = users.get  # type: ignore[method-assign]
+    client.state = SimpleNamespace(http_session=None)
+
+    tmpdir = _tempfile.mkdtemp(prefix="histdelivery-")
+    state_path = _os.path.join(tmpdir, "delivery.json")
+    client._doc_delivery_state_path = lambda: state_path  # type: ignore[method-assign]
+
+    async def _app_info() -> Any:
+        return SimpleNamespace(owner=bot_owner_user)
+
+    client.application_info = _app_info  # type: ignore[method-assign]
+
+    # Kanal serverübergreifend finden (der Bot muss im Server sein)
+    found = SimpleNamespace(id=123, name="ziel")
+    g_empty = SimpleNamespace(
+        id=1, name="A",
+        get_channel=lambda cid: None, get_thread=lambda cid: None,
+    )
+    g_hit = SimpleNamespace(
+        id=2, name="B",
+        get_channel=lambda cid: found if cid == 123 else None,
+        get_thread=lambda cid: None,
+    )
+    res = await client._resolve_history_channel(123, None, guilds=[g_empty, g_hit])
+    check("Kanal serverübergreifend gefunden", res is found, str(res))
+    res_none = await client._resolve_history_channel(999, None, guilds=[g_empty, g_hit])
+    check("Kanal ohne Bot-Mitgliedschaft → None", res_none is None, str(res_none))
+
+    # E2E: kompletter Ablauf (leerer Kanal → PDF → DM an Bot-Owner)
+    fguild = SimpleNamespace(
+        id=555, name="HistServer", roles=[], channels=[], members=[],
+        member_count=0, emojis=[], stickers=[], icon=None, owner=None, owner_id=1,
+    )
+
+    async def _gen(limit=None):
+        if False:
+            yield  # leerer Verlauf
+
+    fchannel = SimpleNamespace(
+        id=777, name="verlauf", guild=fguild, type=None,
+        history=lambda limit=None: _gen(limit),
+    )
+    interaction = SimpleNamespace(followup=_Followup())
+    await client._handle_admin_history(interaction, fchannel)
+
+    owner_user = users[bot_owner.id]
+    check("Chatverlauf-PDF ging an den Bot-Owner", len(owner_user.sent) == 1,
+          str(len(owner_user.sent)))
+    if owner_user.sent:
+        fname = getattr(owner_user.sent[0].get("file"), "filename", "")
+        check("Dateiname chatverlauf-<server>-<kanal>.pdf",
+              fname.startswith("chatverlauf-555-777") and fname.endswith(".pdf"), fname)
+        check("DM-Text: vertraulich, nur Bot-Owner",
+              "nur für dich" in (owner_user.sent[0].get("content") or ""),
+              (owner_user.sent[0].get("content") or "")[:120])
+    state = _json.load(open(state_path, encoding="utf-8"))
+    hist_state = state.get("last_history_delivery") or {}
+    check("Status-File: last_history_delivery gespeichert",
+          hist_state.get("channel_id") == 777 and hist_state.get("recipient_id") == bot_owner.id,
+          str(state))
+    check("Fortschritt endet mit ✅", bool(interaction.followup.msg.edits)
+          and "✅" in (interaction.followup.msg.edits[-1] or ""),
+          str(interaction.followup.msg.edits[-1:]))
+
+    # Fehlschlag: Application-Owner unlesbar → NICHT versendet (nie Server-Owner)
+    async def _app_info_fail() -> Any:
+        raise discord.HTTPException(
+            SimpleNamespace(status=500, reason="Internal Server Error"), "kaputt")
+
+    client.application_info = _app_info_fail  # type: ignore[method-assign]
+    owner_user.sent.clear()
+    interaction_fail = SimpleNamespace(followup=_Followup())
+    await client._handle_admin_history(interaction_fail, fchannel)
+    check("Ohne Application-Info: kein Versand (nie Server/Server-Owner)",
+          len(owner_user.sent) == 0 and bool(interaction_fail.followup.calls)
+          and "nicht" in (interaction_fail.followup.calls[0][0] or ""),
+          str(interaction_fail.followup.calls[:1]))
+    client.application_info = _app_info  # type: ignore[method-assign]
+
+    # Prä-Zustellungs-Aufräumen: alte chatverlauf-*.pdf-DMs werden gelöscht
+    class _HMsg:
+        def __init__(self, mid: int, filename: str) -> None:
+            self.id = mid
+            self.attachments = [SimpleNamespace(filename=filename)]
+            self.deleted = False
+
+        async def delete(self) -> None:
+            self.deleted = True
+
+    await users[bot_owner.id].create_dm()
+    dm = users[bot_owner.id].dm_channel
+    assert dm is not None
+    m_hist = _HMsg(5, "chatverlauf-111-222.pdf")
+    m_other = _HMsg(6, "wichtiges-protokoll.pdf")
+    dm.messages = [m_hist, m_other]
+    _json.dump({"last_history_delivery": {"recipient_id": bot_owner.id, "message_id": 5}},
+               open(state_path, "w", encoding="utf-8"))
+    deleted = await client._cleanup_previous_history_documents(bot_owner.id)
+    check("Prä-Zustellung: alte Chatverlauf-DM gelöscht, fremde bleibt",
+          deleted == 1 and m_hist.deleted and not m_other.deleted, f"{deleted} gelöscht")
+
+
 async def t_security(h: Harness) -> None:
     print("── Sicherheits-Grundlagen ────────────────────────────────────")
     api = h.api("danger")
@@ -1346,7 +1532,8 @@ async def run_tests() -> int:
         ("errors", t_errors), ("setup", t_setup), ("lifecycle", t_session_lifecycle),
         ("ratelimit", t_ratelimit), ("write", t_write), ("arena", t_arena),
         ("prompt", t_prompt), ("pdf", t_pdf), ("limit", t_session_limit),
-        ("docdelivery", t_docdelivery), ("security", t_security),
+        ("docdelivery", t_docdelivery), ("historydelivery", t_history_delivery),
+        ("security", t_security),
     )
     selected = [g for g in sys.argv[1:] if not g.startswith("-")] or [name for name, _ in groups]
 
