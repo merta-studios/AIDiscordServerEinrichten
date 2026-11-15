@@ -1601,6 +1601,9 @@ async def test_owner_features() -> None:
     parsed_leave = _parse_admin_custom_id(_admin_guild_custom_id("leave_confirm", 1000, 1, "abc"))
     check("Admin-Custom-ID: LeaveConfirm-Aktion überlebt den Roundtrip",
           parsed_leave == {"action": "leave_confirm", "guild_id": 1000, "page": 1, "query": "abc"}, str(parsed_leave))
+    parsed_history = _parse_admin_custom_id(_admin_guild_custom_id("history", 1000, 0, ""))
+    check("Admin-Custom-ID: Chatverlauf-Aktion überlebt den Roundtrip",
+          parsed_history == {"action": "history", "guild_id": 1000, "page": 0, "query": ""}, str(parsed_history))
     check("Admin-Custom-ID bleibt unter Discords 100-Zeichen-Limit",
           len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40)) <= 100,
           str(len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40))))

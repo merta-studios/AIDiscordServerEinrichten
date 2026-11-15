@@ -402,6 +402,16 @@ die Owner-ID. Die Liste zeigt:
   aktualisierten Liste zurück. Dabei werden automatisch alle Serverdaten
   gelöscht (KI-Tokens gestoppt, DB-Verknüpfung entfernt, exklusive
   Datenbanken geleert).
+- **Chatverlauf abrufen:** Button 💬 *Chatverlauf abrufen* öffnet ein
+  Eingabefenster für eine **Kanal-ID** (steht im Server-Dokument beim jeweiligen
+  Kanal). Der Bot prüft, ob er in dem Server mit diesem Kanal ist, ruft dann den
+  **kompletten** Chatverlauf ab und erstellt ein PDF — mit Apple-Emojis,
+  Custom-Emojis, Bildanhängen, Komponenten, Embeds und aufgelösten
+  Mention-Namen (`@Rolle`, `#kanal`, `@Mitglied`; ausgetretene Mitglieder mit
+  rotem „nicht mehr im Server“-Hinweis). Das PDF geht **ausschließlich per DM
+  an den Bot-Owner** — niemals an einen Server oder den Server-Owner; ist der
+  Bot-Owner nicht ermittelbar, wird gar nicht versendet. Jede neue Zustellung
+  löscht die vorherige Chatverlauf-DM automatisch.
 - **Zurück-Button:** Bringt dich mit gemerkter Seite und aktivem Suchbegriff
   zurück in die Listenansicht.
 
@@ -764,12 +774,12 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 314 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 326 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/pdf_document_test.py   # 41 Prüfungen: Server-Dokument (PDF) mit eingebetteten Bildern, Fonts, Emojis
-python scripts/login_recovery_test.py # 206 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
+python scripts/pdf_document_test.py   # 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) mit Apple-Emojis, Bildern, Fonts
+python scripts/login_recovery_test.py # 207 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 
 # Bereits zugestellte Server-Dokument-DMs sofort löschen (ohne Deploy):
@@ -792,7 +802,7 @@ Discord-Client ([`scripts/_fake_discord.py`](scripts/_fake_discord.py)) und prü
 | `write` | **Alle sechs Vorlagen werden wirklich ausgeführt** — Rollen, Kategorien, Kanäle, Nachrichten, Invites, AutoMod |
 | `arena` | Webhook-Personen (Anlegen/Wiederverwenden/`/send`), Bot-Profil via `PATCH /members/me`, Guides, echte `<#key>`-Mentions im Setup, Purge vor dem Erneuern, Platzhalter-Warnung |
 | `prompt` | Prompt-Varianten transportieren Hygiene/Personas/Branding/Grenzen; `capabilities.conventions` komplett |
-| `pdf` | Server-Dokument: DejaVu-Fonts eingebettet, Emojis → deutsche Wörter, Notdef-frei, Build läuft auch ohne erreichbare Avatare |
+| `pdf` | Server-Dokument: DejaVu-Fonts eingebettet, Apple-Emojis als farbige Inline-Bilder, Notdef-frei, Build läuft auch ohne erreichbare Avatare |
 | `limit` | Sitzungs-Limit pro Server, Auto-Revoke des ältesten Tokens |
 | `security` | Kein Token-Leak in Antworten, Logs oder der Console; CORS; Header |
 
@@ -1039,9 +1049,9 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        314 Prüfungen ohne Discord-Verbindung
-│   ├── pdf_document_test.py 41 Prüfungen: Server-Dokument (PDF) — Bilder & Fonts eingebettet
-│   ├── login_recovery_test.py 206 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── smoke_test.py        326 Prüfungen ohne Discord-Verbindung
+│   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
+│   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/

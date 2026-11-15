@@ -70,7 +70,7 @@ from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, now_utc
-from .web.pdf_document import build_server_document
+from .web.pdf_document import build_channel_history_pdf, build_server_document
 
 log = logging.getLogger("relay.discord")
 
@@ -359,7 +359,7 @@ def _parse_admin_custom_id(custom_id: str) -> Optional[Dict[str, Any]]:
     if action == "search":
         return {"action": "search", "page": 0, "query": ""}
 
-    if action in ("guild", "invite", "leave", "leave_confirm", "create_doc"):
+    if action in ("guild", "invite", "leave", "leave_confirm", "create_doc", "history"):
         guild_id_raw = parts[1] if len(parts) > 1 else ""
         try:
             guild_id: Optional[int] = int(guild_id_raw)
@@ -615,6 +615,7 @@ def admin_guild_detail_view(
             discord.ui.TextDisplay(f"⚠️ **Hinweis:** {notice}"),
         ])
 
+    # Zwei Reihen: Discord erlaubt max. 5 Buttons pro ActionRow.
     buttons = [
         discord.ui.Button(
             label="Zurück", emoji="◀️", style=discord.ButtonStyle.secondary,
@@ -633,6 +634,10 @@ def admin_guild_detail_view(
             custom_id=_admin_guild_custom_id("create_doc", guild.id, page, query),
         ),
         discord.ui.Button(
+            label="Chatverlauf abrufen", emoji="💬", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_guild_custom_id("history", guild.id, page, query),
+        ),
+        discord.ui.Button(
             label="Schließen", emoji="✖️", style=discord.ButtonStyle.secondary,
             custom_id=_admin_custom_id("close", page, query),
         ),
@@ -640,7 +645,8 @@ def admin_guild_detail_view(
 
     components.extend([
         discord.ui.Separator(),
-        discord.ui.ActionRow(*buttons),
+        discord.ui.ActionRow(*buttons[:4]),
+        discord.ui.ActionRow(*buttons[4:]),
     ])
 
     container = discord.ui.Container(
@@ -721,6 +727,80 @@ class AdminSearchModal(discord.ui.Modal, title="🔍 Server suchen"):
                 await interaction.followup.send(f"⚠️ Suche fehlgeschlagen: {error}", ephemeral=True)
             else:
                 await interaction.response.send_message(f"⚠️ Suche fehlgeschlagen: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
+    """
+    Fragt die Kanal-ID ab (steht im Server-Dokument) und schickt danach das
+    komplette Chatverlauf-PDF an den **Bot-Owner** — niemals an einen Server
+    oder den Server-Owner.
+    """
+
+    channel_id = discord.ui.TextInput(
+        label="Kanal-ID (steht im Server-Dokument)",
+        placeholder="z. B. 1234567890123456789",
+        min_length=5,
+        max_length=25,
+        required=True,
+    )
+
+    def __init__(self, client: "RelayClient", guild: Optional[discord.Guild]) -> None:
+        super().__init__(timeout=300)
+        self.client = client
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Gleiches Guard-Prinzip wie das Panel: nur der Bot-Owner.
+        if int(getattr(self.client.config, "bot_owner_id", 0) or 0) == 0:
+            return
+        if interaction.user.id != self.client.config.bot_owner_id:
+            log.warning("Chatverlauf-Abruf von %s — nicht der Bot-Owner.",
+                        getattr(interaction.user, "id", "?"))
+            return
+
+        raw = (self.channel_id.value or "").strip()
+        if not raw.isdigit():
+            await interaction.response.send_message(
+                "❌ Das ist keine Kanal-ID — bitte nur Ziffern eingeben "
+                "(die ID steht im Server-Dokument beim jeweiligen Kanal).",
+                ephemeral=True,
+            )
+            return
+        cid = int(raw)
+
+        # 1) Im Server, aus dem der Button kam; 2) in allen Servern des Bots —
+        # der Bot muss in dem Server sein, sonst gibt es den Kanal für ihn nicht.
+        channel = await self.client._resolve_history_channel(cid, self.guild)
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ Kanal nicht gefunden — der Bot ist (nicht mehr) in dem Server "
+                f"mit dem Kanal `{cid}`, oder die ID ist falsch.",
+                ephemeral=True,
+            )
+            return
+        if not hasattr(channel, "history") or not isinstance(
+            channel, (discord.TextChannel, discord.Thread)
+        ):
+            await interaction.response.send_message(
+                "❌ Dieser Kanal hat keinen abrufbaren Chatverlauf "
+                "(z. B. Sprachkanal, Kategorie oder Forum selbst).",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.client._handle_admin_history(interaction, channel)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        log.exception("Fehler im Chatverlauf-Abruf-Fenster.", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"⚠️ Chatverlauf-Abruf fehlgeschlagen: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    f"⚠️ Chatverlauf-Abruf fehlgeschlagen: {error}", ephemeral=True)
         except discord.HTTPException:
             pass
 
@@ -1526,6 +1606,13 @@ class RelayClient(discord.Client):
             await self._handle_admin_create_doc(interaction, guild)
             return
 
+        if action == "history":
+            guild_id = parsed.get("guild_id")
+            guild = self.get_guild(guild_id) if guild_id else None
+            # Kanal-ID wird im Modal abgefragt (steht im Server-Dokument).
+            await interaction.response.send_modal(AdminHistoryModal(self, guild))
+            return
+
         if action == "leave":
             guild_id = parsed.get("guild_id")
             guild = self.get_guild(guild_id) if guild_id else None
@@ -1621,6 +1708,80 @@ class RelayClient(discord.Client):
         except discord.HTTPException as exc:
             log.warning("DM-Verlauf für %s nicht lesbar: %s", user_id, exc)
         return deleted
+
+    @staticmethod
+    def _is_history_document_message(message: Any) -> bool:
+        """True, wenn die Nachricht ein „chatverlauf-*.pdf“ anhängen hat."""
+        for att in getattr(message, "attachments", None) or []:
+            name = (getattr(att, "filename", "") or "").lower()
+            if name.startswith("chatverlauf-") and name.endswith(".pdf"):
+                return True
+        return False
+
+    async def _cleanup_previous_history_documents(self, new_recipient_id: int) -> int:
+        """
+        Löscht bereits zugestellte **Chatverlauf**-PDFs („chatverlauf-*.pdf“)
+        beim letzten Empfänger und beim neuen — es bleibt immer nur EIN
+        aktuelles Chatverlauf-PDF pro Zustellung übrig. Fehler blockieren nie.
+        """
+        state = self._load_doc_delivery()
+        record = state.get("last_history_delivery") or {}
+        targets: List[int] = []
+        rid = record.get("recipient_id")
+        if rid is not None and str(rid).lstrip("-").isdigit():
+            targets.append(int(rid))
+        if new_recipient_id not in targets:
+            targets.append(int(new_recipient_id))
+        total = 0
+        for uid in targets:
+            try:
+                user = self.get_user(uid) or await self.fetch_user(uid)
+                dm = getattr(user, "dm_channel", None) or await user.create_dm()
+            except discord.HTTPException:
+                continue
+            deleted = 0
+            try:
+                async for message in dm.history(limit=200):
+                    if self._is_history_document_message(message):
+                        try:
+                            await message.delete()
+                            deleted += 1
+                        except discord.HTTPException as exc:
+                            log.warning("Chatverlauf-DM %s konnte nicht gelöscht werden: %s", message.id, exc)
+            except discord.HTTPException as exc:
+                log.warning("DM-Verlauf für %s nicht lesbar: %s", uid, exc)
+            total += deleted
+        if targets:
+            state["last_history_delivery"] = {}
+            self._save_doc_delivery(state)
+        return total
+
+    async def _resolve_history_channel(
+        self, channel_id: int, context_guild: Optional[discord.Guild] = None,
+        *, guilds: Optional[List[discord.Guild]] = None,
+    ) -> Optional[Any]:
+        """
+        Findet einen Kanal anhand seiner ID — der Bot muss in dem Server sein.
+        Zuerst im Kontext-Server (aus dem der Button kam), dann in allen
+        Servern des Bots (Cache, sonst REST-Fetch). ``guilds`` überschreibt
+        die Serverliste (für Tests).
+        """
+        if guilds is None:
+            guilds = []
+            if context_guild is not None:
+                guilds.append(context_guild)
+            guilds.extend(g for g in self.guilds if g.id != getattr(context_guild, "id", None))
+        for guild in guilds:
+            channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+            if channel is None:
+                try:
+                    channel = await guild.fetch_channel(channel_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException,
+                        AttributeError, TypeError):
+                    channel = None
+            if channel is not None:
+                return channel
+        return None
 
     async def _cleanup_previous_documents(self, new_recipient_id: Optional[int] = None) -> int:
         """
@@ -1791,6 +1952,124 @@ class RelayClient(discord.Client):
             log.exception("Fehler beim Erstellen des Server-Dokuments für '%s'", guild.name)
             try:
                 await progress_msg.edit(content=f"❌ Fehler beim Erstellen des Dokuments: {exc}")
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                await interaction.followup.send(f"❌ Fehler: {exc}", ephemeral=True)
+
+    async def _handle_admin_history(
+        self, interaction: discord.Interaction, channel: Any
+    ) -> None:
+        """
+        Kompletter Chatverlauf eines Kanals als PDF — **ausschließlich** per DM
+        an den Bot-Owner (Application-Owner). Niemals an einen Server oder den
+        Server-Owner; ist der Bot-Owner nicht ermittelbar, wird NICHT versendet.
+
+        Wird aus AdminHistoryModal.on_submit aufgerufen (Response deferred).
+        """
+        guild = channel.guild
+        try:
+            app_info = await self.application_info()
+            recipient = app_info.owner if app_info is not None else None
+        except discord.HTTPException as exc:
+            log.warning("Application-Owner nicht ermittelbar (%s) — kein Chatverlauf-Versand.", exc)
+            recipient = None
+        if recipient is None:
+            await interaction.followup.send(
+                "❌ Der Bot-Owner konnte nicht ermittelt werden — der Chatverlauf "
+                "wird **nicht** versendet (niemals an Server oder Server-Owner).",
+                ephemeral=True,
+            )
+            return
+
+        progress_msg = await interaction.followup.send(
+            f"Chatverlauf von #{channel.name} wird erstellt (0 %) …", ephemeral=True, wait=True
+        )
+
+        async def _progress(percent: int, text: str) -> None:
+            try:
+                await progress_msg.edit(
+                    content=f"Chatverlauf von #{channel.name} wird erstellt ({percent} %) — {text}"
+                )
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
+
+        try:
+            http_session = getattr(self.state, "http_session", None)
+            if http_session is None:
+                http_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=60, connect=15),
+                )
+                own_session = True
+            else:
+                own_session = False
+            try:
+                pdf_bytes = await build_channel_history_pdf(
+                    channel, http_session, progress=_progress, max_messages=None
+                )
+            finally:
+                if own_session:
+                    await http_session.close()
+
+            file = discord.File(
+                io.BytesIO(pdf_bytes),
+                filename=f"chatverlauf-{guild.id}-{channel.id}.pdf",
+            )
+
+            # Vor der neuen Zustellung: alte Chatverlauf-DMs löschen (es bleibt
+            # nur das aktuelle PDF übrig). Fehler dürfen den Versand nie blockieren.
+            try:
+                cleaned = await self._cleanup_previous_history_documents(recipient.id)
+                if cleaned:
+                    log.info("Vor neuer Zustellung %d alte Chatverlauf-DM(s) gelöscht.", cleaned)
+            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
+                log.exception("Aufräumen alter Chatverlauf-DMs fehlgeschlagen — Versand läuft weiter.")
+
+            try:
+                sent = await recipient.send(
+                    content=(
+                        f"💬 **Chatverlauf von #{channel.name}** in **{guild.name}** "
+                        f"(Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
+                        "Dieses PDF enthält den **kompletten** Chatverlauf des Kanals "
+                        "(inkl. Apple-Emojis, Bildanhängen, Komponenten, Embeds und "
+                        "Mention-Namen) und wurde über das Adminpanel angefordert.\n\n"
+                        "_Vertraulich — nur für dich (Bot-Owner) bestimmt. Der Server "
+                        "selbst hat davon nichts bemerkt._"
+                    ),
+                    file=file,
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("Chatverlauf-PDF konnte nicht per DM an %s gesendet werden: %s",
+                            recipient.display_name, exc)
+                await progress_msg.edit(
+                    content=(
+                        f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an "
+                        f"{recipient.display_name}** zugestellt werden.\n"
+                        "Mögliche Ursache: DMs vom Bot sind deaktiviert oder es gibt "
+                        "keinen gemeinsamen Server."
+                    ),
+                )
+                return
+
+            state = self._load_doc_delivery()
+            state["last_history_delivery"] = {
+                "recipient_id": recipient.id,
+                "message_id": sent.id,
+                "guild_id": guild.id,
+                "channel_id": channel.id,
+                "channel_name": getattr(channel, "name", "?"),
+                "sent_at": now_utc().isoformat(),
+            }
+            self._save_doc_delivery(state)
+
+            await progress_msg.edit(
+                content=(
+                    f"✅ Chatverlauf von **#{channel.name}** ({len(pdf_bytes) // 1024} KB) erstellt "
+                    f"und per DM an **{recipient.display_name}** (Bot-Owner) gesendet."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt
+            log.exception("Fehler beim Erstellen des Chatverlaufs für '%s'", getattr(channel, "name", "?"))
+            try:
+                await progress_msg.edit(content=f"❌ Fehler beim Erstellen des Chatverlaufs: {exc}")
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                 await interaction.followup.send(f"❌ Fehler: {exc}", ephemeral=True)
 
