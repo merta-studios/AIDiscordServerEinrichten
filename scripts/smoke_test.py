@@ -1757,6 +1757,11 @@ async def t_history_delivery(h: Harness) -> None:
         check("Batching: 3 Nachrichten bei Batchgröße 1 → 3 Teil-PDFs",
               len(collected) == 3 and (meta or {}).get("parts") == 3
               and (meta or {}).get("messages") == 3, str(meta))
+        check("Batching: Rückgabe enthält nur Teil-GRÖSSEN (Bytes sofort verworfen)",
+              isinstance((meta or {}).get("bytes"), list)
+              and all(isinstance(n, int) for n in (meta or {}).get("bytes") or [])
+              and (meta or {}).get("bytes") == [len(b) for b, _, _ in collected],
+              str((meta or {}).get("bytes")))
         if collected:
             import pymupdf as _pm
             t1 = _pm.open(stream=collected[0][0], filetype="pdf")
@@ -1787,6 +1792,11 @@ async def t_history_delivery(h: Harness) -> None:
               len(collected) == 0 and raised_hist is not None
               and "RAM kritisch" in raised_hist,
               f"sent={len(collected)} exc={raised_hist}")
+        check("Teil-DM minimal: 'Teil 3/85:' ohne Boilerplate (Owner-Wunsch)",
+              db_mod._part_message_content(3, 85) == "Teil 3/85:"
+              and "Vertraulich" not in db_mod._part_message_content(3, 85)
+              and "Chatverlauf" not in db_mod._part_message_content(3, 85),
+              repr(db_mod._part_message_content(3, 85)))
     finally:
         _pdfmod.HISTORY_BATCH_MESSAGES = _saved_batch
         db_mod.current_rss_mb = _saved_rss

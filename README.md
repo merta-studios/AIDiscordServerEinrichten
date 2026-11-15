@@ -430,12 +430,22 @@ kritisch ab 420 MB mit automatischem Aufräumen: GC + PDF-Bildcaches schließen)
 Große Chatverläufe werden **streamend** verarbeitet und automatisch in
 mehrere **Teil-PDFs** aufgeteilt (je 100 Nachrichten): Es liegen nie alle
 Nachrichten im RAM — jede 100er-Gruppe wird direkt aus der Historie gelesen,
-gebaut, sofort per DM versendet und dann verworfen („fertige Sachen senden,
-Daten löschen, Platz für neue“); vor jedem weiteren Teil prüft ein RAM-Guard
-den Speicher. Die Fortschritts-Nachrichten zeigen einen **Ladebalken aus
-Emojis** (🟩⬜) und sind **normale Nachrichten** (kein „Nur du kannst das
-sehen“-Banner, kein Verwerfen-Button — sie bleiben auch nach einem
-Neustart des Discord-Clients sichtbar).
+gebaut, sofort per DM versendet und dann **vollständig verworfen** („fertige
+Sachen senden, Daten löschen, Platz für neue“) — auch die fertigen Teil-PDFs
+selbst bleiben nicht referenziert (nur ihre Größen fließen in die
+Ergebnis-Statistik; genau diese Retention war früher der kumulative OOM,
+der RAM stieg ~10 MB pro Teil und fiel nie wieder ab). Nach jedem Teil
+werden zusätzlich die Bild-Caches geleert, das Apple-Sprite-Sheet (~69 MB)
+geschlossen, GC und `malloc_trim` ausgeführt; vor jedem weiteren Teil prüft
+ein RAM-Guard den Speicher. Die Fortschritts-Nachrichten zeigen **zwei
+Balken** (Teile-Fortschritt + Schritt im laufenden Teil) und den **aktuellen
+RAM** live (🧠) — aus Emojis (🟩⬜) und als **normale Nachrichten** (kein „Nur
+du kannst das sehen“-Banner, kein Verwerfen-Button — sie bleiben auch nach
+einem Neustart des Discord-Clients sichtbar).
+
+Die **Teil-DMs selbst sind minimal**: nur `Teil 3/85:` und darunter die
+Datei (Dateiname enthält Server-/Kanal-ID und Teilnummer) — kein
+wiederholter Boilerplate-Text pro Teil.
 
 ### DM-Benachrichtigungen bei Beitritt & Verlassen
 
@@ -793,7 +803,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 353 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 355 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -1068,7 +1078,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        353 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        355 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
