@@ -452,7 +452,13 @@ reportlab/Pillow (früher ~3-10 MB pro Teil, die nie freigegeben wurden)
 sterben mit dem Prozess und können den Bot-Prozess gar nicht mehr erreichen.
 Schlägt ein Kind fehl, baut NUR dieses Teil als Fallback im Hauptprozess —
 der Lauf bricht nicht ab. glibc-Arenen sind auf 2 begrenzt (`M_ARENA_MAX`,
-sonst behalten Worker-Thread-Arenen freigegebenen Speicher). Nach jedem Teil
+sonst behalten Worker-Thread-Arenen freigegebenen Speicher). **Bild-Cache
+auf Disk:** Der Parent-Prozess hält pro Teil nur PFADSTRINGS — die
+konvertierten PNGs liegen als Dateien und werden vom Bau-Kind seitenweise
+gelesen (Page-Cache, den der Kernel bei Druck automatisch freigibt — kein
+anon-RAM); identische URLs (Avatare!) werden pro Lauf nur EINMAL geladen.
+Pro Teil landen RAM-Werte im Log („RAM (Parent) vor Bau/nach Bau“), damit
+sich ein OOM in den Render-Logs exakt zuordnen lässt. Nach jedem Teil
 werden zusätzlich die Bild-Caches geleert und GC ausgeführt; vor jedem
 weiteren Teil prüft ein RAM-Guard den **OOM-relevanten Container-RAM**. Die
 Fortschritts-Nachrichten zeigen **zwei
@@ -833,7 +839,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 365 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 366 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -916,7 +922,7 @@ akzeptiert diese Sequenz bei **Buttons** klaglos, lehnt sie aber bei
 bekannte Inkonsistenz der Discord-API). `defer()` war dabei immer erfolgreich
 — erst der `followup.send()` mit der fertigen Liste scheiterte, weshalb der
 Client bis zum Timeout „Bot denkt nach…“ zeigte. Auf `main` aktualisieren
-(`/api/health` → `version` sollte `1.0.6` oder neuer sein) und `/adminpanel`
+(`/api/health` → `version` sollte `1.0.7` oder neuer sein) und `/adminpanel`
 erneut ausführen. Im Render-Log steht bei diesem Fehler
 `followup.send() fehlgeschlagen … discord_error_code=…`.
 
@@ -1108,7 +1114,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        365 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        366 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
