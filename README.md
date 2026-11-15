@@ -410,8 +410,9 @@ die Owner-ID. Die Liste zeigt:
   Mention-Namen (`@Rolle`, `#kanal`, `@Mitglied`; ausgetretene Mitglieder mit
   rotem „nicht mehr im Server“-Hinweis). Das PDF geht **ausschließlich per DM
   an den Bot-Owner** — niemals an einen Server oder den Server-Owner; ist der
-  Bot-Owner nicht ermittelbar, wird gar nicht versendet. Jede neue Zustellung
-  löscht die vorherige Chatverlauf-DM automatisch.
+  Bot-Owner nicht ermittelbar, wird gar nicht versendet. Bereits zugestellte
+  Dokumente und Chatverläufe bleiben im Bot-Owner-Chat **bestehen** — nichts
+  wird mehr gelöscht.
 - **Zurück-Button:** Bringt dich mit gemerkter Seite und aktivem Suchbegriff
   zurück in die Listenansicht.
 
@@ -426,10 +427,15 @@ RAM-Stand — man sieht also sofort, wenn der Bot z. B. durch zu wenig RAM (OOM)
 neu gestartet ist, ohne auf Render-Logs warten zu müssen. Der Bot zählt seinen
 RAM selbst: alle 60 s landet der Stand in den Render-Logs (Warn ab 300 MB,
 kritisch ab 420 MB mit automatischem Aufräumen: GC + PDF-Bildcaches schließen).
-Große Chatverläufe werden automatisch in mehrere **Teil-PDFs** aufgeteilt
-(je 100 Nachrichten): Jeder fertige Teil wird sofort per DM versendet und dann
-verworfen („fertige Sachen senden, Daten löschen, Platz für neue“) — der
-RAM-Verbrauch bleibt flach, egal wie groß der Verlauf ist.
+Große Chatverläufe werden **streamend** verarbeitet und automatisch in
+mehrere **Teil-PDFs** aufgeteilt (je 100 Nachrichten): Es liegen nie alle
+Nachrichten im RAM — jede 100er-Gruppe wird direkt aus der Historie gelesen,
+gebaut, sofort per DM versendet und dann verworfen („fertige Sachen senden,
+Daten löschen, Platz für neue“); vor jedem weiteren Teil prüft ein RAM-Guard
+den Speicher. Die Fortschritts-Nachrichten zeigen einen **Ladebalken aus
+Emojis** (🟩⬜) und sind **normale Nachrichten** (kein „Nur du kannst das
+sehen“-Banner, kein Verwerfen-Button — sie bleiben auch nach einem
+Neustart des Discord-Clients sichtbar).
 
 ### DM-Benachrichtigungen bei Beitritt & Verlassen
 

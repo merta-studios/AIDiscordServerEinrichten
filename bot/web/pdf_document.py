@@ -2902,18 +2902,41 @@ async def build_channel_history_pdf(
     for mb in members:
         _MENTION_NAMES[mb.id] = getattr(mb, "display_name", None) or mb.name
 
-    msgs: List[Any] = []
+    # ── STREAMING (RAM-Kernfix): Nachrichten werden STÜCKWEISE aus der
+    # Historie gelesen und in Batches zu je HISTORY_BATCH_MESSAGES gebaut —
+    # es liegen NIE alle Nachrichten im RAM. Ein 8.500-Nachrichten-Verlauf
+    # hat vor dem Fix allein ~100+ MB Message-Objekte im Speicher gehalten
+    # (OOM-Neustart bei Teil 1/85); jetzt fließt er Teil für Teil durch.
     history = getattr(channel, "history", None)
+    ait: Optional[Any] = None
     if history is not None:
         try:
-            msgs = [m async for m in history(limit=max_messages)]
+            # oldest_first=True → Discord liefert ÄLTESTE zuerst (der echte
+            # Discord-Liefertyp ist neueste-zuerst; mit diesem Flag streamt
+            # er chronologisch, genau wie die Tests ihre Fakes liefern).
+            ait = history(limit=max_messages, oldest_first=True)
+        except TypeError:
+            # Fakes/Ältere Signaturen kennen kein oldest_first — deren
+            # Listen sind bereits chronologisch, also direkt verwenden.
+            try:
+                ait = history(limit=max_messages)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound,
+                    AttributeError, TypeError):
+                ait = None
         except (discord.Forbidden, discord.HTTPException, discord.NotFound,
                 AttributeError, TypeError):
-            msgs = []
-    msgs.reverse()  # ÄLTESTE zuerst
+            ait = None
 
-    # Mention-Namen aus den Nachrichten ergänzen (Autoren, Erwähnte, Rollen)
-    for m in msgs:
+    seen_count = 0
+    first_seen: Optional[Any] = None
+    last_seen: Optional[Any] = None
+
+    def _register(m: Any) -> None:
+        nonlocal seen_count, first_seen, last_seen
+        seen_count += 1
+        if first_seen is None:
+            first_seen = m
+        last_seen = m
         if getattr(m, "author", None) is not None:
             _MENTION_NAMES.setdefault(
                 getattr(m.author, "id", 0),
@@ -2926,22 +2949,16 @@ async def build_channel_history_pdf(
         for c in getattr(m, "channel_mentions", None) or []:
             _MENTION_NAMES.setdefault(c.id, c.name)
 
-    await progress(30, f"{len(msgs)} Nachrichten geladen — Aufbereitung startet …")
-
-    full_span = ""
-    if msgs:
-        full_span = (
-            f"{msgs[0].created_at.strftime('%d.%m.%Y %H:%M')} – "
-            f"{msgs[-1].created_at.strftime('%d.%m.%Y %H:%M')} UTC"
+    def _span(a: Optional[Any], b: Optional[Any]) -> str:
+        if a is None or b is None:
+            return ""
+        return (
+            f"{getattr(a.created_at, 'strftime', lambda _f: '')('%d.%m.%Y %H:%M')} – "
+            f"{getattr(b.created_at, 'strftime', lambda _f: '')('%d.%m.%Y %H:%M')} UTC"
         )
 
-    # ── Batching: Teile bilden ──────────────────────────────────────────────
-    if send_part is not None and len(msgs) > HISTORY_BATCH_MESSAGES:
-        batches = [msgs[i:i + HISTORY_BATCH_MESSAGES]
-                   for i in range(0, len(msgs), HISTORY_BATCH_MESSAGES)]
-    else:
-        batches = [msgs]
-    total = len(batches)
+    full_span = _span(first_seen, last_seen) if seen_count else ""
+    total = 0  # Gesamtzahl der Teile ist beim Streaming unbekannt (0 = offen)
 
     def _collect_batch(batch: List[Any]) -> Tuple[Dict[int, str], List[str],
                                                   Dict[int, Optional[str]], List[str]]:
@@ -3008,7 +3025,8 @@ async def build_channel_history_pdf(
                 f"{batch[0].created_at.strftime('%d.%m.%Y %H:%M')} – "
                 f"{batch[-1].created_at.strftime('%d.%m.%Y %H:%M')} UTC"
             )
-        title = "Chatverlauf" if total <= 1 else f"Chatverlauf — Teil {idx + 1} von {total}"
+        is_multi = total != 1  # total == 0 = streaming (mehrere Teile möglich)
+        title = "Chatverlauf" if not is_multi else f"Chatverlauf — Teil {idx + 1}"
         ch_type_name = str(getattr(getattr(channel, "type", None), "name", "kanal") or "kanal")
         head_bits = [
             f"Server <b>{_clean(guild.name)}</b> (ID {_clean(guild.id)})",
@@ -3017,10 +3035,11 @@ async def build_channel_history_pdf(
             f"{len(batch)} Nachricht{'en' if len(batch) != 1 else ''}"
             + (f" · Zeitraum {span}" if span else ""),
         ]
-        if total > 1:
-            head_bits.append(
-                f"Teil {idx + 1}/{total} des Verlaufs ({len(msgs)} Nachrichten insgesamt)"
-            )
+        if is_multi:
+            if total > 1:
+                head_bits.append(f"Teil {idx + 1} von {total}")
+            else:
+                head_bits.append(f"Teil {idx + 1} des Verlaufs")
         head_cells: List[Any] = ([icon_flow] if icon_flow is not None else []) + [[
             Paragraph(title, ParagraphStyle(
                 "hist_title", fontName=_FONTS["bold"], fontSize=17, leading=21, textColor=_C.dark,
@@ -3043,11 +3062,11 @@ async def build_channel_history_pdf(
         flows: List[Any] = [head,
                             HRFlowable(width="100%", thickness=1.1, color=_C.blurple,
                                        spaceAfter=3 * mm)]
-        if not msgs:
+        if seen_count == 0:
             flows.append(Paragraph(
                 "Keine Nachrichten abrufbar (leer, keine Historie-Rechte oder Kanal nicht gefunden).",
                 styles["body"]))
-        elif total > 1 and idx > 0:
+        elif is_multi and idx > 0:
             flows.append(Paragraph(
                 f"Fortsetzung des Verlaufs — Teil {idx + 1} beginnt bei "
                 f"{batch[0].created_at.strftime('%d.%m.%Y %H:%M')} UTC.", styles["subtitle"]))
@@ -3055,8 +3074,13 @@ async def build_channel_history_pdf(
 
     async def _build_and_deliver(idx: int, batch: List[Any]) -> bytes:
         """Ein Teil: Bilder laden → Flowables im Thread bauen → PDF → senden."""
-        label = f"Teil {idx + 1}/{total}" if total > 1 else "Chatverlauf"
-        base_pct = 30 + int(58 * idx / max(total, 1))
+        if total == 0:
+            label = f"Teil {idx + 1}"
+        elif total > 1:
+            label = f"Teil {idx + 1}/{total}"
+        else:
+            label = "Chatverlauf"
+        base_pct = (30 + int(58 * idx / max(total, 1))) if total else 38
         await progress(base_pct, f"{label}: Bilder werden geladen …")
 
         avatar_urls, att_urls, emoji_url_by_id, extra_urls = _collect_batch(batch)
@@ -3112,18 +3136,53 @@ async def build_channel_history_pdf(
         return pdf_bytes
 
     parts_bytes: List[bytes] = []
-    for idx, batch in enumerate(batches):
-        pdf_bytes = await _build_and_deliver(idx, batch)
+    part_idx = 0
+    batch: List[Any] = []
+    loaded_since_guard = 0
+
+    async def _maybe_guard() -> None:
+        nonlocal loaded_since_guard
+        loaded_since_guard += 1
+        if ram_guard is not None and loaded_since_guard >= 200:
+            loaded_since_guard = 0
+            await ram_guard()
+
+    async def _finish_batch() -> None:
+        nonlocal part_idx, batch, full_span
+        if not batch:
+            return
+        full_span = _span(first_seen, last_seen) if seen_count else full_span
+        pdf_bytes = await _build_and_deliver(part_idx, batch)
         parts_bytes.append(pdf_bytes)
+        part_idx += 1
+        batch = []
+
+    if ait is not None:
+        try:
+            async for m in ait:
+                _register(m)
+                batch.append(m)
+                await _maybe_guard()
+                if len(batch) >= HISTORY_BATCH_MESSAGES:
+                    await _finish_batch()
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            pass  # Historie bricht mitten im Stream ab — Bisheriges bleibt gültig
+    await _finish_batch()
+    if not parts_bytes:
+        # Leerer Verlauf: genau ein (leeres) PDF mit Hinweis
+        parts_bytes.append(await _build_and_deliver(0, []))
+        part_idx = 1
+    total = part_idx
 
     _close_apple_sheet()  # RAM: Sprite-Sheet freigeben (Crops bleiben gecacht)
 
     await progress(100, "Chatverlauf fertiggestellt.")
     log.info(
-        "Chatverlauf für #%s in '%s' (ID %s): %d Teil-PDF(s), %d Nachrichten, Zeitraum %s",
-        ch_name, guild.name, guild.id, total, len(msgs), full_span or "—",
+        "Chatverlauf für #%s in '%s' (ID %s): %d Teil-PDF(s), %d Nachrichten (streamend), Zeitraum %s",
+        ch_name, guild.name, guild.id, total, seen_count, _span(first_seen, last_seen) or "—",
     )
     if send_part is None:
         return parts_bytes[0]
-    return {"parts": total, "messages": len(msgs), "span": full_span,
+    return {"parts": total, "messages": seen_count,
+            "span": _span(first_seen, last_seen),
             "bytes": [len(b) for b in parts_bytes]}

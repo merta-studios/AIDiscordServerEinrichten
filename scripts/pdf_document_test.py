@@ -199,12 +199,17 @@ def _build_guild(base_url: str) -> Any:
     ]
 
     def _hist(msgs):
-        # discord.py liefert die Historie NEUESTE zuerst — die Liste unten ist
-        # nach created_at bereits neueste-zuerst sortiert (mid % 50 Stunden her).
-        async def gen(limit=None):
-            for m in msgs[: limit or None]:
-                yield m
-        return gen
+        # Wie der echte discord.py-HistoryIterator: NEUESTE zuerst; mit
+        # oldest_first=True chronologisch (so konsumiert ihn der Streamer).
+        def history(limit=None, oldest_first=False):
+            # msgs ist NEUESTE-zuerst sortiert — oldest_first kehrt um.
+            ordered = list(reversed(msgs)) if oldest_first else msgs
+
+            async def gen():
+                for m in ordered[: limit or None]:
+                    yield m
+            return gen()
+        return history
 
     def msg(mid, author, content, embeds=None, webhook_id=None):
         m = FakeMessage(mid, t1, author, content=content, embeds=embeds or [])

@@ -1629,9 +1629,13 @@ async def t_history_delivery(h: Harness) -> None:
     mchannel = g2.text_channels[0]
 
     def _hist_factory2(messages: List[Any]):
-        def history(limit=None):
+        # Wie der echte discord.py-HistoryIterator: neueste zuerst, mit
+        # oldest_first=True chronologisch (so konsumiert ihn der Streamer).
+        def history(limit=None, oldest_first=False):
+            ordered = messages if oldest_first else list(reversed(messages))
+
             async def gen():
-                for m in messages[: limit or None]:
+                for m in ordered[: limit or None]:
                     yield m
             return gen()
         return history
@@ -1648,7 +1652,7 @@ async def t_history_delivery(h: Harness) -> None:
         FakeMessage(910000000000000003, mchannel, gone_author,
                     content="Nachricht eines Verlassenen"),
     ]
-    mchannel.history = _hist_factory2(list(reversed(modal_msgs)))
+    mchannel.history = _hist_factory2(modal_msgs)
 
     owner2 = _HUser(555555555555555555, "Bot-Betreiber 2")
     users2 = {owner2.id: owner2}
@@ -1688,8 +1692,8 @@ async def t_history_delivery(h: Harness) -> None:
         return resp
 
     resp_ok = await run_modal(client2, g2, str(mchannel.id), owner2, _ProgMsg())
-    check("Modal antwortet SOFORT per send_message (Typ 4, kein defer)",
-          len(resp_ok.sent) == 1 and resp_ok.sent[0][1] is True
+    check("Modal antwortet SOFORT, NICHT-ephemeral (kein „Nur du“-Banner, kein Verwerfen)",
+          len(resp_ok.sent) == 1 and resp_ok.sent[0][1] is False
           and "wird erstellt" in (resp_ok.sent[0][0] or ""), str(resp_ok.sent))
     check("Modal-E2E: PDF per DM an den Bot-Owner",
           len(owner2.sent) == 1
@@ -1760,8 +1764,8 @@ async def t_history_delivery(h: Harness) -> None:
             t1.close()
             check("Batching: Teil 1 enthält die ÄLTESTE Nachricht (Hallo …)",
                   "Hallo" in part1_text, part1_text[:120])
-            check("Batching: Teil-Kopf nennt 'Teil 1 von 3'",
-                  "Teil 1 von 3" in part1_text, part1_text[:200])
+            check("Batching: Teil-Kopf nennt 'Teil 1 des Verlaufs'",
+                  "Teil 1 des Verlaufs" in part1_text, part1_text[:200])
 
         # RAM-Guard: kritischer RAM → Abbruch, NACH Teil 1 (der wurde schon
         # gesendet), kein weiterer Teil, Exception mit klarer Meldung.
