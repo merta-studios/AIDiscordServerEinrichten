@@ -22,6 +22,6 @@ web           aiohttp-Server (REST-API, Console, Healthcheck)
 main          Verdrahtet alles und startet Bot + Web im selben Event-Loop
 """
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 __botname__ = "AIDiscordServerEinrichten"
 __author__ = "mertastudios"

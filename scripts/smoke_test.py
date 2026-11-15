@@ -1147,6 +1147,26 @@ async def t_pdf(h: Harness) -> None:
                       ok3, f"raw={len(big_bytes)} cached={len(got) if got else None}")
         finally:
             await runner2.cleanup()
+
+        # 4) Disk-Modus (Chatverlauf): Cache hält nur PFADSTRINGS — die
+        # konvertierten PNG-Dateien binden keinen anon-RAM im Parent.
+        import shutil as _shutil
+        import tempfile as _tmpmod
+        _imgdir = _tmpmod.mkdtemp(prefix="t-disk-")
+        runner4, p4 = await _serve_one(big_bytes)
+        try:
+            async with _aiohttp.ClientSession() as s4:
+                cache4 = await pdf_mod._download_images(
+                    s4, [f"http://127.0.0.1:{p4}/img.png"], to_disk_dir=_imgdir)
+                val4 = cache4.get(f"http://127.0.0.1:{p4}/img.png")
+                ok4 = isinstance(val4, str) and os.path.isfile(val4)
+                if ok4:
+                    ok4 = _PILImage2.open(val4).size[0] <= 1024
+                check("RAM: Disk-Cache-Modus hält nur Pfade (Datei ≤1024 px)",
+                      ok4, f"val={str(val4)[:80]}")
+        finally:
+            await runner4.cleanup()
+            _shutil.rmtree(_imgdir, ignore_errors=True)
     finally:
         pdf_mod._MAX_IMAGE_BYTES = _saved_bytes
 

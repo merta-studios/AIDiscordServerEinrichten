@@ -45,6 +45,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -145,7 +146,7 @@ _MAX_IMAGE_BYTES = 8_000_000
 #: Anzeige-Größen im PDF ab (Breitbild-Banner bis ~1024 px ≈ 165 dpi).
 _FINALIZE_MAX_PX_W = 1024
 #: Max. 2 parallele PIL-Konvertierungen — jede kostet bis zu ~64 MB Spitze.
-_CONVERT_SEM = asyncio.Semaphore(2)
+_CONVERT_SEM = asyncio.Semaphore(1)  # 1 statt 2: halber Peak bei Bild-Konvertierung
 #: Max. Zeit für den kompletten PDF-Aufbau (Flowables + PIL + reportlab im
 #: Worker-Thread) — danach sichtbare Fehlermeldung statt ewiger Stille.
 _ASSEMBLY_TIMEOUT_S = 600.0
@@ -449,6 +450,21 @@ _apple_cdn_dead = False  # Netzfehler → für die Laufzeit auf Sheet-Fallback u
 
 #: Beobachtung (Tests): wie viele Teil-Bauten im isolierten Kindprozess liefen.
 _FORK_BUILDS = {"ok": 0}
+
+
+def _ram_short() -> str:
+    """Kompakter RAM-String für Log-Zeilen (Container-anon, Fallback Prozess)."""
+    try:
+        from bot.ram import container_memory_mb, current_rss_mb
+
+        used, limit = container_memory_mb()
+        if used > 0:
+            return (f"{used:.0f}/{limit:.0f} MB" if limit > 0
+                    else f"{used:.0f} MB (Container)")
+        proc = current_rss_mb()
+        return f"{proc:.0f} MB (Prozess)" if proc > 0 else "n/a"
+    except Exception:  # noqa: BLE001 — Log-Zeilen dürfen nie brechen
+        return "n/a"
 
 #: Candidate-Ranges für den Beginn/Fortlauf von Emoji-Sequenzen
 def _emoji_cp(o: int) -> bool:
@@ -799,13 +815,39 @@ async def _finalize_image(data: Optional[bytes]) -> Optional[bytes]:
         return await asyncio.to_thread(_finalize_image_sync, data)
 
 
+async def _finalize_image_to_disk(data: bytes, directory: str) -> Optional[str]:
+    """
+    Wie ``_finalize_image``, aber das Ergebnis landet als DATEI und nur der
+    PFAD wird zurückgegeben. Der Disk-Cache bindet keinen anon-RAM im
+    Parent-Prozess — die Kinder lesen die Dateien beim Bau seitenweise
+    (Page-Cache, den der Kernel bei Druck automatisch freigibt). Identische
+    URLs über mehrere Teile (Avatare!) werden nur EINMAL geladen.
+    """
+    png = await _finalize_image(data)
+    if not png:
+        return None
+    fd, path = tempfile.mkstemp(prefix="img-", suffix=".png", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(png)
+    except OSError:
+        return None
+    return path
+
+
 async def _download_image(
     session: aiohttp.ClientSession,
     url: str,
-    cache: Dict[str, Optional[bytes]],
+    cache: Dict[str, Any],
     semaphore: asyncio.Semaphore,
+    to_disk_dir: Optional[str] = None,
 ) -> None:
-    """Lädt ein Bild in den Byte-Cache (fehlertolerant, mit Hart-Timeout)."""
+    """Lädt ein Bild in den Cache (fehlertolerant, mit Hart-Timeout).
+
+    Mit ``to_disk_dir``: konvertiertes PNG wird als DATEI abgelegt und nur
+    der Pfad gecacht (Parent-RAM bleibt flach — der Peak-Killer der
+    Verlauf-Läufe). Ohne: Bytes im Cache (Server-Dokument, kleine Mengen).
+    """
     if url in cache:
         return
     async with semaphore:
@@ -830,7 +872,13 @@ async def _download_image(
             # alle Roh-Downloads gleichzeitig (bei großen Anhängen hunderte MB
             # → OOM-Kill des Containers: „Einfrieren" OHNE jegliches Log,
             # Render startet neu, die Fortschritts-Nachricht bleibt stehen).
-            cache[url] = await _finalize_image(data) if data else None
+            if data:
+                cache[url] = (
+                    await _finalize_image_to_disk(data, to_disk_dir)
+                    if to_disk_dir else await _finalize_image(data)
+                )
+            else:
+                cache[url] = None
         except asyncio.CancelledError:
             raise  # Budget-Abschaltung — NICHT als Bildfehler verschlucken
         except Exception as exc:  # noqa: BLE001 — ein fehlendes Bild darf nicht abbrechen
@@ -846,9 +894,11 @@ async def _download_images(
     session: aiohttp.ClientSession,
     urls: List[Optional[str]],
     progress_hook: Optional[Callable[[int, int], Any]] = None,
-) -> Dict[str, Optional[bytes]]:
+    to_disk_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Lädt alle Bild-URLs parallel (max. 8 gleichzeitig) → ``{url: bytes|None}``.
+    Lädt alle Bild-URLs parallel (max. 4 gleichzeitig) →
+    ``{url: bytes|None}`` — mit ``to_disk_dir``: ``{url: pfad|None}``.
 
     Ist gegen „ewiges Hängen“ gefeit: Jeder Request hat einen Hart-Timeout
     UND die gesamte Phase hat ein Budget (``_IMAGES_BUDGET_S``). Läuft das
@@ -862,12 +912,12 @@ async def _download_images(
     if not unique:
         return cache
     total = len(unique)
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(4)  # 4×8 MB Raw-Peak statt 8×8 MB
     started = time.monotonic()
     done = [0]
 
     async def _one_counted(u: str) -> None:
-        await _download_image(session, u, cache, semaphore)
+        await _download_image(session, u, cache, semaphore, to_disk_dir)
         done[0] += 1
         if progress_hook is not None and (
             done[0] % _IMAGES_PROGRESS_EVERY == 0 or done[0] == total
@@ -960,7 +1010,7 @@ def _pil_to_png_bytes(im: "_PILImage.Image", *, max_px_w: int, circle: bool) -> 
 
 
 def _image_flow(
-    data: Optional[bytes],
+    data: Optional[Any],
     *,
     max_w: float,
     max_h: float,
@@ -968,7 +1018,13 @@ def _image_flow(
     circle: bool = False,
 ) -> Optional[Image]:
     """
-    Bild-Bytes → in die Box (mm) eingepasstes ``Image``-Flowable.
+    Bild-QUELLE → in die Box (mm) eingepasstes ``Image``-Flowable.
+
+    ``data`` ist bytes **oder ein Pfad** (Disk-Cache-Modus des Verlaufs:
+    der Parent hält nur Pfade; die Datei wird vom Bau-Prozess seitenweise
+    gelesen — Page-Cache, kein anon-RAM). Pfade werden NICHT erneut
+    konvertiert (der Parent hat bereits auf ≤1024 px normalisiert) — nur
+    Kreis-Avatare brauchen eine kleine PIL-Maske.
 
     Ohne Pillow wird ein Fallback über ``ImageReader`` versucht (PNG/JPEG),
     sonst ``None`` — der Build bricht nie wegen eines Bildes.
@@ -977,20 +1033,34 @@ def _image_flow(
         return None
 
     png_bytes: Optional[bytes] = None
+    is_path = isinstance(data, str)
 
-    if _PILImage is not None:
-        try:
-            im = _PILImage.open(io.BytesIO(data))
-            png_bytes = _pil_to_png_bytes(
-                im, max_px_w=max(int(max_w * RENDER_PX_PER_MM), 32), circle=circle
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.debug("PIL-Konvertierung fehlgeschlagen (%s) — versuche Raw-Reader", exc)
-            png_bytes = None
+    if is_path:
+        if _PILImage is not None and circle:
+            try:
+                with _PILImage.open(data) as im:
+                    png_bytes = _pil_to_png_bytes(
+                        im, max_px_w=max(int(max_w * RENDER_PX_PER_MM), 32),
+                        circle=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Avatar-Maske fehlgeschlagen (%s) — nutze Datei direkt", exc)
+                png_bytes = None
+        payload: Any = png_bytes if png_bytes else data
+    else:
+        if _PILImage is not None:
+            try:
+                im = _PILImage.open(io.BytesIO(data))
+                png_bytes = _pil_to_png_bytes(
+                    im, max_px_w=max(int(max_w * RENDER_PX_PER_MM), 32), circle=circle
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("PIL-Konvertierung fehlgeschlagen (%s) — versuche Raw-Reader", exc)
+                png_bytes = None
+        payload = png_bytes if png_bytes else data
 
-    payload = png_bytes if png_bytes else data
     try:
-        probe = ImageReader(io.BytesIO(payload))
+        probe = ImageReader(payload if isinstance(payload, str) else io.BytesIO(payload))
         native_w, native_h = probe.getSize()
     except Exception as exc:  # noqa: BLE001
         log.debug("Bild nicht darstellbar: %s", exc)
@@ -1014,12 +1084,15 @@ def _image_flow(
         120.0 / max(h_mm, 0.01),
     )
     w_mm, h_mm = w_mm * scale, h_mm * scale
-    # Frisches BytesIO: das Image-Flowable liest erst beim Zeichnen
+    # Bei Pfaden: reportlab öffnet die Datei erst beim Zeichnen (streamend).
+    # Bei Bytes: frisches BytesIO, das Image-Flowable liest erst beim Zeichnen.
+    if isinstance(payload, str):
+        return Image(payload, width=w_mm * mm, height=h_mm * mm)
     return Image(io.BytesIO(payload), width=w_mm * mm, height=h_mm * mm)
 
 
-def _avatar_flow(data: Optional[bytes], size_mm: float) -> Optional[Image]:
-    """Kreisförmiger Avatar/Icon in exakter Quadratgröße."""
+def _avatar_flow(data: Optional[Any], size_mm: float) -> Optional[Image]:
+    """Kreisförmiger Avatar/Icon (bytes ODER Pfad) in exakter Quadratgröße."""
     flow = _image_flow(data, max_w=size_mm, max_h=size_mm, upscale=True, circle=True)
     if flow is None:
         return None
@@ -3226,8 +3299,11 @@ async def build_channel_history_pdf(
                                f"{label}: Bilder werden geladen ({done_n}/{total_n}) …")
 
         image_cache = await _download_images(http_session, image_urls,
-                                             progress_hook=_img_progress_part)
+                                             progress_hook=_img_progress_part,
+                                             to_disk_dir=_img_dir)
         _dl_ok = sum(1 for v in image_cache.values() if v)
+        log.info("%s: %d/%d Bilder auf Disk — RAM (Parent) vor Bau: %s", label,
+                 _dl_ok, len(image_cache), _ram_short())
         await _part_report(42, f"{label}: Bilder geladen ({_dl_ok}/{len(image_cache)}) — "
                                "PDF wird aufbereitet …")
 
@@ -3391,85 +3467,95 @@ async def build_channel_history_pdf(
         if send_part is not None:
             await send_part(pdf_bytes, idx + 1, total)
         part_idx_count[0] = idx + 1
+        log.info("%s: gesendet (%d KB) — RAM (Parent) nach Bau: %s", label,
+                 len(pdf_bytes) // 1024, _ram_short())
         await _part_report(100, f"{label} fertig und gesendet.")
         log.info("Chatverlauf-%s #%s: %d KB (%d Nachrichten)",
                  f"Teil {idx + 1}{von}" if total > 1 else "PDF",
                  ch_name, len(pdf_bytes) // 1024, len(batch))
         return pdf_bytes
 
-    parts_bytes: List[bytes] = []  # NUR im Rückgabe-Modus (send_part=None)
-    part_sizes: List[int] = []     # Streaming: nur GRÖSSEN — Bytes werden gesendet & verworfen
-    part_idx = 0
-    batch: List[Any] = []
-    loaded_since_guard = 0
+    # ── Bild-DISK-CACHE (Peak-Fix): Der Parent hält nur PFADSTRINGS — die
+    # konvertierten PNGs liegen als Dateien und werden vom Bau-Kind seitenweise
+    # gelesen (Page-Cache = vom Kernel freigebbar, kein anon-RAM). Identische
+    # URLs über Teile hinweg (Avatare!) werden nur EINMAL geladen/gewandelt.
+    _img_dir = tempfile.mkdtemp(prefix="verlauf-bilder-")
+    try:
+        parts_bytes: List[bytes] = []  # NUR im Rückgabe-Modus (send_part=None)
+        part_sizes: List[int] = []     # Streaming: nur GRÖSSEN — Bytes werden gesendet & verworfen
+        part_idx = 0
+        batch: List[Any] = []
+        loaded_since_guard = 0
 
-    async def _maybe_guard() -> None:
-        nonlocal loaded_since_guard
-        loaded_since_guard += 1
-        if ram_guard is not None and loaded_since_guard >= 200:
-            loaded_since_guard = 0
-            await ram_guard()
+        async def _maybe_guard() -> None:
+            nonlocal loaded_since_guard
+            loaded_since_guard += 1
+            if ram_guard is not None and loaded_since_guard >= 200:
+                loaded_since_guard = 0
+                await ram_guard()
 
-    async def _guard_before_part() -> None:
-        if ram_guard is not None:
-            await ram_guard()
+        async def _guard_before_part() -> None:
+            if ram_guard is not None:
+                await ram_guard()
 
-    async def _finish_batch() -> None:
-        nonlocal part_idx, batch, full_span
-        if not batch:
-            return
-        await _guard_before_part()
-        full_span = _span(first_seen, last_seen) if seen_count else full_span
-        pdf_bytes = await _build_and_deliver(part_idx, batch)
-        part_sizes.append(len(pdf_bytes))
-        if send_part is None:
-            parts_bytes.append(pdf_bytes)
-        else:
-            # Gesendet heißt VERGESSEN: Der Kumulativ-OOM (~10 MB pro Teil,
-            # Erst-OOM bei Teil 8, dann Teil 12 — RAM stieg monoton und fiel
-            # nie ab) kam daher, dass JEDE Teil-PDF bis zum Ende der Erstellung
-            # in ``parts_bytes`` referenziert blieb. GC und malloc_trim konnten
-            # den Speicher nicht freigeben, weil er die ganze Zeit benutzt
-            # wurde. Nur die GRÖSSE bleibt für die Rückgabe/Metadaten übrig.
-            pdf_bytes = None
-            gc.collect()
+        async def _finish_batch() -> None:
+            nonlocal part_idx, batch, full_span
+            if not batch:
+                return
+            await _guard_before_part()
+            full_span = _span(first_seen, last_seen) if seen_count else full_span
+            pdf_bytes = await _build_and_deliver(part_idx, batch)
+            part_sizes.append(len(pdf_bytes))
+            if send_part is None:
+                parts_bytes.append(pdf_bytes)
+            else:
+                # Gesendet heißt VERGESSEN: Der Kumulativ-OOM (~10 MB pro Teil,
+                # Erst-OOM bei Teil 8, dann Teil 12 — RAM stieg monoton und fiel
+                # nie ab) kam daher, dass JEDE Teil-PDF bis zum Ende der Erstellung
+                # in ``parts_bytes`` referenziert blieb. GC und malloc_trim konnten
+                # den Speicher nicht freigeben, weil er die ganze Zeit benutzt
+                # wurde. Nur die GRÖSSE bleibt für die Rückgabe/Metadaten übrig.
+                pdf_bytes = None
+                gc.collect()
+                try:
+                    from bot.ram import malloc_trim as _mtrim
+                    _mtrim()
+                except Exception:  # noqa: BLE001 — Trim ist Best-Effort
+                    pass
+            part_idx += 1
+            batch = []
+
+        if ait is not None:
             try:
-                from bot.ram import malloc_trim as _mtrim
-                _mtrim()
-            except Exception:  # noqa: BLE001 — Trim ist Best-Effort
-                pass
-        part_idx += 1
-        batch = []
+                async for m in ait:
+                    _register(m)
+                    batch.append(m)
+                    await _maybe_guard()
+                    if len(batch) >= HISTORY_BATCH_MESSAGES:
+                        await _finish_batch()
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                pass  # Historie bricht mitten im Stream ab — Bisheriges bleibt gültig
+        await _finish_batch()
+        if not parts_bytes and not part_sizes:
+            # Leerer Verlauf: genau ein (leeres) PDF mit Hinweis
+            pdf_bytes = await _build_and_deliver(0, [])
+            part_sizes.append(len(pdf_bytes))
+            if send_part is None:
+                parts_bytes.append(pdf_bytes)
+            part_idx = 1
+        total = part_idx
 
-    if ait is not None:
-        try:
-            async for m in ait:
-                _register(m)
-                batch.append(m)
-                await _maybe_guard()
-                if len(batch) >= HISTORY_BATCH_MESSAGES:
-                    await _finish_batch()
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-            pass  # Historie bricht mitten im Stream ab — Bisheriges bleibt gültig
-    await _finish_batch()
-    if not parts_bytes and not part_sizes:
-        # Leerer Verlauf: genau ein (leeres) PDF mit Hinweis
-        pdf_bytes = await _build_and_deliver(0, [])
-        part_sizes.append(len(pdf_bytes))
+        _close_apple_sheet()  # RAM: Sprite-Sheet freigeben (Crops bleiben gecacht)
+
+        await progress(100, "Chatverlauf fertiggestellt.")
+        log.info(
+            "Chatverlauf für #%s in '%s' (ID %s): %d Teil-PDF(s), %d Nachrichten (streamend), Zeitraum %s",
+            ch_name, guild.name, guild.id, total, seen_count, _span(first_seen, last_seen) or "—",
+        )
         if send_part is None:
-            parts_bytes.append(pdf_bytes)
-        part_idx = 1
-    total = part_idx
-
-    _close_apple_sheet()  # RAM: Sprite-Sheet freigeben (Crops bleiben gecacht)
-
-    await progress(100, "Chatverlauf fertiggestellt.")
-    log.info(
-        "Chatverlauf für #%s in '%s' (ID %s): %d Teil-PDF(s), %d Nachrichten (streamend), Zeitraum %s",
-        ch_name, guild.name, guild.id, total, seen_count, _span(first_seen, last_seen) or "—",
-    )
-    if send_part is None:
-        return parts_bytes[0]
-    return {"parts": total, "messages": seen_count,
-            "span": _span(first_seen, last_seen),
-            "bytes": part_sizes}
+            return parts_bytes[0]
+        return {"parts": total, "messages": seen_count,
+                "span": _span(first_seen, last_seen),
+                "bytes": part_sizes}
+    finally:
+        shutil.rmtree(_img_dir, ignore_errors=True)

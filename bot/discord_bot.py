@@ -831,6 +831,9 @@ class _ProgressRelay:
                     self.msg = None
                     return False
                 self.msg = await self.channel.send(content)
+                log.info("Fortschritt: neue Nachricht nach Token-Expiry "
+                         "(Kanal %s) — Balken läuft dort weiter.",
+                         getattr(self.channel, "id", "?"))
                 return True
             except Exception:  # noqa: BLE001 — Kanal nicht schreibbar
                 self.msg = None
