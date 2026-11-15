@@ -1082,6 +1082,74 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
           f"{len(pdf_bytes) // 1024} KB")
 
+    # ── Regression: Die Bild-Download-Phase darf sich NIEMALS ewig aufhängen ──
+    # Produktion (Render): ein Server blieb bei „Bilder werden geladen …" für
+    # immer stehen. Fix: Hart-Timeout pro Request + globales Budget für die
+    # ganze Phase + Fortschritts-Callback + Log-Ausgabe.
+    import time as _time
+    from aiohttp import web as _web
+
+    async def _stall_handler(_request: Any) -> Any:
+        await asyncio.sleep(300)  # simuliert einen CDN-Hänger
+        return _web.Response(body=b"x")
+
+    async def _ok_handler(_request: Any) -> Any:
+        return _web.Response(body=b"PNGDATA")
+
+    stall_app = _web.Application()
+    stall_app.router.add_get("/stall", _stall_handler)
+    stall_app.router.add_get("/ok", _ok_handler)
+    stall_port = free_port()
+    stall_runner = await start_web_server(stall_app, "127.0.0.1", stall_port)
+    stall_base = f"http://127.0.0.1:{stall_port}"
+    _saved_dl = (pdf_mod._IMAGE_TIMEOUT_S, pdf_mod._IMAGES_BUDGET_S,
+                 pdf_mod._IMAGES_PROGRESS_EVERY)
+    try:
+        pdf_mod._IMAGE_TIMEOUT_S = 1.0
+        pdf_mod._IMAGES_BUDGET_S = 60.0
+        pdf_mod._IMAGES_PROGRESS_EVERY = 1
+        async with _aiohttp.ClientSession() as s2:
+            t0 = _time.monotonic()
+            cache1 = await pdf_mod._download_images(s2, [f"{stall_base}/stall"])
+            elapsed1 = _time.monotonic() - t0
+            check("Hängender Bild-Request bricht per Hart-Timeout ab (kein ewiges Hängen)",
+                  cache1 == {f"{stall_base}/stall": None} and elapsed1 < 15,
+                  f"{elapsed1:.1f}s, cache={cache1}")
+
+            t0 = _time.monotonic()
+            cache_ok = await pdf_mod._download_images(s2, [f"{stall_base}/ok"])
+            elapsed_ok = _time.monotonic() - t0
+            check("Funktionierender Bild-Request liefert Bytes",
+                  cache_ok == {f"{stall_base}/ok": b"PNGDATA"} and elapsed_ok < 15,
+                  f"{elapsed_ok:.1f}s, cache={cache_ok}")
+
+            # Globales Budget: selbst wenn ALLE Requests hängen (und der
+            # per-Request-Timeout sie NICHT erwischt), kehrt die Phase zurück.
+            pdf_mod._IMAGE_TIMEOUT_S = 30.0
+            pdf_mod._IMAGES_BUDGET_S = 2.0
+            hook_calls: List[Any] = []
+
+            async def _hook(done_n: int, total_n: int) -> None:
+                hook_calls.append((done_n, total_n))
+
+            stall_url = f"{stall_base}/stall?budget=1"
+            ok_url = f"{stall_base}/ok?budget=2"
+            t0 = _time.monotonic()
+            cache_budget = await pdf_mod._download_images(
+                s2, [stall_url, ok_url], progress_hook=_hook)
+            elapsed_budget = _time.monotonic() - t0
+            check("Download-Budget bricht die GESAMTE Phase ab und kehrt zurück",
+                  isinstance(cache_budget, dict) and elapsed_budget < 12,
+                  f"{elapsed_budget:.1f}s")
+            check("Bereits geladene Bilder überleben den Budget-Abbruch",
+                  cache_budget.get(ok_url) == b"PNGDATA", str(list(cache_budget)))
+            check("Fortschritts-Callback wird aufgerufen",
+                  len(hook_calls) >= 1 and hook_calls[0][1] == 2, str(hook_calls[:3]))
+    finally:
+        (pdf_mod._IMAGE_TIMEOUT_S, pdf_mod._IMAGES_BUDGET_S,
+         pdf_mod._IMAGES_PROGRESS_EVERY) = _saved_dl
+        await stall_runner.cleanup()
+
 
 async def t_session_limit(h: Harness) -> None:
     print("── Sitzungs-Limit pro Server ─────────────────────────────────")
