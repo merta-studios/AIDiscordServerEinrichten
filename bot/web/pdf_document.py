@@ -142,6 +142,7 @@ class _C:
     pink = colors.HexColor("#EB459E")
     cyan = colors.HexColor("#00A8FC")
     gray_chip = colors.HexColor("#80848E")
+    red = colors.HexColor("#ED4245")
     white = colors.white
 
 
@@ -165,20 +166,54 @@ _FONT_FILES: Dict[str, Tuple[str, str]] = {
 }
 #: Optionale Zusatz-Fonts (fehlende Datei degradiert nur die Darstellung):
 #: * emoji — Monochromes Noto Emoji: Echte Emoji-Glyphen im PDF (👋 statt
-#:   „winkende Hand“), inkl. Hauttönen, ZWJ-Sequenzen und Regional-Indikatoren.
+#:   „winkende Hand“), inkl. ZWJ-Sequenzen und Regional-Indikatoren.
 #: * math — Noto Sans Math: Unicode-„Schriftarten“ wie 𝗖𝗵𝗮𝘁 (Mathematical
 #:   Alphanumeric Symbols, Fraktur, Double-Struck …), die DejaVu nicht kennt.
+#: * cjk_sc / cjk_kr — Noto Sans SC/KR (statische Regular-Instanzen):
+#:   Chinesisch (vereinfacht/traditionell), Japanisch (Kana+Kanji), Koreanisch
+#:   (Hangul), dazu CJK-Punkte, Circled/Fullwidth-Formen.
+#: * Scripts — die restlichen Sprach-Schriften, die DejaVu fehlen
+#:   (Indic, Thai/Lao/Khmer/Myanmar, Ethiopic, Cherokee, Tibetan …).
 _EXTRA_FONT_FILES: Dict[str, str] = {
     "emoji": "NotoEmoji.ttf",
     "math": "NotoSansMath.ttf",
+    "cjk_sc": "NotoSansSC.ttf",
+    "cjk_kr": "NotoSansKR.ttf",
+    "devanagari": "NotoSansDevanagari.ttf",
+    "bengali": "NotoSansBengali.ttf",
+    "gurmukhi": "NotoSansGurmukhi.ttf",
+    "gujarati": "NotoSansGujarati.ttf",
+    "oriya": "NotoSansOriya.ttf",
+    "tamil": "NotoSansTamil.ttf",
+    "telugu": "NotoSansTelugu.ttf",
+    "kannada": "NotoSansKannada.ttf",
+    "malayalam": "NotoSansMalayalam.ttf",
+    "sinhala": "NotoSansSinhala.ttf",
+    "thai": "NotoSansThai.ttf",
+    "lao": "NotoSansLao.ttf",
+    "myanmar": "NotoSansMyanmar.ttf",
+    "khmer": "NotoSansKhmer.ttf",
+    "ethiopic": "NotoSansEthiopic.ttf",
+    "cherokee": "NotoSansCherokee.ttf",
+    "mongolian": "NotoSansMongolian.ttf",
+    "tibetan": "NotoSerifTibetan.ttf",
 }
+#: Auswertungsreihenfolge in _font_markup (speziell → allgemein).
+_EXTRA_FONT_ORDER: Tuple[str, ...] = (
+    "emoji", "math", "cjk_sc", "cjk_kr",
+    "devanagari", "bengali", "gurmukhi", "gujarati", "oriya",
+    "tamil", "telugu", "kannada", "malayalam", "sinhala",
+    "thai", "lao", "myanmar", "khmer", "ethiopic", "cherokee",
+    "mongolian", "tibetan",
+)
 _FONTS: Dict[str, Optional[str]] = {role: fallback for role, (_file, fallback) in _FONT_FILES.items()}
 _FONTS.update({role: None for role in _EXTRA_FONT_FILES})  # bis geladen: None
 _FONTS_READY = False
 #: Menge der im Font vorhandenen Codepoints (für die Notdef-Filterung)
 _GLYPH_COVERAGE: Optional[set] = None
-#: Coverage der Zusatz-Fonts (None = Font nicht verfügbar)
-_FONT_COVERAGE: Dict[str, Optional[set]] = {"sans": None, "emoji": None, "math": None}
+#: Coverage je Font (None = nicht verfügbar); „sans“ ist die Basis-Abdeckung
+_FONT_COVERAGE: Dict[str, Optional[set]] = {"sans": None}
+_FONT_COVERAGE.update({role: None for role in _EXTRA_FONT_FILES})
 
 
 def _ensure_fonts() -> Dict[str, str]:
@@ -344,8 +379,10 @@ def _font_markup(escaped: str) -> str:
     𝕏, 𝔊) sichtbar, obwohl DejaVu sie nicht kennt. ``\\n`` wird zu ``<br/>``.
     """
     cov_sans = _FONT_COVERAGE.get("sans")
-    cov_emoji = _FONT_COVERAGE.get("emoji")
-    cov_math = _FONT_COVERAGE.get("math")
+    cascade: List[Tuple[str, set]] = [
+        (role, cov) for role in _EXTRA_FONT_ORDER
+        if (cov := _FONT_COVERAGE.get(role)) is not None
+    ]
     out: List[str] = []
     cur: Optional[str] = None
 
@@ -357,10 +394,9 @@ def _font_markup(escaped: str) -> str:
                 return None
         elif o < 0x100:  # kein DejaVu geladen: Base-14 deckt Latin-1 ab
             return None
-        if cov_emoji is not None and o in cov_emoji:
-            return "emoji"
-        if cov_math is not None and o in cov_math:
-            return "math"
+        for role, cov in cascade:
+            if o in cov:
+                return role
         return "drop"
 
     for ch in escaped:
@@ -975,6 +1011,74 @@ def _select_important_members(members: List[discord.Member], guild: discord.Guil
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+#: Lesbare Labels für die Discord-Komponententypen (Layouts v2 inklusive).
+_COMPONENT_TYPE_LABELS = {
+    "action_row": "Aktionsreihe",
+    "button": "Schaltfläche",
+    "string_select": "Auswahlmenü",
+    "user_select": "Benutzerauswahl",
+    "role_select": "Rollenauswahl",
+    "channel_select": "Kanalauswahl",
+    "mentionable_select": "Auswahl (Nutzer/Rolle)",
+    "text_input": "Text-Eingabe",
+    "text_display": "Text",
+    "thumbnail": "Vorschaubild",
+    "media_gallery": "Medien-Galerie",
+    "file": "Datei",
+    "separator": "Trennlinie",
+    "section": "Abschnitt",
+    "container": "Container",
+}
+_BUTTON_STYLE_LABELS = {
+    "primary": "Primär", "secondary": "Sekundär", "success": "Erfolg",
+    "danger": "Gefahr", "link": "Link", "premium": "Premium",
+}
+
+
+def _component_items(components: List[Any]) -> List[str]:
+    """
+    Komponenten-Baum → flache Liste beschreibender Einträge (eine Zeile je
+    Komponente). Container/Abschnitte/Aktionsreihen werden rekursiv
+    absteigend aufgelöst; Text-Displays werden mit ihrem Inhalt angezeigt.
+    """
+    items: List[str] = []
+
+    def _walk(comps: Any) -> None:
+        for comp in comps or []:
+            ctype = getattr(comp, "type", None)
+            cname = getattr(ctype, "name", None) or str(ctype)
+            label = _COMPONENT_TYPE_LABELS.get(cname, str(cname).replace("_", " "))
+
+            if cname in ("action_row", "section", "container"):
+                _walk(getattr(comp, "children", None))
+            elif cname == "text_display":
+                content = _prepare_text(getattr(comp, "content", None) or "")
+                text = _short(content, 180) if content else ""
+                items.append(f"{label}: {text}" if text else label)
+            elif cname == "button":
+                lbl = _prepare_text(getattr(comp, "label", None) or "")
+                style_name = str(getattr(getattr(comp, "style", None), "name", "") or "").lower()
+                style_lbl = _BUTTON_STYLE_LABELS.get(style_name, style_name)
+                suffix = f" ({style_lbl})" if style_lbl else ""
+                url = getattr(comp, "url", None)
+                link = f" → {url}" if (url and style_name == "link") else ""
+                items.append(f"{label} „{lbl}“{suffix}{link}" if lbl else f"{label}{suffix}{link}")
+            elif cname in ("string_select", "user_select", "role_select",
+                           "channel_select", "mentionable_select"):
+                ph = _prepare_text(getattr(comp, "placeholder", None) or "")
+                opts = getattr(comp, "options", None) or []
+                count = f", {len(opts)} Optionen" if opts else ""
+                items.append(f"{label} „{ph}“{count}" if ph else f"{label}{count}")
+            elif cname == "media_gallery":
+                media = getattr(comp, "items", None) or getattr(comp, "attachments", None) or []
+                items.append(f"{label} ({len(media)} Medien)" if media else label)
+            else:
+                items.append(label)
+
+    _walk(components)
+    return items
+
+
 def _components_to_text(components: List[discord.Component]) -> str:
     parts: List[str] = []
     for comp in components:
@@ -1475,14 +1579,23 @@ async def build_server_document(
         Paragraph("ID", styles["table_head_small"]),
     ]]
     for role in roles:
-        perm_names = sorted(
-            (name.replace("_", " ") for name, enabled in role.permissions if enabled),
-            key=_perm_sort_key,
-        )
-        perms_para = Paragraph(
-            " · ".join(_clean(n) for n in perm_names) or "— keine eigenen Berechtigungen —",
-            styles["table_small"],
-        )
+        is_admin = bool(getattr(role.permissions, "administrator", False))
+        if is_admin:
+            # Administrator heißt ALLE Berechtigungen — die Aufzählung der
+            # einzelnen Rechte wäre redundant, daher rot hervorgehoben.
+            perms_para = Paragraph(
+                "<b><font color='#ED4245'>ADMINISTRATOR — umfasst ALLE Berechtigungen</font></b>",
+                styles["table_small"],
+            )
+        else:
+            perm_names = sorted(
+                (name.replace("_", " ") for name, enabled in role.permissions if enabled),
+                key=_perm_sort_key,
+            )
+            perms_para = Paragraph(
+                " · ".join(_clean(n) for n in perm_names) or "— keine eigenen Berechtigungen —",
+                styles["table_small"],
+            )
         if role.color.value:
             color_para = Paragraph(
                 f"<font color='#{role.color.value:06x}'>●</font> "
@@ -1491,8 +1604,11 @@ async def build_server_document(
             )
         else:
             color_para = Paragraph("<font color='#9AA0AB'>●</font> Standard", styles["table_small"])
+        role_name_html = _clean(role.name)
+        if is_admin:
+            role_name_html = f"<font color='#ED4245'>{role_name_html}</font>"
         role_rows.append([
-            Paragraph(f"<b>{_clean(role.name)}</b>", styles["table"]),
+            Paragraph(f"<b>{role_name_html}</b>", styles["table"]),
             color_para,
             perms_para,
             Paragraph(
@@ -1797,12 +1913,27 @@ async def build_server_document(
                 comps = m.components or []
             except Exception:  # pragma: no cover — ältere discord.py-Versionen
                 comps = []
-            if comps:
-                comps_text = _short(_components_to_text(comps), COMPONENTS_TEXT_MAX_CHARS)
-                extras.append("Komponenten: " + comps_text)
+            comp_items: List[str] = _component_items(comps) if comps else []
             if extras:
                 body.append(Spacer(1, 0.8 * mm))
                 body.append(Paragraph(_clean(" | ".join(extras)), styles["table_muted"]))
+
+            # Komponenten strukturiert: eine Überschrift, dann je Komponente
+            # eine Bullet-Zeile (statt ein langer „·"-Ketten-Text).
+            if comp_items:
+                body.append(Spacer(1, 0.6 * mm))
+                body.append(Paragraph("<b>Komponenten:</b>", styles["table_muted"]))
+                for item in comp_items[:12]:
+                    body.append(Paragraph(
+                        f"•&nbsp;&nbsp;{_font_markup(_esc(_short(item, 160)))}",
+                        ParagraphStyle(
+                            "comp_item", parent=styles["table_muted"],
+                            leftIndent=8, firstLineIndent=-8,
+                        ),
+                    ))
+                if len(comp_items) > 12:
+                    body.append(Paragraph(
+                        f"(+{len(comp_items) - 12} weitere Komponenten)", styles["table_muted"]))
 
             # Nachricht als graues, abgerundetes Kästchen. Sicherheitsnetz
             # (LayoutError-Schutz): die Box-Höhe wird vorher gemessen — passt
