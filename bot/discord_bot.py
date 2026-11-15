@@ -1889,9 +1889,14 @@ class RelayClient(discord.Client):
 
         async def _progress(percent: int, text: str) -> None:
             try:
-                await progress_msg.edit(content=f"Server-Dokument wird erstellt ({percent} %) — {text}")
-            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                pass
+                await asyncio.wait_for(
+                    progress_msg.edit(
+                        content=f"Server-Dokument wird erstellt ({percent} %) — {text}"
+                    ),
+                    timeout=10,
+                )
+            except Exception:  # noqa: BLE001 — Fortschritt darf niemals blockieren
+                pass  # z. B. abgelaufenes Interaktions-Token — der Build läuft weiter
 
         try:
             http_session = getattr(self.state, "http_session", None)
@@ -2030,10 +2035,13 @@ class RelayClient(discord.Client):
             if progress_msg is None:
                 return
             try:
-                await progress_msg.edit(
-                    content=f"Chatverlauf von #{ch_name} wird erstellt ({percent} %) — {text}"
+                await asyncio.wait_for(
+                    progress_msg.edit(
+                        content=f"Chatverlauf von #{ch_name} wird erstellt ({percent} %) — {text}"
+                    ),
+                    timeout=10,
                 )
-            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            except Exception:  # noqa: BLE001 — Fortschritt darf niemals blockieren
                 pass  # z. B. Interaktions-Token nach 15 min abgelaufen — DM geht trotzdem raus
 
         try:
