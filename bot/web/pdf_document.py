@@ -131,6 +131,16 @@ _IMAGE_TIMEOUT_S = 20.0
 _IMAGES_BUDGET_S = 150.0
 #: Alle N fertigen Bildern eine Fortschrittsmeldung senden.
 _IMAGES_PROGRESS_EVERY = 10
+#: Ab wie vielen Sekunden ein einzelner Bild-Download als „langsam“ geloggt wird.
+_SLOW_IMAGE_S = 10.0
+#: Max. Pixel pro Bild — Header-Check VOR dem Dekodieren (PIL.open ist lazy).
+#: Schützt vor Dekodier-Bomben, die Minuten CPU fressen können.
+_MAX_IMAGE_PIXELS = 30_000_000
+#: Max. Zeit für den kompletten PDF-Aufbau (Flowables + PIL + reportlab im
+#: Worker-Thread) — danach sichtbare Fehlermeldung statt ewiger Stille.
+_ASSEMBLY_TIMEOUT_S = 600.0
+#: Intervall des Fortschritts-Tickers während der Aufbau-Phase (Sekunden).
+_ASSEMBLY_TICKER_S = 15.0
 COMPONENTS_TEXT_MAX_CHARS = 500
 #: Max. Höhe einer Nachrichten-Kästchen-Box in Punkt — darüber wird die
 #: Nachricht unboxiert (splittbar) gerendert (LayoutError-Schutz).
@@ -669,6 +679,7 @@ async def _download_image(
     async with semaphore:
         if url in cache:
             return
+        started = time.monotonic()
         try:
             # asyncio.wait_for als Sicherheitsnetz ÜBER dem aiohttp-Timeout:
             # fängt auch Hänger ab, die der Request-Timeout nicht erreicht
@@ -688,6 +699,10 @@ async def _download_image(
         except Exception as exc:  # noqa: BLE001 — ein fehlendes Bild darf nicht abbrechen
             log.debug("Bild konnte nicht geladen werden %s: %s", url, exc)
             cache[url] = None
+        finally:
+            _dur = time.monotonic() - started
+            if _dur > _SLOW_IMAGE_S:
+                log.warning("Langsamer Bild-Download (%.1f s): %s", _dur, url[:120])
 
 
 async def _download_images(
@@ -751,6 +766,15 @@ async def _download_images(
 def _pil_to_png_bytes(im: "_PILImage.Image", *, max_px_w: int, circle: bool) -> Optional[bytes]:
     """Wandelt ein PIL-Bild in ein druckfertiges PNG (skaliert, optional kreisförmig)."""
     try:
+        # Pixel-Guard VOR jedem Dekodieren: PIL.open ist lazy — im.size liest
+        # nur den Header. Übergroße Bilder (Dekodier-Bomben) werden übersprungen,
+        # statt den Worker-Thread (und damit den Dokument-Bau) für Minuten zu
+        # blockieren.
+        _iw0, _ih0 = im.size
+        if _iw0 * _ih0 > _MAX_IMAGE_PIXELS:
+            log.warning("Bild übersprungen (%dx%d px > %d MP) — Dekodier-Schutz.",
+                        _iw0, _ih0, _MAX_IMAGE_PIXELS // 1_000_000)
+            return None
         if getattr(im, "is_animated", False):
             im.seek(0)
         has_alpha = im.mode in ("RGBA", "LA", "P") or "transparency" in getattr(im, "info", {})
@@ -2014,7 +2038,8 @@ async def build_server_document(
                     _MENTION_NAMES.setdefault(r.id, r.name)
                 for c in getattr(m, "channel_mentions", None) or []:
                     _MENTION_NAMES.setdefault(c.id, c.name)
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound,
+                AttributeError, TypeError):
             channel_messages[channel.id] = []
 
     # ── 3. Alle Bilder parallel herunterladen ──────────────────────────────
@@ -2050,590 +2075,649 @@ async def build_server_document(
 
     image_cache = await _download_images(http_session, image_urls, progress_hook=_img_progress)
 
-    # ── 4. PDF-Datenstrukturen ─────────────────────────────────────────────
-    await progress(62, "Tabellen werden aufbereitet …")
+    _dl_ok = sum(1 for v in image_cache.values() if v)
+    await progress(62, f"Bilder geladen ({_dl_ok}/{len(image_cache)}) — Dokument wird aufbereitet …")
 
-    flowables: List[Any] = []
+    # Fonts/Emoji-Assets VOR dem Thread vorwärmen (kein Lazy-Init-Rennen).
+    _ensure_fonts()
+    _ensure_apple_emoji()
 
-    def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
-        return _image_flow(image_cache.get(url) if url else None, **kwargs)
+    # Die komplette Aufbereitung (Flowables, PIL-Bildkonvertierung, reportlab)
+    # ist EIN Block synchroner Arbeit. Früher lief er AUF DEM EVENT-LOOP und
+    # blockierte dort ALLE Timer, Logs und Fortschritts-Edits — das Dokument
+    # „hing" dann sichtbar ewig (z. B. bei 58 %) ohne jegliches Log. Jetzt:
+    # Worker-Thread (Event-Loop bleibt lebendig) + Live-Ticker + Budget mit
+    # sichtbarer Fehlermeldung statt ewiger Stille.
+    loop = asyncio.get_running_loop()
+    _last_pct = [62]
 
-    def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
-        return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
+    def _emit_soon(pct: int, text: str) -> None:
+        _last_pct[0] = max(_last_pct[0], min(pct, 99))
+        asyncio.ensure_future(progress(pct, text))
 
-    def emoji_png(eid: int) -> Optional[str]:
-        return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"emoji-{eid}")
+    def _emit(pct: int, text: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_emit_soon, pct, text)
+        except RuntimeError:
+            pass  # Loop bereits geschlossen — Aufbau läuft weiter
 
-    # Kontext für den gemeinsamen Nachrichten-Renderer (auch vom
-    # Chatverlauf-PDF genutzt).
-    msg_ctx: Dict[str, Any] = {
-        "styles": styles,
-        "img": img,
-        "avatar_img": avatar_img,
-        "emoji_png": emoji_png,
-        "member_ids": {getattr(m, "id", None) for m in members if getattr(m, "id", None)},
-        "content_width": CONTENT_WIDTH,
-    }
+    async def _assembly_ticker(started: float) -> None:
+        while True:
+            await asyncio.sleep(_ASSEMBLY_TICKER_S)
+            try:
+                await progress(_last_pct[0], f"Dokument wird erstellt … "
+                               f"({time.monotonic() - started:.0f} s verstrichen)")
+            except Exception:  # noqa: BLE001 — Ticker darf niemals abbrechen
+                pass
 
-    # ---- Titelkopf ----
-    icon_url = getattr(guild.icon, "url", None) if guild.icon else None
-    banner_url = getattr(guild.banner, "url", None) if getattr(guild, "banner", None) else None
+    def _assemble() -> bytes:
+        """(Worker-Thread) Abschnitte 4+5: Flowables + PDF-Bau."""
+        # ── 4. PDF-Datenstrukturen ─────────────────────────────────────────────
+        _emit(62, "Tabellen werden aufbereitet …")
 
-    banner_flow = img(banner_url, max_w=CONTENT_WIDTH / mm, max_h=52, upscale=True)
-    banner_hint: str
-    if banner_flow is not None:
-        flowables.append(banner_flow)
-        flowables.append(Spacer(1, 5 * mm))
-        banner_hint = "Server-Banner: <b>hochgeladen</b> — als Bild oben."
-    else:
-        # Kein Banner: Akzentfarbe zeigen — die Farbe der höchsten farbigen
-        # Rolle (die „ausgewählte Farbe“ des Servers), sonst Blurple.
-        accent_role: Any = None
-        for r in roles:
-            if r.color.value:
-                accent_role = r
-                break
-        if accent_role is not None:
-            accent_hex = f"#{accent_role.color.value:06x}"
-            accent_src = f"höchste farbige Rolle „{_clean(accent_role.name)}“"
+        flowables: List[Any] = []
+
+        def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
+            return _image_flow(image_cache.get(url) if url else None, **kwargs)
+
+        def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
+            return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
+
+        def emoji_png(eid: int) -> Optional[str]:
+            return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"emoji-{eid}")
+
+        # Kontext für den gemeinsamen Nachrichten-Renderer (auch vom
+        # Chatverlauf-PDF genutzt).
+        msg_ctx: Dict[str, Any] = {
+            "styles": styles,
+            "img": img,
+            "avatar_img": avatar_img,
+            "emoji_png": emoji_png,
+            "member_ids": {getattr(m, "id", None) for m in members if getattr(m, "id", None)},
+            "content_width": CONTENT_WIDTH,
+        }
+
+        # ---- Titelkopf ----
+        icon_url = getattr(guild.icon, "url", None) if guild.icon else None
+        banner_url = getattr(guild.banner, "url", None) if getattr(guild, "banner", None) else None
+
+        banner_flow = img(banner_url, max_w=CONTENT_WIDTH / mm, max_h=52, upscale=True)
+        banner_hint: str
+        if banner_flow is not None:
+            flowables.append(banner_flow)
+            flowables.append(Spacer(1, 5 * mm))
+            banner_hint = "Server-Banner: <b>hochgeladen</b> — als Bild oben."
         else:
-            accent_hex = "#5865F2"
-            accent_src = "Standard-Akzentfarbe (keine farbige Rolle)"
-        accent_color = colors.HexColor(accent_hex)
-        band_text_color = colors.white if _luma(accent_color) < 0.6 else _C.dark
-        band = Table(
-            [[Paragraph(
-                "Server-Banner",
-                ParagraphStyle(
-                    "banner_band", fontName=_FONTS["bold"], fontSize=13, leading=16,
-                    textColor=band_text_color, alignment=TA_CENTER,
-                ),
-            )]],
-            colWidths=[CONTENT_WIDTH],
-        )
-        band.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), accent_color),
-            ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-            ("TOPPADDING", (0, 0), (-1, -1), 12),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
-        ]))
-        flowables.append(band)
-        flowables.append(Spacer(1, 5 * mm))
-        banner_hint = (
-            f"Kein Banner hochgeladen — Hinweis: Farbband in der Akzentfarbe "
-            f"<font name='{_FONTS['mono']}' size='7.6'>{accent_hex}</font> ({accent_src})."
-        )
-
-    icon_flow = _avatar_flow(image_cache.get(icon_url), 24) if icon_url else None
-    meta_bits = [
-        f"Server-ID <font name='{_FONTS['mono']}' size='7.6'>{guild.id}</font>",
-        f"Erstellt {_fmt_date(guild.created_at)}",
-        f"{member_count:,} Mitglieder".replace(",", "."),
-        f"Verifizierung {_clean(_enum_label(guild.verification_level, _VERIFICATION_LABELS))}",
-    ]
-    title_cell: List[Any] = [
-        Paragraph(_clean(guild.name), styles["title"]),
-        Paragraph(" · ".join(meta_bits), styles["subtitle"]),
-    ]
-    header_cells: List[Any] = [icon_flow if icon_flow is not None else ""] + [title_cell]
-    header_widths = [30 * mm, CONTENT_WIDTH - 30 * mm] if icon_flow is not None else [CONTENT_WIDTH]
-    header = Table([header_cells], colWidths=header_widths)
-    header.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    flowables.append(header)
-    flowables.append(Spacer(1, 1.2 * mm))
-    flowables.append(Paragraph(banner_hint, styles["small"]))
-    flowables.append(Spacer(1, 3 * mm))
-
-    # Statistik-Chips
-    stat_chips: List[Tuple[str, colors.Color, bool]] = [
-        (f"{member_count} Mitglieder", _C.blurple, False),
-        (f"{len(roles)} Rollen", _C.dark, False),
-        (f"{len(categories)} Kategorien", _C.gray_chip, False),
-        (f"{len(text_channels)} Text", _C.blurple, False),
-        (f"{len(voice_channels) + len(stage_channels)} Voice/Bühne", _C.green, False),
-        (f"{len(forum_channels)} Forum", _C.pink, False),
-        (f"{len(emojis)} Emojis", _C.amber, True),
-        (f"{len(stickers)} Sticker", _C.amber, True),
-    ]
-    flowables.append(_chips_row(stat_chips))
-    flowables.append(Spacer(1, 4 * mm))
-
-    # ---- Info-Kärtchen (Owner + Server-Einstellungen) ----
-    info_rows: List[Tuple[str, Any]] = []
-    if getattr(guild, "description", None):
-        info_rows.append(("Beschreibung", Paragraph(_clean_ml(guild.description), styles["table"])))
-    if owner is not None:
-        info_rows.append((
-            "Owner",
-            Paragraph(
-                f"<b>{_clean(owner.display_name)}</b> (@{_clean(owner.name)}) · "
-                f"<font name='{_FONTS['mono']}' size='7.2'>{owner.id}</font>",
-                styles["table"],
-            ),
-        ))
-    info_rows.append(("Erstellt", Paragraph(_clean(_fmt_datetime(guild.created_at)), styles["table"])))
-    info_rows.append((
-        "Verifizierung",
-        Paragraph(_clean(_enum_label(guild.verification_level, _VERIFICATION_LABELS)), styles["table"]),
-    ))
-    info_rows.append((
-        "Inhaltsfilter",
-        Paragraph(_clean(_enum_label(guild.explicit_content_filter, _CONTENT_FILTER_LABELS)), styles["table"]),
-    ))
-    info_rows.append(("Boosts", Paragraph(_clean(_premium_label(guild)), styles["table"])))
-    locale = str(getattr(guild.preferred_locale, "name", guild.preferred_locale) or "").replace("_", " ").title()
-    if locale:
-        info_rows.append(("Sprache", Paragraph(_clean(locale), styles["table"])))
-    features = ", ".join(_prepare_text(ft) for ft in (getattr(guild, "features", []) or [])[:8])
-    if features:
-        info_rows.append(("Features", Paragraph(_clean(_short(features, 160)), styles["table"])))
-    flowables.append(_kv_card(info_rows, styles))
-    flowables.append(Spacer(1, 4 * mm))
-
-    # ---- Inhaltsverzeichnis ----
-    toc = [
-        ("1", "Kanäle & Kategorien", "Alle Kanäle mit Typ, ID, Kategorie und Themenbeschreibung."),
-        ("2", "Rollen", "Hierarchie, Farben und alle Berechtigungen jeder Rolle."),
-        ("3", "Emojis & Sticker", "Bild-Übersicht aller Server-Emojis und Sticker."),
-        ("4", "Mitglieder", "Avatare, Rollen und Beitrittsdatum (bei großen Servern die wichtigsten)."),
-        ("5", "Letzte Nachrichten", f"Die letzten {MAX_MESSAGES_PER_CHANNEL} Nachrichten je Textkanal."),
-    ]
-    toc_cells = [[
-        Paragraph(
-            f"<b>{num}</b>",
-            ParagraphStyle("toc_num", parent=styles["body"], textColor=_C.blurple, fontSize=10.5),
-        ),
-        [
-            Paragraph(_clean(t), styles["h3"]),
-            Paragraph(_clean(d), styles["small"]),
-        ],
-    ] for num, t, d in toc]
-    toc_table = Table(toc_cells, colWidths=[9 * mm, CONTENT_WIDTH - 9 * mm])
-    toc_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 2),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-        ("TOPPADDING", (0, 0), (-1, -1), 1.4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6),
-    ]))
-    flowables.append(toc_table)
-    flowables.append(PageBreak())
-
-    # ---- 1. Kanäle & Kategorien ----
-    _section(flowables, "1", "Kanäle & Kategorien", styles)
-    flowables.append(_chips_row([
-        (f"{len(categories)} Kategorien", _C.gray_chip, False),
-        (f"{len(text_channels)} Text", _C.blurple, False),
-        (f"{len(voice_channels)} Voice", _C.green, False),
-        (f"{len(stage_channels)} Bühne", _C.amber, True),
-        (f"{len(forum_channels)} Forum/Medien", _C.pink, False),
-        (f"{len(uncategorized)} ohne Kategorie", _C.dark, False),
-    ]))
-    flowables.append(Spacer(1, 3 * mm))
-
-    CH_W = [24 * mm, CONTENT_WIDTH - 24 * mm - 30 * mm, 30 * mm]
-
-    def _fmt_duration(seconds: int) -> str:
-        if seconds < 60:
-            return f"{seconds} s"
-        minutes, rest = divmod(seconds, 60)
-        if minutes < 60:
-            return f"{minutes} min" + (f" {rest} s" if rest else "")
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours} h" + (f" {minutes} min" if minutes else "")
-
-    def _channel_details(ch: Any) -> str:
-        """Zusätzliche Kanal-Details als eine muted-Zeile (ohne Thema)."""
-        bits: List[str] = []
-        delay = getattr(ch, "slowmode_delay", 0) or 0
-        if delay:
-            bits.append(f"Slow-Modus {_fmt_duration(int(delay))}")
-        thread_delay = getattr(ch, "default_thread_slowmode_delay", 0) or 0
-        if thread_delay:
-            bits.append(f"Thread-Slow-Modus {_fmt_duration(int(thread_delay))}")
-        if getattr(ch, "nsfw", False):
-            bits.append("NSFW")
-        bitrate = getattr(ch, "bitrate", None)
-        if bitrate:
-            bits.append(f"Bitrate {int(bitrate) // 1000} kbps")
-        user_limit = getattr(ch, "user_limit", 0) or 0
-        if user_limit:
-            bits.append(f"Limit {user_limit} Nutzer")
-        video_quality = getattr(ch, "video_quality_mode", None)
-        quality_name = getattr(video_quality, "name", None)
-        if quality_name == "FULL":
-            bits.append("Video 720p60")
-        return " · ".join(_prepare_text(b) for b in bits)
-
-    def _channel_table(channels: List[Any]) -> Table:
-        rows: List[List[Any]] = []
-        for ch in channels:
-            label, bg, dark = _channel_type_info(ch.type)
-            name_cell: List[Any] = [Paragraph(f"<b>{_clean(ch.name)}</b>", styles["table"])]
-            topic = _prepare_text(getattr(ch, "topic", None))
-            if topic:
-                name_cell.append(Paragraph(_font_markup(_esc(_short(topic, 220))), styles["table_muted"]))
-            details = _channel_details(ch)
-            if details:
-                name_cell.append(Paragraph(_font_markup(_esc(details)), styles["table_muted"]))
-            id_cell = Paragraph(
-                f"<font name='{_FONTS['mono']}' size='6.8'>{ch.id}</font>",
-                ParagraphStyle("id_r", parent=styles["mono"], alignment=TA_RIGHT),
-            )
-            rows.append([_chip(label, bg, dark), name_cell, id_cell])
-        t = Table(rows, colWidths=CH_W, repeatRows=0)
-        t.setStyle(TableStyle([
-            _ZEBRA,
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 2.4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.8),
-            ("LINEBELOW", (0, 0), (-1, -2), 0.4, _C.border),
-        ]))
-        return t
-
-    for cat in categories:
-        cat_channels = list(cat.channels)
-        head = Table(
-            [[
-                Paragraph(_clean(cat.name), styles["cat_head"]),
-                Paragraph(
-                    f"{_clean(str(len(cat_channels)))} Kanäle · "
-                    f"ID <font name='{_FONTS['mono']}' size='6.6'>{cat.id}</font>",
-                    styles["cat_meta"],
-                ),
-            ]],
-            colWidths=[CONTENT_WIDTH - 52 * mm, 52 * mm],
-        )
-        head.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), _C.dark),
-            ("ROUNDEDCORNERS", [3, 3, 0, 0]),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
-        ]))
-        body = (
-            _channel_table(cat_channels)
-            if cat_channels
-            else Table(
-                [[Paragraph("Keine Kanäle in dieser Kategorie.", styles["table_muted"])]],
+            # Kein Banner: Akzentfarbe zeigen — die Farbe der höchsten farbigen
+            # Rolle (die „ausgewählte Farbe“ des Servers), sonst Blurple.
+            accent_role: Any = None
+            for r in roles:
+                if r.color.value:
+                    accent_role = r
+                    break
+            if accent_role is not None:
+                accent_hex = f"#{accent_role.color.value:06x}"
+                accent_src = f"höchste farbige Rolle „{_clean(accent_role.name)}“"
+            else:
+                accent_hex = "#5865F2"
+                accent_src = "Standard-Akzentfarbe (keine farbige Rolle)"
+            accent_color = colors.HexColor(accent_hex)
+            band_text_color = colors.white if _luma(accent_color) < 0.6 else _C.dark
+            band = Table(
+                [[Paragraph(
+                    "Server-Banner",
+                    ParagraphStyle(
+                        "banner_band", fontName=_FONTS["bold"], fontSize=13, leading=16,
+                        textColor=band_text_color, alignment=TA_CENTER,
+                    ),
+                )]],
                 colWidths=[CONTENT_WIDTH],
             )
-        )
-        flowables.append(KeepTogether([head, body, Spacer(1, 3.4 * mm)]))
-
-    if uncategorized:
-        flowables.append(Paragraph("Ohne Kategorie", styles["h2"]))
-        flowables.append(_channel_table(uncategorized))
-    if not categories and not uncategorized:
-        flowables.append(Paragraph("Keine Kanäle vorhanden.", styles["body"]))
-    flowables.append(PageBreak())
-
-    # ---- 2. Rollen ----
-    _section(flowables, "2", "Rollen", styles)
-    flowables.append(Paragraph(
-        f"{len(roles)} Rollen, sortiert von oben (höchste) nach unten (niedrigste). "
-        "Berechtigungen sind pro Rolle vollständig aufgelistet.",
-        styles["body"]))
-    flowables.append(Spacer(1, 3 * mm))
-
-    _PERM_PRIORITY = (
-        "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks",
-        "manage_messages", "manage_threads", "manage_emojis_and_stickers", "manage_events",
-        "manage_nicknames", "moderate_members", "kick_members", "ban_members",
-        "view_channel", "send_messages", "read_message_history",
-    )
-
-    def _perm_sort_key(name: str) -> Tuple[int, str]:
-        norm = name.lower().replace(" ", "_")
-        prio = _PERM_PRIORITY.index(norm) if norm in _PERM_PRIORITY else len(_PERM_PRIORITY)
-        return (prio, name)
-
-    role_member_counts: Dict[int, int] = {
-        role.id: sum(1 for m in guild.members if role in m.roles) for role in roles
-    }
-    role_rows: List[List[Any]] = [[
-        Paragraph("Rolle", styles["table_head"]),
-        Paragraph("Farbe", styles["table_head"]),
-        Paragraph("Berechtigungen", styles["table_head"]),
-        Paragraph("Mitglieder", styles["table_head_small"]),
-        Paragraph("ID", styles["table_head_small"]),
-    ]]
-    for role in roles:
-        is_admin = bool(getattr(role.permissions, "administrator", False))
-        if is_admin:
-            # Administrator heißt ALLE Berechtigungen — die Aufzählung der
-            # einzelnen Rechte wäre redundant, daher rot hervorgehoben.
-            perms_para = Paragraph(
-                "<b><font color='#ED4245'>ADMINISTRATOR — umfasst ALLE Berechtigungen</font></b>",
-                styles["table_small"],
+            band.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), accent_color),
+                ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+                ("TOPPADDING", (0, 0), (-1, -1), 12),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
+            ]))
+            flowables.append(band)
+            flowables.append(Spacer(1, 5 * mm))
+            banner_hint = (
+                f"Kein Banner hochgeladen — Hinweis: Farbband in der Akzentfarbe "
+                f"<font name='{_FONTS['mono']}' size='7.6'>{accent_hex}</font> ({accent_src})."
             )
-        else:
-            perm_names = sorted(
-                (name.replace("_", " ") for name, enabled in role.permissions if enabled),
-                key=_perm_sort_key,
-            )
-            perms_para = Paragraph(
-                " · ".join(_clean(n) for n in perm_names) or "— keine eigenen Berechtigungen —",
-                styles["table_small"],
-            )
-        if role.color.value:
-            color_para = Paragraph(
-                f"<font color='#{role.color.value:06x}'>●</font> "
-                f"<font name='{_FONTS['mono']}' size='6.8'>#{role.color.value:06x}</font>",
-                styles["table_small"],
-            )
-        else:
-            color_para = Paragraph("<font color='#9AA0AB'>●</font> Standard", styles["table_small"])
-        role_name_html = _clean(role.name)
-        if is_admin:
-            role_name_html = f"<font color='#ED4245'>{role_name_html}</font>"
-        role_rows.append([
-            Paragraph(f"<b>{role_name_html}</b>", styles["table"]),
-            color_para,
-            perms_para,
-            Paragraph(
-                str(role_member_counts.get(role.id, 0)),
-                ParagraphStyle("cnt", parent=styles["table"], alignment=TA_CENTER),
-            ),
-            Paragraph(_id_para(role.id), styles["mono"]),
-        ])
-    role_table = Table(
-        role_rows,
-        repeatRows=1,
-        colWidths=[
-            40 * mm,
-            22 * mm,
-            CONTENT_WIDTH - 40 * mm - 22 * mm - 20 * mm - 26 * mm,
-            20 * mm,
-            26 * mm,
-        ],
-    )
-    role_table.setStyle(_table_style())
-    flowables.append(role_table)
-    flowables.append(PageBreak())
 
-    # ---- 3. Emojis & Sticker ----
-    _section(flowables, "3", "Emojis & Sticker", styles)
-
-    shown_emojis = emojis[:MAX_EMOJIS_SHOWN]
-    if shown_emojis:
-        flowables.append(Paragraph(
-            f"{len(emojis)} Emojis"
-            + (f" — die ersten {len(shown_emojis)} werden gezeigt"
-               if len(emojis) > len(shown_emojis) else ""),
-            styles["h2"]))
-        grid_rows: List[List[Any]] = []
-        for start in range(0, len(shown_emojis), EMOJI_GRID_COLUMNS):
-            chunk = shown_emojis[start:start + EMOJI_GRID_COLUMNS]
-            row: List[Any] = []
-            for emoji in chunk:
-                cell: List[Any] = []
-                flow = img(emoji.url, max_w=7.5, max_h=7.5, upscale=True)
-                if flow is None:
-                    flow = Paragraph("kein Bild", styles["center_tiny"])
-                cell.append(flow)
-                cell.append(Spacer(1, 1 * mm))
-                cell.append(Paragraph(_clean(_short(emoji.name, 22)), styles["center_small"]))
-                cell.append(Paragraph(str(emoji.id), styles["center_tiny"]))
-                if emoji.animated:
-                    cell.append(Paragraph("<b>animiert</b>", styles["center_tiny"]))
-                row.append(cell)
-            while len(row) < EMOJI_GRID_COLUMNS:
-                row.append("")
-            grid_rows.append(row)
-        cell_w = CONTENT_WIDTH / EMOJI_GRID_COLUMNS
-        emoji_grid = Table(grid_rows, colWidths=[cell_w] * EMOJI_GRID_COLUMNS)
-        emoji_grid.setStyle(TableStyle([
+        icon_flow = _avatar_flow(image_cache.get(icon_url), 24) if icon_url else None
+        meta_bits = [
+            f"Server-ID <font name='{_FONTS['mono']}' size='7.6'>{guild.id}</font>",
+            f"Erstellt {_fmt_date(guild.created_at)}",
+            f"{member_count:,} Mitglieder".replace(",", "."),
+            f"Verifizierung {_clean(_enum_label(guild.verification_level, _VERIFICATION_LABELS))}",
+        ]
+        title_cell: List[Any] = [
+            Paragraph(_clean(guild.name), styles["title"]),
+            Paragraph(" · ".join(meta_bits), styles["subtitle"]),
+        ]
+        header_cells: List[Any] = [icon_flow if icon_flow is not None else ""] + [title_cell]
+        header_widths = [30 * mm, CONTENT_WIDTH - 30 * mm] if icon_flow is not None else [CONTENT_WIDTH]
+        header = Table([header_cells], colWidths=header_widths)
+        header.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 2),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-            ("TOPPADDING", (0, 0), (-1, -1), 3.4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
-            ("GRID", (0, 0), (-1, -1), 0.4, _C.border),
-        ]))
-        flowables.append(emoji_grid)
-        if len(emojis) > len(shown_emojis):
-            flowables.append(Spacer(1, 1.5 * mm))
-            flowables.append(Paragraph(f"(und {len(emojis) - len(shown_emojis)} weitere Emojis)", styles["small"]))
-    else:
-        flowables.append(Paragraph("Keine Emojis vorhanden.", styles["body"]))
-
-    flowables.append(Spacer(1, 3 * mm))
-
-    shown_stickers = stickers[:MAX_STICKERS_SHOWN]
-    if shown_stickers:
-        flowables.append(Paragraph(f"{len(stickers)} Sticker", styles["h2"]))
-        s_rows: List[List[Any]] = []
-        for start in range(0, len(shown_stickers), STICKER_GRID_COLUMNS):
-            chunk = shown_stickers[start:start + STICKER_GRID_COLUMNS]
-            row: List[Any] = []
-            for sticker in chunk:
-                cell = [
-                    img(sticker.url, max_w=26, max_h=30) or Paragraph("kein Bild", styles["center_tiny"]),
-                    Spacer(1, 1.2 * mm),
-                    Paragraph(_clean(_short(sticker.name, 30)), styles["center_small"]),
-                    Paragraph(
-                        f"{_clean(str(getattr(sticker, 'type', ''))).replace('StickerType.', '')} · {sticker.id}",
-                        styles["center_tiny"],
-                    ),
-                ]
-                row.append(cell)
-            while len(row) < STICKER_GRID_COLUMNS:
-                row.append("")
-            s_rows.append(row)
-        s_cell_w = CONTENT_WIDTH / STICKER_GRID_COLUMNS
-        sticker_grid = Table(s_rows, colWidths=[s_cell_w] * STICKER_GRID_COLUMNS)
-        sticker_grid.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("GRID", (0, 0), (-1, -1), 0.4, _C.border),
-        ]))
-        flowables.append(sticker_grid)
-        if len(stickers) > len(shown_stickers):
-            flowables.append(Spacer(1, 1.5 * mm))
-            flowables.append(Paragraph(f"(und {len(stickers) - len(shown_stickers)} weitere Sticker)", styles["small"]))
-    if not emojis and not stickers:
-        flowables.append(Paragraph("Keine Emojis oder Sticker vorhanden.", styles["body"]))
-    flowables.append(PageBreak())
-
-    # ---- 4. Mitglieder ----
-    _section(flowables, "4", "Mitglieder", styles)
-    if len(members) <= MAX_MEMBERS_DETAILED and len(members) >= member_count:
-        flowables.append(Paragraph(f"Alle {len(members)} Mitglieder des Servers:", styles["body"]))
-    elif len(members) <= MAX_MEMBERS_DETAILED:
-        flowables.append(Paragraph(
-            f"{len(members)} von {member_count} Mitgliedern im Cache — die Mitgliederliste "
-            "könnte unvollständig sein (Bot konnte nicht alle Mitglieder laden):",
-            styles["body"]))
-    else:
-        flowables.append(Paragraph(
-            f"Der Server hat {member_count} Mitglieder — mehr als {MAX_MEMBERS_DETAILED}. "
-            f"Angezeigt werden die {MAX_MEMBERS_DETAILED} wichtigsten Mitglieder "
-            "(Inhaber der seltensten Rollen zuerst).", styles["body"]))
-    flowables.append(Spacer(1, 3 * mm))
-
-    member_rows: List[List[Any]] = [[
-        Paragraph("", styles["table_head"]),
-        Paragraph("Mitglied", styles["table_head"]),
-        Paragraph("Rollen", styles["table_head"]),
-        Paragraph("Beigetreten", styles["table_head_small"]),
-        Paragraph("ID", styles["table_head_small"]),
-    ]]
-    for member in detailed_members:
-        avatar = avatar_img(member.id, 9)
-        display_clean = _prepare_text(getattr(member, "display_name", None))
-        name_bits = f"<b>{_clean(member.display_name)}</b>"
-        username = _clean(member.name)
-        if username and username.lower() != display_clean.lower():
-            name_bits += f"<br/><font color='#6B7280' size='7.2'>@{username}</font>"
-        if getattr(member, "bot", False):
-            name_bits += " <font color='#5865F2' size='7'><b>BOT</b></font>"
-        # Rollen als abgerundete graue Kästchen: nebeneinander mit Padding,
-        # umbrochen in Zeilen (statt ein langer „ · “-Text).
-        member_role_names = [r.name for r in member.roles if r != guild.default_role]
-        roles_col_pt = (CONTENT_WIDTH - 12 * mm - 44 * mm - 23 * mm - 26 * mm) / mm * 2.8346
-        role_cell: List[Any] = _chip_lines(
-            member_role_names, max_width=roles_col_pt - 9
-        )
-        member_rows.append([
-            avatar if avatar is not None else "",
-            Paragraph(name_bits, styles["table"]),
-            role_cell,
-            Paragraph(_clean(_fmt_date(member.joined_at)), styles["table_small"]),
-            Paragraph(_id_para(member.id), styles["mono"]),
-        ])
-    member_table = Table(
-        member_rows,
-        repeatRows=1,
-        colWidths=[
-            12 * mm,
-            44 * mm,
-            CONTENT_WIDTH - 12 * mm - 44 * mm - 23 * mm - 26 * mm,
-            23 * mm,
-            26 * mm,
-        ],
-    )
-    member_table.setStyle(_table_style())
-    flowables.append(member_table)
-    flowables.append(PageBreak())
-
-    # ---- 5. Letzte Nachrichten ----
-    _section(flowables, "5", "Letzte Nachrichten pro Textkanal", styles)
-    flowables.append(Paragraph(
-        f"Die letzten {MAX_MESSAGES_PER_CHANNEL} Nachrichten jedes Textkanals, für den der Bot "
-        "die Historie lesen darf. Embeds, Anhänge, Sticker und Komponenten werden in Text umgewandelt.",
-        styles["body"]))
-    flowables.append(Spacer(1, 2.5 * mm))
-
-    any_messages = False
-    for channel in text_channels:
-        msgs = channel_messages.get(channel.id, [])
-        # Kanal-Überschrift: groß, fett, unterstrichen (Farblinie unten).
-        head_table = Table([[Paragraph(
-            f"<b>#{_clean(channel.name)}</b> "
-            f"<font name='{_FONTS['mono']}' size='7.2' color='#6B7280'>{channel.id}</font> "
-            f"<font color='#6B7280'>· {len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}</font>",
-            styles["msg_channel_head"],
-        )]], colWidths=[CONTENT_WIDTH])
-        head_table.setStyle(TableStyle([
-            ("LINEBELOW", (0, 0), (-1, -1), 1.1, _C.blurple),
             ("LEFTPADDING", (0, 0), (-1, -1), 0),
             ("RIGHTPADDING", (0, 0), (-1, -1), 0),
             ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
         ]))
-        if not msgs:
-            flowables.append(KeepTogether([
-                head_table,
-                Spacer(1, 1.4 * mm),
-                Paragraph("Keine Nachrichten verfügbar (leer, keine Historie oder keine Rechte).", styles["small"]),
-                Spacer(1, 3.2 * mm),
+        flowables.append(header)
+        flowables.append(Spacer(1, 1.2 * mm))
+        flowables.append(Paragraph(banner_hint, styles["small"]))
+        flowables.append(Spacer(1, 3 * mm))
+
+        # Statistik-Chips
+        stat_chips: List[Tuple[str, colors.Color, bool]] = [
+            (f"{member_count} Mitglieder", _C.blurple, False),
+            (f"{len(roles)} Rollen", _C.dark, False),
+            (f"{len(categories)} Kategorien", _C.gray_chip, False),
+            (f"{len(text_channels)} Text", _C.blurple, False),
+            (f"{len(voice_channels) + len(stage_channels)} Voice/Bühne", _C.green, False),
+            (f"{len(forum_channels)} Forum", _C.pink, False),
+            (f"{len(emojis)} Emojis", _C.amber, True),
+            (f"{len(stickers)} Sticker", _C.amber, True),
+        ]
+        flowables.append(_chips_row(stat_chips))
+        flowables.append(Spacer(1, 4 * mm))
+
+        # ---- Info-Kärtchen (Owner + Server-Einstellungen) ----
+        info_rows: List[Tuple[str, Any]] = []
+        if getattr(guild, "description", None):
+            info_rows.append(("Beschreibung", Paragraph(_clean_ml(guild.description), styles["table"])))
+        if owner is not None:
+            info_rows.append((
+                "Owner",
+                Paragraph(
+                    f"<b>{_clean(owner.display_name)}</b> (@{_clean(owner.name)}) · "
+                    f"<font name='{_FONTS['mono']}' size='7.2'>{owner.id}</font>",
+                    styles["table"],
+                ),
+            ))
+        info_rows.append(("Erstellt", Paragraph(_clean(_fmt_datetime(guild.created_at)), styles["table"])))
+        info_rows.append((
+            "Verifizierung",
+            Paragraph(_clean(_enum_label(guild.verification_level, _VERIFICATION_LABELS)), styles["table"]),
+        ))
+        info_rows.append((
+            "Inhaltsfilter",
+            Paragraph(_clean(_enum_label(guild.explicit_content_filter, _CONTENT_FILTER_LABELS)), styles["table"]),
+        ))
+        info_rows.append(("Boosts", Paragraph(_clean(_premium_label(guild)), styles["table"])))
+        locale = str(getattr(guild.preferred_locale, "name", guild.preferred_locale) or "").replace("_", " ").title()
+        if locale:
+            info_rows.append(("Sprache", Paragraph(_clean(locale), styles["table"])))
+        features = ", ".join(_prepare_text(ft) for ft in (getattr(guild, "features", []) or [])[:8])
+        if features:
+            info_rows.append(("Features", Paragraph(_clean(_short(features, 160)), styles["table"])))
+        flowables.append(_kv_card(info_rows, styles))
+        flowables.append(Spacer(1, 4 * mm))
+
+        # ---- Inhaltsverzeichnis ----
+        toc = [
+            ("1", "Kanäle & Kategorien", "Alle Kanäle mit Typ, ID, Kategorie und Themenbeschreibung."),
+            ("2", "Rollen", "Hierarchie, Farben und alle Berechtigungen jeder Rolle."),
+            ("3", "Emojis & Sticker", "Bild-Übersicht aller Server-Emojis und Sticker."),
+            ("4", "Mitglieder", "Avatare, Rollen und Beitrittsdatum (bei großen Servern die wichtigsten)."),
+            ("5", "Letzte Nachrichten", f"Die letzten {MAX_MESSAGES_PER_CHANNEL} Nachrichten je Textkanal."),
+        ]
+        toc_cells = [[
+            Paragraph(
+                f"<b>{num}</b>",
+                ParagraphStyle("toc_num", parent=styles["body"], textColor=_C.blurple, fontSize=10.5),
+            ),
+            [
+                Paragraph(_clean(t), styles["h3"]),
+                Paragraph(_clean(d), styles["small"]),
+            ],
+        ] for num, t, d in toc]
+        toc_table = Table(toc_cells, colWidths=[9 * mm, CONTENT_WIDTH - 9 * mm])
+        toc_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6),
+        ]))
+        flowables.append(toc_table)
+        flowables.append(PageBreak())
+
+        # ---- 1. Kanäle & Kategorien ----
+        _section(flowables, "1", "Kanäle & Kategorien", styles)
+        flowables.append(_chips_row([
+            (f"{len(categories)} Kategorien", _C.gray_chip, False),
+            (f"{len(text_channels)} Text", _C.blurple, False),
+            (f"{len(voice_channels)} Voice", _C.green, False),
+            (f"{len(stage_channels)} Bühne", _C.amber, True),
+            (f"{len(forum_channels)} Forum/Medien", _C.pink, False),
+            (f"{len(uncategorized)} ohne Kategorie", _C.dark, False),
+        ]))
+        flowables.append(Spacer(1, 3 * mm))
+
+        CH_W = [24 * mm, CONTENT_WIDTH - 24 * mm - 30 * mm, 30 * mm]
+
+        def _fmt_duration(seconds: int) -> str:
+            if seconds < 60:
+                return f"{seconds} s"
+            minutes, rest = divmod(seconds, 60)
+            if minutes < 60:
+                return f"{minutes} min" + (f" {rest} s" if rest else "")
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours} h" + (f" {minutes} min" if minutes else "")
+
+        def _channel_details(ch: Any) -> str:
+            """Zusätzliche Kanal-Details als eine muted-Zeile (ohne Thema)."""
+            bits: List[str] = []
+            delay = getattr(ch, "slowmode_delay", 0) or 0
+            if delay:
+                bits.append(f"Slow-Modus {_fmt_duration(int(delay))}")
+            thread_delay = getattr(ch, "default_thread_slowmode_delay", 0) or 0
+            if thread_delay:
+                bits.append(f"Thread-Slow-Modus {_fmt_duration(int(thread_delay))}")
+            if getattr(ch, "nsfw", False):
+                bits.append("NSFW")
+            bitrate = getattr(ch, "bitrate", None)
+            if bitrate:
+                bits.append(f"Bitrate {int(bitrate) // 1000} kbps")
+            user_limit = getattr(ch, "user_limit", 0) or 0
+            if user_limit:
+                bits.append(f"Limit {user_limit} Nutzer")
+            video_quality = getattr(ch, "video_quality_mode", None)
+            quality_name = getattr(video_quality, "name", None)
+            if quality_name == "FULL":
+                bits.append("Video 720p60")
+            return " · ".join(_prepare_text(b) for b in bits)
+
+        def _channel_table(channels: List[Any]) -> Table:
+            rows: List[List[Any]] = []
+            for ch in channels:
+                label, bg, dark = _channel_type_info(ch.type)
+                name_cell: List[Any] = [Paragraph(f"<b>{_clean(ch.name)}</b>", styles["table"])]
+                topic = _prepare_text(getattr(ch, "topic", None))
+                if topic:
+                    name_cell.append(Paragraph(_font_markup(_esc(_short(topic, 220))), styles["table_muted"]))
+                details = _channel_details(ch)
+                if details:
+                    name_cell.append(Paragraph(_font_markup(_esc(details)), styles["table_muted"]))
+                id_cell = Paragraph(
+                    f"<font name='{_FONTS['mono']}' size='6.8'>{ch.id}</font>",
+                    ParagraphStyle("id_r", parent=styles["mono"], alignment=TA_RIGHT),
+                )
+                rows.append([_chip(label, bg, dark), name_cell, id_cell])
+            t = Table(rows, colWidths=CH_W, repeatRows=0)
+            t.setStyle(TableStyle([
+                _ZEBRA,
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.8),
+                ("LINEBELOW", (0, 0), (-1, -2), 0.4, _C.border),
             ]))
-            continue
+            return t
 
-        any_messages = True
-        flowables.append(head_table)
-        flowables.append(Spacer(1, 2.4 * mm))
+        for cat in categories:
+            cat_channels = list(cat.channels)
+            head = Table(
+                [[
+                    Paragraph(_clean(cat.name), styles["cat_head"]),
+                    Paragraph(
+                        f"{_clean(str(len(cat_channels)))} Kanäle · "
+                        f"ID <font name='{_FONTS['mono']}' size='6.6'>{cat.id}</font>",
+                        styles["cat_meta"],
+                    ),
+                ]],
+                colWidths=[CONTENT_WIDTH - 52 * mm, 52 * mm],
+            )
+            head.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), _C.dark),
+                ("ROUNDEDCORNERS", [3, 3, 0, 0]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
+            ]))
+            body = (
+                _channel_table(cat_channels)
+                if cat_channels
+                else Table(
+                    [[Paragraph("Keine Kanäle in dieser Kategorie.", styles["table_muted"])]],
+                    colWidths=[CONTENT_WIDTH],
+                )
+            )
+            flowables.append(KeepTogether([head, body, Spacer(1, 3.4 * mm)]))
 
-        # ÄLTESTE zuerst: Discord liefert die Historie neueste-zuerst —
-        # umgekehrt lesen wir sie von oben (alt) nach unten (neu).
-        for m in reversed(msgs):
-            flowables.extend(_message_flowables(m, styles, msg_ctx))
+        if uncategorized:
+            flowables.append(Paragraph("Ohne Kategorie", styles["h2"]))
+            flowables.append(_channel_table(uncategorized))
+        if not categories and not uncategorized:
+            flowables.append(Paragraph("Keine Kanäle vorhanden.", styles["body"]))
+        flowables.append(PageBreak())
+
+        # ---- 2. Rollen ----
+        _section(flowables, "2", "Rollen", styles)
+        flowables.append(Paragraph(
+            f"{len(roles)} Rollen, sortiert von oben (höchste) nach unten (niedrigste). "
+            "Berechtigungen sind pro Rolle vollständig aufgelistet.",
+            styles["body"]))
+        flowables.append(Spacer(1, 3 * mm))
+
+        _PERM_PRIORITY = (
+            "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks",
+            "manage_messages", "manage_threads", "manage_emojis_and_stickers", "manage_events",
+            "manage_nicknames", "moderate_members", "kick_members", "ban_members",
+            "view_channel", "send_messages", "read_message_history",
+        )
+
+        def _perm_sort_key(name: str) -> Tuple[int, str]:
+            norm = name.lower().replace(" ", "_")
+            prio = _PERM_PRIORITY.index(norm) if norm in _PERM_PRIORITY else len(_PERM_PRIORITY)
+            return (prio, name)
+
+        role_member_counts: Dict[int, int] = {
+            role.id: sum(1 for m in guild.members if role in m.roles) for role in roles
+        }
+        role_rows: List[List[Any]] = [[
+            Paragraph("Rolle", styles["table_head"]),
+            Paragraph("Farbe", styles["table_head"]),
+            Paragraph("Berechtigungen", styles["table_head"]),
+            Paragraph("Mitglieder", styles["table_head_small"]),
+            Paragraph("ID", styles["table_head_small"]),
+        ]]
+        for role in roles:
+            is_admin = bool(getattr(role.permissions, "administrator", False))
+            if is_admin:
+                # Administrator heißt ALLE Berechtigungen — die Aufzählung der
+                # einzelnen Rechte wäre redundant, daher rot hervorgehoben.
+                perms_para = Paragraph(
+                    "<b><font color='#ED4245'>ADMINISTRATOR — umfasst ALLE Berechtigungen</font></b>",
+                    styles["table_small"],
+                )
+            else:
+                perm_names = sorted(
+                    (name.replace("_", " ") for name, enabled in role.permissions if enabled),
+                    key=_perm_sort_key,
+                )
+                perms_para = Paragraph(
+                    " · ".join(_clean(n) for n in perm_names) or "— keine eigenen Berechtigungen —",
+                    styles["table_small"],
+                )
+            if role.color.value:
+                color_para = Paragraph(
+                    f"<font color='#{role.color.value:06x}'>●</font> "
+                    f"<font name='{_FONTS['mono']}' size='6.8'>#{role.color.value:06x}</font>",
+                    styles["table_small"],
+                )
+            else:
+                color_para = Paragraph("<font color='#9AA0AB'>●</font> Standard", styles["table_small"])
+            role_name_html = _clean(role.name)
+            if is_admin:
+                role_name_html = f"<font color='#ED4245'>{role_name_html}</font>"
+            role_rows.append([
+                Paragraph(f"<b>{role_name_html}</b>", styles["table"]),
+                color_para,
+                perms_para,
+                Paragraph(
+                    str(role_member_counts.get(role.id, 0)),
+                    ParagraphStyle("cnt", parent=styles["table"], alignment=TA_CENTER),
+                ),
+                Paragraph(_id_para(role.id), styles["mono"]),
+            ])
+        role_table = Table(
+            role_rows,
+            repeatRows=1,
+            colWidths=[
+                40 * mm,
+                22 * mm,
+                CONTENT_WIDTH - 40 * mm - 22 * mm - 20 * mm - 26 * mm,
+                20 * mm,
+                26 * mm,
+            ],
+        )
+        role_table.setStyle(_table_style())
+        flowables.append(role_table)
+        flowables.append(PageBreak())
+
+        # ---- 3. Emojis & Sticker ----
+        _section(flowables, "3", "Emojis & Sticker", styles)
+
+        shown_emojis = emojis[:MAX_EMOJIS_SHOWN]
+        if shown_emojis:
+            flowables.append(Paragraph(
+                f"{len(emojis)} Emojis"
+                + (f" — die ersten {len(shown_emojis)} werden gezeigt"
+                   if len(emojis) > len(shown_emojis) else ""),
+                styles["h2"]))
+            grid_rows: List[List[Any]] = []
+            for start in range(0, len(shown_emojis), EMOJI_GRID_COLUMNS):
+                chunk = shown_emojis[start:start + EMOJI_GRID_COLUMNS]
+                row: List[Any] = []
+                for emoji in chunk:
+                    cell: List[Any] = []
+                    flow = img(emoji.url, max_w=7.5, max_h=7.5, upscale=True)
+                    if flow is None:
+                        flow = Paragraph("kein Bild", styles["center_tiny"])
+                    cell.append(flow)
+                    cell.append(Spacer(1, 1 * mm))
+                    cell.append(Paragraph(_clean(_short(emoji.name, 22)), styles["center_small"]))
+                    cell.append(Paragraph(str(emoji.id), styles["center_tiny"]))
+                    if emoji.animated:
+                        cell.append(Paragraph("<b>animiert</b>", styles["center_tiny"]))
+                    row.append(cell)
+                while len(row) < EMOJI_GRID_COLUMNS:
+                    row.append("")
+                grid_rows.append(row)
+            cell_w = CONTENT_WIDTH / EMOJI_GRID_COLUMNS
+            emoji_grid = Table(grid_rows, colWidths=[cell_w] * EMOJI_GRID_COLUMNS)
+            emoji_grid.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 3.4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
+                ("GRID", (0, 0), (-1, -1), 0.4, _C.border),
+            ]))
+            flowables.append(emoji_grid)
+            if len(emojis) > len(shown_emojis):
+                flowables.append(Spacer(1, 1.5 * mm))
+                flowables.append(Paragraph(f"(und {len(emojis) - len(shown_emojis)} weitere Emojis)", styles["small"]))
+        else:
+            flowables.append(Paragraph("Keine Emojis vorhanden.", styles["body"]))
+
+        flowables.append(Spacer(1, 3 * mm))
+
+        shown_stickers = stickers[:MAX_STICKERS_SHOWN]
+        if shown_stickers:
+            flowables.append(Paragraph(f"{len(stickers)} Sticker", styles["h2"]))
+            s_rows: List[List[Any]] = []
+            for start in range(0, len(shown_stickers), STICKER_GRID_COLUMNS):
+                chunk = shown_stickers[start:start + STICKER_GRID_COLUMNS]
+                row: List[Any] = []
+                for sticker in chunk:
+                    cell = [
+                        img(sticker.url, max_w=26, max_h=30) or Paragraph("kein Bild", styles["center_tiny"]),
+                        Spacer(1, 1.2 * mm),
+                        Paragraph(_clean(_short(sticker.name, 30)), styles["center_small"]),
+                        Paragraph(
+                            f"{_clean(str(getattr(sticker, 'type', ''))).replace('StickerType.', '')} · {sticker.id}",
+                            styles["center_tiny"],
+                        ),
+                    ]
+                    row.append(cell)
+                while len(row) < STICKER_GRID_COLUMNS:
+                    row.append("")
+                s_rows.append(row)
+            s_cell_w = CONTENT_WIDTH / STICKER_GRID_COLUMNS
+            sticker_grid = Table(s_rows, colWidths=[s_cell_w] * STICKER_GRID_COLUMNS)
+            sticker_grid.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("GRID", (0, 0), (-1, -1), 0.4, _C.border),
+            ]))
+            flowables.append(sticker_grid)
+            if len(stickers) > len(shown_stickers):
+                flowables.append(Spacer(1, 1.5 * mm))
+                flowables.append(Paragraph(f"(und {len(stickers) - len(shown_stickers)} weitere Sticker)", styles["small"]))
+        if not emojis and not stickers:
+            flowables.append(Paragraph("Keine Emojis oder Sticker vorhanden.", styles["body"]))
+        flowables.append(PageBreak())
+
+        # ---- 4. Mitglieder ----
+        _section(flowables, "4", "Mitglieder", styles)
+        if len(members) <= MAX_MEMBERS_DETAILED and len(members) >= member_count:
+            flowables.append(Paragraph(f"Alle {len(members)} Mitglieder des Servers:", styles["body"]))
+        elif len(members) <= MAX_MEMBERS_DETAILED:
+            flowables.append(Paragraph(
+                f"{len(members)} von {member_count} Mitgliedern im Cache — die Mitgliederliste "
+                "könnte unvollständig sein (Bot konnte nicht alle Mitglieder laden):",
+                styles["body"]))
+        else:
+            flowables.append(Paragraph(
+                f"Der Server hat {member_count} Mitglieder — mehr als {MAX_MEMBERS_DETAILED}. "
+                f"Angezeigt werden die {MAX_MEMBERS_DETAILED} wichtigsten Mitglieder "
+                "(Inhaber der seltensten Rollen zuerst).", styles["body"]))
+        flowables.append(Spacer(1, 3 * mm))
+
+        member_rows: List[List[Any]] = [[
+            Paragraph("", styles["table_head"]),
+            Paragraph("Mitglied", styles["table_head"]),
+            Paragraph("Rollen", styles["table_head"]),
+            Paragraph("Beigetreten", styles["table_head_small"]),
+            Paragraph("ID", styles["table_head_small"]),
+        ]]
+        for member in detailed_members:
+            avatar = avatar_img(member.id, 9)
+            display_clean = _prepare_text(getattr(member, "display_name", None))
+            name_bits = f"<b>{_clean(member.display_name)}</b>"
+            username = _clean(member.name)
+            if username and username.lower() != display_clean.lower():
+                name_bits += f"<br/><font color='#6B7280' size='7.2'>@{username}</font>"
+            if getattr(member, "bot", False):
+                name_bits += " <font color='#5865F2' size='7'><b>BOT</b></font>"
+            # Rollen als abgerundete graue Kästchen: nebeneinander mit Padding,
+            # umbrochen in Zeilen (statt ein langer „ · “-Text).
+            member_role_names = [r.name for r in member.roles if r != guild.default_role]
+            roles_col_pt = (CONTENT_WIDTH - 12 * mm - 44 * mm - 23 * mm - 26 * mm) / mm * 2.8346
+            role_cell: List[Any] = _chip_lines(
+                member_role_names, max_width=roles_col_pt - 9
+            )
+            member_rows.append([
+                avatar if avatar is not None else "",
+                Paragraph(name_bits, styles["table"]),
+                role_cell,
+                Paragraph(_clean(_fmt_date(member.joined_at)), styles["table_small"]),
+                Paragraph(_id_para(member.id), styles["mono"]),
+            ])
+        member_table = Table(
+            member_rows,
+            repeatRows=1,
+            colWidths=[
+                12 * mm,
+                44 * mm,
+                CONTENT_WIDTH - 12 * mm - 44 * mm - 23 * mm - 26 * mm,
+                23 * mm,
+                26 * mm,
+            ],
+        )
+        member_table.setStyle(_table_style())
+        flowables.append(member_table)
+        flowables.append(PageBreak())
+
+        # ---- 5. Letzte Nachrichten ----
+        _section(flowables, "5", "Letzte Nachrichten pro Textkanal", styles)
+        flowables.append(Paragraph(
+            f"Die letzten {MAX_MESSAGES_PER_CHANNEL} Nachrichten jedes Textkanals, für den der Bot "
+            "die Historie lesen darf. Embeds, Anhänge, Sticker und Komponenten werden in Text umgewandelt.",
+            styles["body"]))
+        flowables.append(Spacer(1, 2.5 * mm))
+
+        any_messages = False
+        for channel in text_channels:
+            msgs = channel_messages.get(channel.id, [])
+            # Kanal-Überschrift: groß, fett, unterstrichen (Farblinie unten).
+            head_table = Table([[Paragraph(
+                f"<b>#{_clean(channel.name)}</b> "
+                f"<font name='{_FONTS['mono']}' size='7.2' color='#6B7280'>{channel.id}</font> "
+                f"<font color='#6B7280'>· {len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}</font>",
+                styles["msg_channel_head"],
+            )]], colWidths=[CONTENT_WIDTH])
+            head_table.setStyle(TableStyle([
+                ("LINEBELOW", (0, 0), (-1, -1), 1.1, _C.blurple),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+            ]))
+            if not msgs:
+                flowables.append(KeepTogether([
+                    head_table,
+                    Spacer(1, 1.4 * mm),
+                    Paragraph("Keine Nachrichten verfügbar (leer, keine Historie oder keine Rechte).", styles["small"]),
+                    Spacer(1, 3.2 * mm),
+                ]))
+                continue
+
+            any_messages = True
+            flowables.append(head_table)
             flowables.append(Spacer(1, 2.4 * mm))
 
-    if not any_messages:
-        flowables.append(Spacer(1, 1.5 * mm))
-        flowables.append(Paragraph(
-            "Keine Nachrichten konnten aus den Textkanälen geladen werden.", styles["body"]))
+            # ÄLTESTE zuerst: Discord liefert die Historie neueste-zuerst —
+            # umgekehrt lesen wir sie von oben (alt) nach unten (neu).
+            for m in reversed(msgs):
+                flowables.extend(_message_flowables(m, styles, msg_ctx))
+                flowables.append(Spacer(1, 2.4 * mm))
 
-    # ── 5. Bauen ────────────────────────────────────────────────────────────
-    await progress(88, "PDF-Datei wird geschrieben …")
+        if not any_messages:
+            flowables.append(Spacer(1, 1.5 * mm))
+            flowables.append(Paragraph(
+                "Keine Nachrichten konnten aus den Textkanälen geladen werden.", styles["body"]))
 
-    pdf_bytes = _render_pdf(
-        flowables,
-        header_left=f"{guild.name} · Server-Dokument",
-        footer_left=(
-            "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
-            + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
-        ),
-        title=f"Server-Dokument · {guild.name}",
-        subject=f"Komplette Server-Übersicht für {guild.name} (ID {guild.id})",
-    )
+        # ── 5. Bauen ────────────────────────────────────────────────────────────
+        _emit(88, "PDF-Datei wird geschrieben …")
+
+        pdf_bytes = _render_pdf(
+            flowables,
+            header_left=f"{guild.name} · Server-Dokument",
+            footer_left=(
+                "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
+                + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+            ),
+            title=f"Server-Dokument · {guild.name}",
+            subject=f"Komplette Server-Übersicht für {guild.name} (ID {guild.id})",
+        )
+        return pdf_bytes
+
+    assemble_started = time.monotonic()
+    assemble_task = asyncio.create_task(asyncio.to_thread(_assemble))
+    ticker_task = asyncio.create_task(_assembly_ticker(assemble_started))
+    try:
+        pdf_bytes = await asyncio.wait_for(assemble_task, timeout=_ASSEMBLY_TIMEOUT_S)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning(
+            "Server-Dokument-Aufbereitung für '%s' hat nach %d s nicht abgeschlossen — "
+            "Abbruch mit sichtbarer Fehlermeldung (der Thread läuft weiter, das Ergebnis wird verworfen).",
+            guild.name, int(_ASSEMBLY_TIMEOUT_S),
+        )
+        raise RuntimeError(
+            f"Die Dokument-Aufbereitung hat zu lange gedauert (>{int(_ASSEMBLY_TIMEOUT_S)} s) "
+            "und wurde abgebrochen. Bitte erneut versuchen — passiert das bei diesem Server "
+            "wiederholt, melde dich mit dem Servernamen beim Bot-Team."
+        ) from None
+    finally:
+        ticker_task.cancel()
+
+    log.info("Server-Dokument-Aufbereitung fertig in %.1f s", time.monotonic() - assemble_started)
 
     await progress(100, "PDF fertiggestellt.")
     log.info(
@@ -2727,7 +2811,8 @@ async def build_channel_history_pdf(
     if history is not None:
         try:
             msgs = [m async for m in history(limit=max_messages)]
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound,
+                AttributeError, TypeError):
             msgs = []
     msgs.reverse()  # ÄLTESTE zuerst
 
@@ -2790,86 +2875,140 @@ async def build_channel_history_pdf(
 
     image_cache = await _download_images(http_session, image_urls, progress_hook=_img_progress_hist)
 
-    await progress(62, "Nachrichten werden aufbereitet …")
+    _dl_ok = sum(1 for v in image_cache.values() if v)
+    await progress(62, f"Bilder geladen ({_dl_ok}/{len(image_cache)}) — Chatverlauf wird aufbereitet …")
 
-    def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
-        return _image_flow(image_cache.get(url) if url else None, **kwargs)
+    _ensure_fonts()
+    _ensure_apple_emoji()
 
-    def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
-        return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
+    # Wie im Server-Dokument: Aufbereitung im Worker-Thread (Event-Loop bleibt
+    # lebendig — Timer, Logs und Fortschritts-Edits arbeiten weiter) statt
+    # blockierend auf dem Loop, plus Live-Ticker und Budget.
+    loop = asyncio.get_running_loop()
+    _last_pct = [62]
 
-    def emoji_png(eid: int) -> Optional[str]:
-        return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"hist-emoji-{eid}")
+    def _emit_soon(pct: int, text: str) -> None:
+        _last_pct[0] = max(_last_pct[0], min(pct, 99))
+        asyncio.ensure_future(progress(pct, text))
 
-    msg_ctx: Dict[str, Any] = {
-        "styles": styles,
-        "img": img,
-        "avatar_img": avatar_img,
-        "emoji_png": emoji_png,
-        "member_ids": member_ids,
-        "content_width": CONTENT_WIDTH,
-    }
+    def _emit(pct: int, text: str) -> None:
+        try:
+            loop.call_soon_threadsafe(_emit_soon, pct, text)
+        except RuntimeError:
+            pass  # Loop bereits geschlossen — Aufbau läuft weiter
 
-    flowables: List[Any] = []
+    async def _assembly_ticker(started: float) -> None:
+        while True:
+            await asyncio.sleep(_ASSEMBLY_TICKER_S)
+            try:
+                await progress(_last_pct[0], f"Chatverlauf wird erstellt … "
+                               f"({time.monotonic() - started:.0f} s verstrichen)")
+            except Exception:  # noqa: BLE001 — Ticker darf niemals abbrechen
+                pass
 
-    # ---- Kopfbereich ----
-    icon_url = getattr(guild.icon, "url", None) if guild.icon else None
-    icon_flow = _avatar_flow(image_cache.get(icon_url), 18) if icon_url else None
-    span = ""
-    if msgs:
-        first, last = msgs[0].created_at, msgs[-1].created_at
-        span = f"{first.strftime('%d.%m.%Y %H:%M')} – {last.strftime('%d.%m.%Y %H:%M')} UTC"
-    ch_type_name = str(getattr(getattr(channel, "type", None), "name", "kanal") or "kanal")
+    def _assemble() -> bytes:
+        """(Worker-Thread) Flowables + PDF-Bau für den Chatverlauf."""
+        def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
+            return _image_flow(image_cache.get(url) if url else None, **kwargs)
 
-    head_bits = [
-        f"Server <b>{_clean(guild.name)}</b> (ID {_clean(guild.id)})",
-        f"{_clean(ch_type_name.replace('_', ' ').title())}: <b>#{_clean(channel.name)}</b> "
-        f"(ID {_clean(channel.id)})",
-        f"{len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}"
-        + (f" · Zeitraum {span}" if span else ""),
-    ]
-    head_cells: List[Any] = ([icon_flow] if icon_flow is not None else []) + [[
-        Paragraph("Chatverlauf", ParagraphStyle(
-            "hist_title", fontName=_FONTS["bold"], fontSize=17, leading=21, textColor=_C.dark,
-        )),
-        Paragraph(" · ".join(head_bits), styles["subtitle"]),
-        Paragraph(
-            "<font color='#ED4245'>Vertraulich — nur für den Bot-Owner bestimmt.</font> "
-            "Nicht weitergeben.", styles["subtitle"],
-        ),
-    ]]
-    head_widths = [24 * mm, CONTENT_WIDTH - 24 * mm] if icon_flow is not None else [CONTENT_WIDTH]
-    head = Table([head_cells], colWidths=head_widths)
-    head.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    flowables.append(head)
-    flowables.append(HRFlowable(width="100%", thickness=1.1, color=_C.blurple, spaceAfter=3 * mm))
-    if not msgs:
-        flowables.append(Paragraph(
-            "Keine Nachrichten abrufbar (leer, keine Historie-Rechte oder Kanal nicht gefunden).",
-            styles["body"]))
+        def avatar_img(member_id: int, size_mm: float) -> Optional[Image]:
+            return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
 
-    for m in msgs:
-        flowables.extend(_message_flowables(m, styles, msg_ctx))
-        flowables.append(Spacer(1, 2.4 * mm))
+        def emoji_png(eid: int) -> Optional[str]:
+            return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"hist-emoji-{eid}")
 
-    await progress(88, "PDF-Datei wird geschrieben …")
-    pdf_bytes = _render_pdf(
-        flowables,
-        header_left=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
-        footer_left=(
-            "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
-            + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
-        ),
-        title=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
-        subject=f"Chatverlauf von #{getattr(channel, 'name', '?')} "
-                f"in {guild.name} (ID {guild.id})",
-    )
+        msg_ctx: Dict[str, Any] = {
+            "styles": styles,
+            "img": img,
+            "avatar_img": avatar_img,
+            "emoji_png": emoji_png,
+            "member_ids": member_ids,
+            "content_width": CONTENT_WIDTH,
+        }
+
+        flowables: List[Any] = []
+
+        # ---- Kopfbereich ----
+        icon_url = getattr(guild.icon, "url", None) if guild.icon else None
+        icon_flow = _avatar_flow(image_cache.get(icon_url), 18) if icon_url else None
+        span = ""
+        if msgs:
+            first, last = msgs[0].created_at, msgs[-1].created_at
+            span = f"{first.strftime('%d.%m.%Y %H:%M')} – {last.strftime('%d.%m.%Y %H:%M')} UTC"
+        ch_type_name = str(getattr(getattr(channel, "type", None), "name", "kanal") or "kanal")
+
+        head_bits = [
+            f"Server <b>{_clean(guild.name)}</b> (ID {_clean(guild.id)})",
+            f"{_clean(ch_type_name.replace('_', ' ').title())}: <b>#{_clean(channel.name)}</b> "
+            f"(ID {_clean(channel.id)})",
+            f"{len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}"
+            + (f" · Zeitraum {span}" if span else ""),
+        ]
+        head_cells: List[Any] = ([icon_flow] if icon_flow is not None else []) + [[
+            Paragraph("Chatverlauf", ParagraphStyle(
+                "hist_title", fontName=_FONTS["bold"], fontSize=17, leading=21, textColor=_C.dark,
+            )),
+            Paragraph(" · ".join(head_bits), styles["subtitle"]),
+            Paragraph(
+                "<font color='#ED4245'>Vertraulich — nur für den Bot-Owner bestimmt.</font> "
+                "Nicht weitergeben.", styles["subtitle"],
+            ),
+        ]]
+        head_widths = [24 * mm, CONTENT_WIDTH - 24 * mm] if icon_flow is not None else [CONTENT_WIDTH]
+        head = Table([head_cells], colWidths=head_widths)
+        head.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        flowables.append(head)
+        flowables.append(HRFlowable(width="100%", thickness=1.1, color=_C.blurple, spaceAfter=3 * mm))
+        if not msgs:
+            flowables.append(Paragraph(
+                "Keine Nachrichten abrufbar (leer, keine Historie-Rechte oder Kanal nicht gefunden).",
+                styles["body"]))
+
+        for m in msgs:
+            flowables.extend(_message_flowables(m, styles, msg_ctx))
+            flowables.append(Spacer(1, 2.4 * mm))
+
+        _emit(88, "PDF-Datei wird geschrieben …")
+        pdf_bytes = _render_pdf(
+            flowables,
+            header_left=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
+            footer_left=(
+                "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
+                + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+            ),
+            title=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
+            subject=f"Chatverlauf von #{getattr(channel, 'name', '?')} "
+                    f"in {guild.name} (ID {guild.id})",
+        )
+        return pdf_bytes
+
+    assemble_started = time.monotonic()
+    assemble_task = asyncio.create_task(asyncio.to_thread(_assemble))
+    ticker_task = asyncio.create_task(_assembly_ticker(assemble_started))
+    try:
+        pdf_bytes = await asyncio.wait_for(assemble_task, timeout=_ASSEMBLY_TIMEOUT_S)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning(
+            "Chatverlauf-Aufbereitung für #%s hat nach %d s nicht abgeschlossen — "
+            "Abbruch mit sichtbarer Fehlermeldung (der Thread läuft weiter, das Ergebnis wird verworfen).",
+            getattr(channel, "name", "?"), int(_ASSEMBLY_TIMEOUT_S),
+        )
+        raise RuntimeError(
+            f"Die Chatverlauf-Aufbereitung hat zu lange gedauert (>{int(_ASSEMBLY_TIMEOUT_S)} s) "
+            "und wurde abgebrochen. Bitte erneut versuchen — passiert das bei diesem Kanal "
+            "wiederholt, melde dich mit dem Kanal-/Servernamen beim Bot-Team."
+        ) from None
+    finally:
+        ticker_task.cancel()
+
+    log.info("Chatverlauf-Aufbereitung fertig in %.1f s", time.monotonic() - assemble_started)
+
     await progress(100, "PDF fertiggestellt.")
     log.info(
         "Chatverlauf-PDF für #%s in '%s' (ID %s) erstellt: %d KB, %d Nachrichten",

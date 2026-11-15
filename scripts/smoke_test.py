@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import os
 import re
@@ -1082,6 +1083,42 @@ async def t_pdf(h: Harness) -> None:
           str(pdf_bytes.count(b"/Type /Page")))
     check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
           f"{len(pdf_bytes) // 1024} KB")
+
+    # ── Regression: PDF-Aufbau läuft im Worker-Thread mit Budget ────────────
+    # Produktion: der gesamte Aufbau (Flowables + PIL + reportlab) lief als
+    # EIN synchroner Block AUF DEM EVENT-LOOP — blockierte er (große Bilder),
+    # fror ALLES ein: keine Fortschritts-Edits, keine Logs, keine Timer.
+    # Jetzt: Worker-Thread + Ticker + Budget mit sichtbarer Fehlermeldung.
+    _saved_budget = pdf_mod._ASSEMBLY_TIMEOUT_S
+    try:
+        pdf_mod._ASSEMBLY_TIMEOUT_S = 0.05
+        raised = None
+        g_budget = _standard_guild()
+        # Leere Historie-Fabrik: sonst greift die echte discord.py-History
+        # (HistoryIterator → logs_from), die das Fake-HTTP nicht kennt.
+        g_budget.text_channels[0].history = _history_factory([])
+        async with _aiohttp.ClientSession() as s_budget:
+            try:
+                await build_server_document(g_budget, s_budget, progress=_progress)
+            except RuntimeError as exc:
+                raised = str(exc)
+        check("Aufbau-Budget: Timeout → sichtbarer RuntimeError (kein ewiges Einfreeze)",
+              raised is not None and "zu lange" in raised, str(raised)[:140])
+    finally:
+        pdf_mod._ASSEMBLY_TIMEOUT_S = _saved_budget
+
+    # Pixel-Guard: übergroße Bilder werden VOR dem Dekodieren übersprungen.
+    from PIL import Image as _PILTest
+    _saved_mp = pdf_mod._MAX_IMAGE_PIXELS
+    try:
+        pdf_mod._MAX_IMAGE_PIXELS = 100
+        _buf = io.BytesIO()
+        _PILTest.new("RGB", (20, 20), (255, 0, 0)).save(_buf, "PNG")
+        _im = _PILTest.open(_buf)
+        check("Pixel-Guard: übergroße Bilder werden ohne Dekodieren übersprungen",
+              pdf_mod._pil_to_png_bytes(_im, max_px_w=10, circle=False) is None)
+    finally:
+        pdf_mod._MAX_IMAGE_PIXELS = _saved_mp
 
     # ── Regression: Die Bild-Download-Phase darf sich NIEMALS ewig aufhängen ──
     # Produktion (Render): ein Server blieb bei „Bilder werden geladen …" für
