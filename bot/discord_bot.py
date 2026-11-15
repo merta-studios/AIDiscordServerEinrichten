@@ -752,12 +752,21 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
         self.guild = guild
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Gleiches Guard-Prinzip wie das Panel: nur der Bot-Owner.
+        # Gleiches Guard-Prinzip wie das Panel: nur der Bot-Owner. Guards
+        # antworten IMMER sichtbar — ein stilles return würde Discord nur
+        # „Die Anwendung reagiert nicht“ zeigen.
         if int(getattr(self.client.config, "bot_owner_id", 0) or 0) == 0:
+            await interaction.response.send_message(
+                "ℹ️ Chatverlauf-Abruf ist nicht aktiviert (kein `BOT_OWNER_ID` gesetzt).",
+                ephemeral=True,
+            )
             return
         if interaction.user.id != self.client.config.bot_owner_id:
             log.warning("Chatverlauf-Abruf von %s — nicht der Bot-Owner.",
                         getattr(interaction.user, "id", "?"))
+            await interaction.response.send_message(
+                "⛔ Nur der Bot-Owner kann den Chatverlauf abrufen.", ephemeral=True,
+            )
             return
 
         raw = (self.channel_id.value or "").strip()
@@ -790,7 +799,18 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
             )
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # Sofortige, garantiert gültige Antwort (Callback Typ 4). Der frühere
+        # defer (Typ 5 + Ephemeral-Flags) ist bei Modal-Submits die einzige
+        # Stelle, an der Discord die Antwort mit „Etwas ist schief gelaufen“
+        # quittieren konnte — Typ 4 ist für Modals immer erlaubt und zeigt
+        # dem Owner sofort die Fortschritts-Nachricht.
+        try:
+            await interaction.response.send_message(
+                f"💬 Chatverlauf von **#{getattr(channel, 'name', '?')}** wird erstellt …",
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            log.warning("Modal-Antwort konnte nicht gesendet werden: %s — Verarbeitung läuft weiter.", exc)
         await self.client._handle_admin_history(interaction, channel)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
@@ -1770,7 +1790,10 @@ class RelayClient(discord.Client):
             guilds = []
             if context_guild is not None:
                 guilds.append(context_guild)
-            guilds.extend(g for g in self.guilds if g.id != getattr(context_guild, "id", None))
+            try:
+                guilds.extend(g for g in self.guilds if g.id != getattr(context_guild, "id", None))
+            except (AttributeError, TypeError):
+                pass  # z. B. Client ohne ConnectionState — Kontext-Server genügt
         for guild in guilds:
             channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
             if channel is None:
@@ -1963,36 +1986,70 @@ class RelayClient(discord.Client):
         an den Bot-Owner (Application-Owner). Niemals an einen Server oder den
         Server-Owner; ist der Bot-Owner nicht ermittelbar, wird NICHT versendet.
 
-        Wird aus AdminHistoryModal.on_submit aufgerufen (Response deferred).
+        Wird aus AdminHistoryModal.on_submit aufgerufen — die Interaktion wurde
+        bereits mit einer sofortigen Nachricht (Callback Typ 4) beantwortet.
+        Jeder Ausgang (erfolgreich, DM fehlgeschlagen, Fehler) wird dem Owner
+        SICHTBAR gemeldet — es gibt keinen stillen Pfad mehr, der nur Discords
+        generischen „Etwas ist schief gelaufen“-Dialog hinterlassen könnte.
         """
         guild = channel.guild
-        try:
-            app_info = await self.application_info()
-            recipient = app_info.owner if app_info is not None else None
-        except discord.HTTPException as exc:
-            log.warning("Application-Owner nicht ermittelbar (%s) — kein Chatverlauf-Versand.", exc)
-            recipient = None
-        if recipient is None:
-            await interaction.followup.send(
-                "❌ Der Bot-Owner konnte nicht ermittelt werden — der Chatverlauf "
-                "wird **nicht** versendet (niemals an Server oder Server-Owner).",
-                ephemeral=True,
-            )
-            return
+        ch_name = getattr(channel, "name", "?")
 
-        progress_msg = await interaction.followup.send(
-            f"Chatverlauf von #{channel.name} wird erstellt (0 %) …", ephemeral=True, wait=True
-        )
+        # Fortschritts-Nachricht: die Typ-4-Antwort des Modals (original) —
+        # Fallback: Followup (falls der Aufrufer statt Typ 4 deferred hat).
+        progress_msg: Any = None
+        try:
+            progress_msg = await interaction.original_response()
+        except Exception:  # noqa: BLE001 — Aufruf-Shape/HTTP-Fehler sind egal
+            progress_msg = None
+        if progress_msg is None:
+            try:
+                progress_msg = await interaction.followup.send(
+                    f"Chatverlauf von #{ch_name} wird erstellt (0 %) …",
+                    ephemeral=True, wait=True,
+                )
+            except Exception:  # noqa: BLE001 — ohne Fortschritt läuft der Bau weiter
+                progress_msg = None
+        if progress_msg is not None:
+            log.info("Chatverlauf-Abruf #%s: Fortschritts-Nachricht aktiv.", ch_name)
+
+        async def _final(content: str) -> None:
+            """Meldet das Ergebnis sichtbar — nie raisend, nie still."""
+            if progress_msg is not None:
+                try:
+                    await progress_msg.edit(content=content)
+                    return
+                except Exception:  # noqa: BLE001 — z. B. Token nach 15 min abgelaufen
+                    log.warning("Ergebnis-Edit der Chatverlauf-Nachricht fehlgeschlagen — Fallback auf Followup.")
+            try:
+                await interaction.followup.send(content, ephemeral=True)
+            except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
+                log.warning("Chatverlauf-Ergebnis konnte nicht angezeigt werden: %s", content[:80])
 
         async def _progress(percent: int, text: str) -> None:
+            if progress_msg is None:
+                return
             try:
                 await progress_msg.edit(
-                    content=f"Chatverlauf von #{channel.name} wird erstellt ({percent} %) — {text}"
+                    content=f"Chatverlauf von #{ch_name} wird erstellt ({percent} %) — {text}"
                 )
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                pass
+                pass  # z. B. Interaktions-Token nach 15 min abgelaufen — DM geht trotzdem raus
 
         try:
+            try:
+                app_info = await self.application_info()
+                recipient = app_info.owner if app_info is not None else None
+            except discord.HTTPException as exc:
+                log.warning("Application-Owner nicht ermittelbar (%s) — kein Chatverlauf-Versand.", exc)
+                recipient = None
+            if recipient is None:
+                await _final(
+                    "❌ Der Bot-Owner konnte nicht ermittelt werden — der Chatverlauf "
+                    "wird **nicht** versendet (niemals an Server oder Server-Owner)."
+                )
+                return
+
             http_session = getattr(self.state, "http_session", None)
             if http_session is None:
                 http_session = aiohttp.ClientSession(
@@ -2026,7 +2083,7 @@ class RelayClient(discord.Client):
             try:
                 sent = await recipient.send(
                     content=(
-                        f"💬 **Chatverlauf von #{channel.name}** in **{guild.name}** "
+                        f"💬 **Chatverlauf von #{ch_name}** in **{guild.name}** "
                         f"(Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
                         "Dieses PDF enthält den **kompletten** Chatverlauf des Kanals "
                         "(inkl. Apple-Emojis, Bildanhängen, Komponenten, Embeds und "
@@ -2039,13 +2096,11 @@ class RelayClient(discord.Client):
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("Chatverlauf-PDF konnte nicht per DM an %s gesendet werden: %s",
                             recipient.display_name, exc)
-                await progress_msg.edit(
-                    content=(
-                        f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an "
-                        f"{recipient.display_name}** zugestellt werden.\n"
-                        "Mögliche Ursache: DMs vom Bot sind deaktiviert oder es gibt "
-                        "keinen gemeinsamen Server."
-                    ),
+                await _final(
+                    f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an "
+                    f"{recipient.display_name}** zugestellt werden.\n"
+                    "Mögliche Ursache: DMs vom Bot sind deaktiviert oder es gibt "
+                    "keinen gemeinsamen Server."
                 )
                 return
 
@@ -2055,23 +2110,18 @@ class RelayClient(discord.Client):
                 "message_id": sent.id,
                 "guild_id": guild.id,
                 "channel_id": channel.id,
-                "channel_name": getattr(channel, "name", "?"),
+                "channel_name": ch_name,
                 "sent_at": now_utc().isoformat(),
             }
             self._save_doc_delivery(state)
 
-            await progress_msg.edit(
-                content=(
-                    f"✅ Chatverlauf von **#{channel.name}** ({len(pdf_bytes) // 1024} KB) erstellt "
-                    f"und per DM an **{recipient.display_name}** (Bot-Owner) gesendet."
-                ),
+            await _final(
+                f"✅ Chatverlauf von **#{ch_name}** ({len(pdf_bytes) // 1024} KB) erstellt "
+                f"und per DM an **{recipient.display_name}** (Bot-Owner) gesendet."
             )
         except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt
-            log.exception("Fehler beim Erstellen des Chatverlaufs für '%s'", getattr(channel, "name", "?"))
-            try:
-                await progress_msg.edit(content=f"❌ Fehler beim Erstellen des Chatverlaufs: {exc}")
-            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                await interaction.followup.send(f"❌ Fehler: {exc}", ephemeral=True)
+            log.exception("Fehler beim Erstellen des Chatverlaufs für '%s'", ch_name)
+            await _final(f"❌ Fehler beim Erstellen des Chatverlaufs: {exc}")
 
     async def _new_session(self, guild: discord.Guild, member: discord.Member, *, note: str):
         """

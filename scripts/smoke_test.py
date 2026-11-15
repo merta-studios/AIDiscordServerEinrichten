@@ -59,7 +59,8 @@ VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _fake_discord import (  # noqa: E402
-    GUILD_ID, TEXT_ID, USER_ID, FakeClient, FakeGuild, FakeMessage, MutableGuild, now,
+    GUILD_ID, OWNER_ID, TEXT_ID, USER_ID, FakeClient, FakeGuild, FakeMessage,
+    MutableGuild, now,
 )
 
 OTHER_GUILD_ID = 1212121212121212
@@ -1424,7 +1425,12 @@ async def t_history_delivery(h: Harness) -> None:
         id=777, name="verlauf", guild=fguild, type=None,
         history=lambda limit=None: _gen(limit),
     )
-    interaction = SimpleNamespace(followup=_Followup())
+    async def _aret(msg: Any) -> Any:
+        return msg
+
+    prog = _ProgMsg()
+    interaction = SimpleNamespace(
+        original_response=lambda: _aret(prog), followup=_Followup())
     await client._handle_admin_history(interaction, fchannel)
 
     owner_user = users[bot_owner.id]
@@ -1442,9 +1448,8 @@ async def t_history_delivery(h: Harness) -> None:
     check("Status-File: last_history_delivery gespeichert",
           hist_state.get("channel_id") == 777 and hist_state.get("recipient_id") == bot_owner.id,
           str(state))
-    check("Fortschritt endet mit ✅", bool(interaction.followup.msg.edits)
-          and "✅" in (interaction.followup.msg.edits[-1] or ""),
-          str(interaction.followup.msg.edits[-1:]))
+    check("Fortschritt endet mit ✅", bool(prog.edits)
+          and "✅" in (prog.edits[-1] or ""), str(prog.edits[-1:]))
 
     # Fehlschlag: Application-Owner unlesbar → NICHT versendet (nie Server-Owner)
     async def _app_info_fail() -> Any:
@@ -1453,12 +1458,13 @@ async def t_history_delivery(h: Harness) -> None:
 
     client.application_info = _app_info_fail  # type: ignore[method-assign]
     owner_user.sent.clear()
-    interaction_fail = SimpleNamespace(followup=_Followup())
+    prog_fail = _ProgMsg()
+    interaction_fail = SimpleNamespace(
+        original_response=lambda: _aret(prog_fail), followup=_Followup())
     await client._handle_admin_history(interaction_fail, fchannel)
     check("Ohne Application-Info: kein Versand (nie Server/Server-Owner)",
-          len(owner_user.sent) == 0 and bool(interaction_fail.followup.calls)
-          and "nicht" in (interaction_fail.followup.calls[0][0] or ""),
-          str(interaction_fail.followup.calls[:1]))
+          len(owner_user.sent) == 0 and bool(prog_fail.edits)
+          and "nicht" in (prog_fail.edits[-1] or ""), str(prog_fail.edits[-1:]))
     client.application_info = _app_info  # type: ignore[method-assign]
 
     # Prä-Zustellungs-Aufräumen: alte chatverlauf-*.pdf-DMs werden gelöscht
@@ -1482,6 +1488,109 @@ async def t_history_delivery(h: Harness) -> None:
     deleted = await client._cleanup_previous_history_documents(bot_owner.id)
     check("Prä-Zustellung: alte Chatverlauf-DM gelöscht, fremde bleibt",
           deleted == 1 and m_hist.deleted and not m_other.deleted, f"{deleted} gelöscht")
+
+    # ── E2E: Der ECHTE Modal-Flow (Button → Formular → Absenden → on_submit) ──
+    # Regression: In Produktion zeigte Discord nach dem Absenden des Modals
+    # „Etwas ist schief gelaufen" — der früher verwendete defer (Typ 5 mit
+    # Ephemeral-Flags) ist bei Modal-Submits die riskante Antwort; jetzt
+    # antwortet das Modal sofort per Typ 4 (send_message), und ALLE Ausgänge
+    # (erfolgreich, DM fehlgeschlagen, Fehler) landen sichtbar in der Nachricht.
+    print("── Chatverlauf-Modal: kompletter on_submit-Flow ──────────────")
+    from bot.discord_bot import AdminHistoryModal
+
+    g2 = _standard_guild()
+    mchannel = g2.text_channels[0]
+
+    def _hist_factory2(messages: List[Any]):
+        def history(limit=None):
+            async def gen():
+                for m in messages[: limit or None]:
+                    yield m
+            return gen()
+        return history
+
+    gone_author = SimpleNamespace(
+        id=999000000000000001, name="geloescht", display_name="Gelöscht 123",
+        bot=False, display_avatar=SimpleNamespace(url="http://127.0.0.1:1/av.png"),
+    )
+    modal_msgs = [
+        FakeMessage(910000000000000001, mchannel, g2.owner,
+                    content=f"Hallo <@{OWNER_ID}> 🎉 — Verlauf-Test"),
+        FakeMessage(910000000000000002, mchannel, g2.me,
+                    content="Bot-Antwort mit 👍🏽 und <:tada:455601000000000018>"),
+        FakeMessage(910000000000000003, mchannel, gone_author,
+                    content="Nachricht eines Verlassenen"),
+    ]
+    mchannel.history = _hist_factory2(modal_msgs)
+
+    owner2 = _HUser(555555555555555555, "Bot-Betreiber 2")
+    users2 = {owner2.id: owner2}
+    client2 = RelayClient.__new__(RelayClient)
+    client2.config = SimpleNamespace(bot_owner_id=owner2.id)
+    client2.get_user = lambda uid: users2.get(uid)  # type: ignore[method-assign]
+    client2.fetch_user = users2.get  # type: ignore[method-assign]
+    client2.state = SimpleNamespace(http_session=None)
+    state_path2 = _os.path.join(tmpdir, "delivery2.json")
+    client2._doc_delivery_state_path = lambda: state_path2  # type: ignore[method-assign]
+
+    async def _app_info2() -> Any:
+        return SimpleNamespace(owner=owner2)
+
+    client2.application_info = _app_info2  # type: ignore[method-assign]
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.sent: List[Any] = []
+
+        async def send_message(self, content: Optional[str] = None,
+                               ephemeral: bool = False, **kw: Any) -> None:
+            self.sent.append((content, ephemeral))
+
+        def is_done(self) -> bool:
+            return bool(self.sent)
+
+    async def run_modal(client_x: Any, guild_x: Any, value: str,
+                        user: Any, prog_x: _ProgMsg) -> _Resp:
+        modal = AdminHistoryModal(client_x, guild_x)
+        modal.channel_id._value = value  # noqa: SLF001 — Test-Injektion
+        resp = _Resp()
+        inter = SimpleNamespace(
+            user=user, response=resp,
+            original_response=lambda: _aret(prog_x), followup=_Followup())
+        await modal.on_submit(inter)
+        return resp
+
+    resp_ok = await run_modal(client2, g2, str(mchannel.id), owner2, _ProgMsg())
+    check("Modal antwortet SOFORT per send_message (Typ 4, kein defer)",
+          len(resp_ok.sent) == 1 and resp_ok.sent[0][1] is True
+          and "wird erstellt" in (resp_ok.sent[0][0] or ""), str(resp_ok.sent))
+    check("Modal-E2E: PDF per DM an den Bot-Owner",
+          len(owner2.sent) == 1
+          and getattr(owner2.sent[0].get("file"), "filename", "").startswith(
+              f"chatverlauf-{g2.id}-"), str([x.get("file") for x in owner2.sent]))
+    state2 = _json.load(open(state_path2, encoding="utf-8"))
+    check("Modal-E2E: Status-File gespeichert",
+          (state2.get("last_history_delivery") or {}).get("channel_id") == mchannel.id,
+          str(state2))
+
+    # Kanal existiert nicht (Bot nicht im Server) → sichtbare Fehlermeldung
+    resp_missing = await run_modal(client2, g2, "888888888888888888", owner2, _ProgMsg())
+    check("Modal: Kanal nicht gefunden → sichtbare Meldung statt Stillstand",
+          len(resp_missing.sent) == 1 and "Kanal nicht gefunden" in (resp_missing.sent[0][0] or ""),
+          str(resp_missing.sent))
+
+    # Keine gültige ID → sichtbare Fehlermeldung
+    resp_bad = await run_modal(client2, g2, "keine-zahl", owner2, _ProgMsg())
+    check("Modal: ungültige Eingabe → sichtbare Meldung",
+          len(resp_bad.sent) == 1 and "keine Kanal-ID" in (resp_bad.sent[0][0] or ""),
+          str(resp_bad.sent))
+
+    # Nicht-Owner → Abwehr mit sichtbarer Meldung
+    other_user = SimpleNamespace(id=111222333444555666, display_name="Angreifer")
+    resp_not_owner = await run_modal(client2, g2, str(mchannel.id), other_user, _ProgMsg())
+    check("Modal: Nicht-Owner wird abgewehrt (mit sichtbarer Meldung)",
+          len(resp_not_owner.sent) == 1 and "Bot-Owner" in (resp_not_owner.sent[0][0] or ""),
+          str(resp_not_owner.sent))
 
 
 async def t_security(h: Harness) -> None:
