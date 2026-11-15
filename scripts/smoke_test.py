@@ -1845,6 +1845,58 @@ async def t_history_delivery(h: Harness) -> None:
     db_mod.current_rss_mb = lambda: 256.0
     check("Auslastung ohne cgroup: Prozess-RSS/512 → 50 %",
           db_mod._auslastung_pct() == 50, str(db_mod._auslastung_pct()))
+    db_mod.container_memory_mb = lambda: (128.0, 512.0)
+
+    # RAM-Zeile: Page-Cache transparent ausgewiesen (OOM-relevant = anonym)
+    _saved_cache = db_mod.container_cache_mb
+    db_mod.container_cache_mb = lambda: 140.0
+    _line_cache = db_mod._ram_line()
+    check("RAM-Zeile: Cache-Anteil separat (+140 Cache) — Guard-Wert bleibt anon",
+          "128/512 MB" in _line_cache and "+140 Cache" in _line_cache,
+          repr(_line_cache))
+    db_mod.container_cache_mb = lambda: -1.0
+    check("RAM-Zeile ohne Cache-Wert: keine Cache-Angabe",
+          "Cache" not in db_mod._ram_line(), repr(db_mod._ram_line()))
+    db_mod.container_cache_mb = _saved_cache
+
+    # Fortschritts-Relay: Interaktions-Token abgelaufen → neue NORMALE Nachricht
+    class _DeadMsg:
+        def __init__(self) -> None:
+            self.tries = 0
+
+        async def edit(self, content: Any = None, **kw: Any) -> None:
+            self.tries += 1
+            raise RuntimeError("Interaction-Token abgelaufen")
+
+    class _NewMsg:
+        def __init__(self) -> None:
+            self.edits: List[Any] = []
+
+        async def edit(self, content: Any = None, **kw: Any) -> None:
+            self.edits.append(content)
+
+    class _Chan:
+        def __init__(self, msg: Any) -> None:
+            self._msg = msg
+            self.sent: List[Any] = []
+
+        async def send(self, content: Any = None, **kw: Any) -> Any:
+            self.sent.append(content)
+            return self._msg
+
+    _dead = _DeadMsg()
+    _new = _NewMsg()
+    _chan = _Chan(_new)
+    _relay = db_mod._ProgressRelay(_dead, _chan)
+    _r1 = await _relay.edit("Stand 1")
+    _r2 = await _relay.edit("Stand 2")
+    check("Fortschritts-Relay: Token-Expiry → neue normale Nachricht, dort weiter",
+          _r1 and _r2 and _dead.tries == 1 and _chan.sent == ["Stand 1"]
+          and _new.edits == ["Stand 2"],
+          f"tries={_dead.tries} sent={_chan.sent} edits={_new.edits}")
+    check("Fortschritts-Relay: ohne Kanal kein Crash",
+          not await db_mod._ProgressRelay(_DeadMsg(), None).edit("x"), "ok")
+
     db_mod.container_memory_mb = _saved_cont
     db_mod.current_rss_mb = _saved_rss2
 

@@ -428,10 +428,12 @@ Sobald der Bot startet (auch nach einem automatischen Neustart), bekommt der
 Bot-Owner sofort eine DM: „🟢 Bot ist online“ mit Uhrzeit, Version und aktuellem
 RAM-Stand — man sieht also sofort, wenn der Bot z. B. durch zu wenig RAM (OOM)
 neu gestartet ist, ohne auf Render-Logs warten zu müssen. Die DM zeigt **zwei
-RAM-Werte**: den **Container-RAM** (aus dem cgroup-Memory-Controller — genau
-die Zahl, bei deren Überschreitung Render den OOM-Kill macht; sie zählt alle
-Prozesse + Seiten-Cache) und den **Prozess-RAM** (der Bot selbst). Alle 60 s
-landen beide Werte in den Render-Logs (Warn ab 300 MB, kritisch ab 420 MB mit
+RAM-Werte**: den **Container-RAM** (OOM-relevant = der anonyme Anteil aus dem
+cgroup-Memory-Controller — genau der, bei dessen Überschreitung Render den
+OOM-Kill macht) und den **Prozess-RAM** (der Bot selbst). Signifikanter
+Page-Cache (Datei-I/O — gibt der Kernel bei Druck automatisch frei) wird
+separat ausgewiesen und zählt nicht als OOM-Risiko. Alle 60 s landen alle
+Werte in den Render-Logs (Warn ab 300 MB, kritisch ab 420 MB mit
 automatischem Aufräumen: GC + PDF-Bildcaches schließen).
 Große Chatverläufe werden **streamend** verarbeitet und automatisch in
 mehrere **Teil-PDFs** aufgeteilt (je 100 Nachrichten): Es liegen nie alle
@@ -443,16 +445,25 @@ Ergebnis-Statistik; genau diese Retention war früher der kumulative OOM,
 der RAM stieg ~10 MB pro Teil und fiel nie wieder ab). **Jedes Teil wird
 zusätzlich in einem isolierten KINDPROZESS gebaut** (fork): Das Kind erbt die
 Batch-Nachrichten direkt aus dem Speicher (Copy-on-Write, kein Pickling),
-baut das PDF und endet — damit gibt es seinen kompletten RAM garantiert ans
-OS zurück. Churn und Heap-Fragmentierung von reportlab/Pillow (früher ~3-10 MB
-pro Teil, die nie freigegeben wurden) sterben mit dem Prozess und können den
-Bot-Prozess gar nicht mehr erreichen. Nach jedem Teil werden zusätzlich die
-Bild-Caches geleert und GC ausgeführt; vor jedem weiteren Teil prüft ein
-RAM-Guard den **Container-RAM**. Die Fortschritts-Nachrichten zeigen **zwei
+**streamt das PDF seitenweise direkt in eine Pipe** (nie das fertige PDF im
+RAM des Kindes, kein Temp-File/Page-Cache) und endet — damit gibt es seinen
+kompletten RAM garantiert ans OS zurück. Churn und Heap-Fragmentierung von
+reportlab/Pillow (früher ~3-10 MB pro Teil, die nie freigegeben wurden)
+sterben mit dem Prozess und können den Bot-Prozess gar nicht mehr erreichen.
+Schlägt ein Kind fehl, baut NUR dieses Teil als Fallback im Hauptprozess —
+der Lauf bricht nicht ab. glibc-Arenen sind auf 2 begrenzt (`M_ARENA_MAX`,
+sonst behalten Worker-Thread-Arenen freigegebenen Speicher). Nach jedem Teil
+werden zusätzlich die Bild-Caches geleert und GC ausgeführt; vor jedem
+weiteren Teil prüft ein RAM-Guard den **OOM-relevanten Container-RAM**. Die
+Fortschritts-Nachrichten zeigen **zwei
 Balken** (Teile-Fortschritt + Schritt im laufenden Teil) und den **aktuellen
 RAM** live (🧠) — aus Emojis (🟩⬜) und als **normale Nachrichten** (kein „Nur
 du kannst das sehen“-Banner, kein Verwerfen-Button — sie bleiben auch nach
-einem Neustart des Discord-Clients sichtbar).
+einem Neustart des Discord-Clients sichtbar). Läuft der Bau länger als die
+~15-minütige Interaktions-Token-Gültigkeit, schaltet die Anzeige automatisch
+auf eine frische, normale Nachricht um und läuft dort weiter — der Balken
+friert nicht mehr ein (früher stand er ab Teil ~32, obwohl bis Teil 76
+gebaut wurde).
 
 Die **Teil-DMs selbst sind minimal**: nur `Teil 3/85:` und darunter die
 Datei (Dateiname enthält Server-/Kanal-ID und Teilnummer) — kein
@@ -822,7 +833,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 361 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 365 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -905,7 +916,7 @@ akzeptiert diese Sequenz bei **Buttons** klaglos, lehnt sie aber bei
 bekannte Inkonsistenz der Discord-API). `defer()` war dabei immer erfolgreich
 — erst der `followup.send()` mit der fertigen Liste scheiterte, weshalb der
 Client bis zum Timeout „Bot denkt nach…“ zeigte. Auf `main` aktualisieren
-(`/api/health` → `version` sollte `1.0.5` oder neuer sein) und `/adminpanel`
+(`/api/health` → `version` sollte `1.0.6` oder neuer sein) und `/adminpanel`
 erneut ausführen. Im Render-Log steht bei diesem Fehler
 `followup.send() fehlgeschlagen … discord_error_code=…`.
 
@@ -1097,7 +1108,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        361 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        365 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
