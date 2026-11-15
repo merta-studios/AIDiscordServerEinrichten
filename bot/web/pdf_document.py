@@ -436,6 +436,20 @@ _apple_index: Dict[str, List[int]] = {}
 _apple_tmpdir: Optional[str] = None
 _apple_png_cache: Dict[str, str] = {}  # Key → Pfad der zugeschnittenen PNG
 
+#: CDN für EINZELNE Apple-Emoji-PNGs (iamcal/emoji-data über jsDelivr —
+#: exakt dieselben Apple-Bilder, aus denen das Sheet gebaut wurde). Damit
+#: muss das 6,8-MB-Sheet NICHT mehr dekodiert werden (≈69 MB RGBA im RAM)
+#: — jedes benötigte Emoji kommt als wenige-KB-PNG und bleibt auf Disk
+#: gecacht. Das lokale Sheet bleibt als Offline-Fallback (wenn das CDN
+#: nicht erreichbar ist). Tests setzen _APPLE_USE_CDN = False.
+_APPLE_CDN_BASE = "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/img-apple-64"
+_APPLE_USE_CDN = True
+_APPLE_CDN_TIMEOUT_S = 4.0
+_apple_cdn_dead = False  # Netzfehler → für die Laufzeit auf Sheet-Fallback umschalten
+
+#: Beobachtung (Tests): wie viele Teil-Bauten im isolierten Kindprozess liefen.
+_FORK_BUILDS = {"ok": 0}
+
 #: Candidate-Ranges für den Beginn/Fortlauf von Emoji-Sequenzen
 def _emoji_cp(o: int) -> bool:
     return (
@@ -450,22 +464,26 @@ def _emoji_cp(o: int) -> bool:
 
 
 def _ensure_apple_emoji() -> bool:
-    """Lädt Index + Sheet (lazy). False, wenn Assets fehlen."""
+    """
+    Lädt Index + Sheet (lazy) bzw. bereitet den CDN-Modus vor.
+    False, wenn weder lokale Assets noch CDN zur Verfügung stehen.
+    """
     global _apple_tmpdir
     if _apple_tmpdir is not None:
-        return bool(_apple_index)
-    if not (_APPLE_INDEX_PATH.is_file() and _APPLE_SHEET_PATH.is_file()):
-        _apple_tmpdir = ""
-        return False
-    try:
-        with open(_APPLE_INDEX_PATH, "r", encoding="utf-8") as fh:
-            _apple_index.update(json.load(fh))
+        return bool(_apple_index) or (_APPLE_USE_CDN and not _apple_cdn_dead)
+    if _APPLE_INDEX_PATH.is_file() and _APPLE_SHEET_PATH.is_file():
+        try:
+            with open(_APPLE_INDEX_PATH, "r", encoding="utf-8") as fh:
+                _apple_index.update(json.load(fh))
+            _apple_tmpdir = tempfile.mkdtemp(prefix="apple-emoji-")
+            return True
+        except (OSError, ValueError) as exc:
+            log.warning("Apple-Emoji-Assets nicht ladbar: %s", exc)
+    if _APPLE_USE_CDN and not _apple_cdn_dead:
         _apple_tmpdir = tempfile.mkdtemp(prefix="apple-emoji-")
         return True
-    except (OSError, ValueError) as exc:
-        log.warning("Apple-Emoji-Assets nicht ladbar: %s", exc)
-        _apple_tmpdir = ""
-        return False
+    _apple_tmpdir = ""
+    return False
 
 
 def _close_apple_sheet() -> None:
@@ -479,12 +497,57 @@ def _close_apple_sheet() -> None:
         _apple_sheet_img = None
 
 
-def _apple_emoji_png(key: str, pos: List[int]) -> Optional[str]:
-    """Schneidet ein Emoji aus dem Apple-Sheet und liefert den PNG-Pfad."""
+def _fetch_apple_cdn_png(key: str) -> Optional[bytes]:
+    """
+    Lädt ein einzelnes Apple-Emoji-PNG (64 px, iamcal/emoji-data via jsDelivr).
+    None bei Fehlern: Ein 404 bedeutet „dieses Key ist im Apple-Set nicht
+    vorhanden“ (CDN bleibt aktiv); ein Netz-/Timeout-Fehler markiert das CDN
+    für die RESTLAUFZEIT als tot → lokales Sheet als Fallback (keine
+    Timeout-Wartezeit pro Emoji mehr).
+    """
+    global _apple_cdn_dead
+    import urllib.error
+    import urllib.request
+
+    url = f"{_APPLE_CDN_BASE}/{key.lower()}.png"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AIDiscordServerEinrichten/emoji"})
+        with urllib.request.urlopen(req, timeout=_APPLE_CDN_TIMEOUT_S) as resp:
+            return resp.read()
+    except urllib.error.HTTPError:
+        return None
+    except Exception:  # noqa: BLE001 — Netzfehler: Fallback, nie abstürzen
+        _apple_cdn_dead = True
+        log.info("Apple-Emoji-CDN nicht erreichbar — lokales Sheet wird als Fallback verwendet.")
+        return None
+
+
+def _apple_emoji_png(key: str, pos: Optional[List[int]]) -> Optional[str]:
+    """
+    Liefert den Pfad eines Apple-Emoji-PNGs: Disk-Cache → CDN (einzelne
+    kleine PNGs) → lokales Sheet (Crop). Die Dateien bleiben im Temp-Verzeichnis
+    des Prozesses liegen — über alle Teile hinweg wird nie zweimal geladen.
+    """
     global _apple_sheet_img
     cached = _apple_png_cache.get(key)
     if cached:
         return cached
+    path = os.path.join(_apple_tmpdir or "", f"{key}.png")
+    if os.path.isfile(path):
+        _apple_png_cache[key] = path
+        return path
+    if _APPLE_USE_CDN and not _apple_cdn_dead:
+        data = _fetch_apple_cdn_png(key)
+        if data:
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                _apple_png_cache[key] = path
+                return path
+            except OSError:
+                pass
+    if pos is None:
+        return None
     try:
         if _apple_sheet_img is None:
             if _PILImage is None:
@@ -510,7 +573,7 @@ def _apple_emoji_seq_img(run: str) -> Optional[str]:
     """
     Versucht, eine Emoji-Zeichenfolge (bereits aus dem Text gegriffen) als
     Apple-Sprite zu rendern → Pfad der PNG, sonst None. VS16/Variationen
-    werden normalisiert (Sheet indiziert ohne/mit FE0F).
+    werden normalisiert (Sheet/CDN indiziert ohne/mit FE0F).
     """
     if not _ensure_apple_emoji():
         return None
@@ -527,7 +590,14 @@ def _apple_emoji_seq_img(run: str) -> Optional[str]:
     for key in keys:
         pos = _apple_index.get(key)
         if pos is not None:
-            return _apple_emoji_png(key, pos)
+            img = _apple_emoji_png(key, pos)
+            if img is not None:
+                return img
+        elif _APPLE_USE_CDN and not _apple_cdn_dead:
+            # Kein Sheet-Index (oder Key nur im CDN-Set) — CDN versuchen.
+            img = _apple_emoji_png(key, None)
+            if img is not None:
+                return img
     return None
 
 
@@ -3171,10 +3241,99 @@ async def build_channel_history_pdf(
                 subject=f"Chatverlauf von #{ch_name} in {guild.name} (ID {guild.id})",
             )
 
+        _iso_counter = [0]
+
+        async def _assemble_isolated() -> bytes:
+            """
+            Baut das Teil-PDF in einem ISOLIERTEN KINDPROZESS (fork).
+
+            Der Kumulativ-OOM (Teil 8, dann 12, dann 20 — RAM stieg ~3-10 MB
+            pro Teil und fiel nie wieder ab) kam vom Aufbau IM Bot-Prozess:
+            Allokations-Churn und Heap-Fragmentierung von reportlab/Pillow
+            bleiben dort über alle Teile liegen — selbst gc + malloc_trim
+            können das nicht vollständig beheben (Fragmente im Heap bleiben).
+            Ein Kindprozess, der NACH JEDEM TEIL endet, gibt seinen gesamten
+            Speicher garantiert ans OS zurück — Leaks und Fragmentierung
+            sterben mit dem Prozess. Über fork erbt das Kind die Batch-
+            Nachrichten und Bild-Daten direkt aus dem Speicher (kein Pickling,
+            keine Kopie — Copy-on-Write); übertragen wird nur die fertige
+            PDF-Datei über ein Temp-Verzeichnis.
+
+            Fallback: In-Process-Bau im Thread, wenn fork nicht verfügbar ist
+            (Windows) oder der Kindprozess nicht gestartet werden kann.
+            """
+            if not hasattr(os, "fork"):
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
+                )
+            out_path = os.path.join(
+                tempfile.gettempdir(),
+                f"verlauf-teil-{os.getpid()}-{_iso_counter[0]}.bin",
+            )
+            err_path = out_path + ".err"
+            _iso_counter[0] += 1
+
+            def _child() -> None:  # läuft NUR im Kindprozess (sync, kein asyncio!)
+                try:
+                    data = _assemble()
+                    tmp_path = out_path + ".tmp"
+                    with open(tmp_path, "wb") as fh:
+                        fh.write(data)
+                    os.rename(tmp_path, out_path)  # atomar: nie halbe Dateien
+                except BaseException as exc:  # noqa: BLE001 — Kind meldet jeden Fehler
+                    try:
+                        with open(err_path, "w", encoding="utf-8") as fh:
+                            fh.write(f"{type(exc).__name__}: {exc}")
+                    except OSError:
+                        pass
+                    os._exit(1)  # keine Cleanup-Handler — Parent-Verbindungen unberührt
+                os._exit(0)
+
+            import multiprocessing as _mp
+            import warnings as _warnings
+
+            try:
+                proc = _mp.get_context("fork").Process(target=_child, daemon=True)
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore", DeprecationWarning)
+                    proc.start()
+            except Exception:  # noqa: BLE001 — fallback statt Abbruch
+                log.warning("Kindprozess für Teil-Bau nicht startbar — Bau im Hauptprozess.",
+                            exc_info=True)
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
+                )
+            await asyncio.to_thread(proc.join, _ASSEMBLY_TIMEOUT_S)
+            if proc.is_alive():
+                proc.kill()
+                await asyncio.to_thread(proc.join, 5)
+                raise TimeoutError(
+                    f"Teil-Aufbau hat {_ASSEMBLY_TIMEOUT_S:.0f}s überschritten — "
+                    "Kindprozess gestoppt."
+                )
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as fh:
+                    data = fh.read()
+                os.unlink(out_path)
+                if os.path.exists(err_path):
+                    os.unlink(err_path)
+                _FORK_BUILDS["ok"] += 1
+                return data
+            err_text = ""
+            if os.path.exists(err_path):
+                try:
+                    with open(err_path, "r", encoding="utf-8") as fh:
+                        err_text = fh.read()
+                    os.unlink(err_path)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f"Teil-Aufbau im isolierten Prozess fehlgeschlagen "
+                f"(Exit {proc.exitcode}) {err_text}".strip()
+            )
+
         await _part_report(48, f"{label}: PDF wird geschrieben …")
-        pdf_bytes = await asyncio.wait_for(
-            asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
-        )
+        pdf_bytes = await _assemble_isolated()
 
         # RAM-Hygiene nach JEDEM Teil: Bild-Cache leeren, Emoji-Zuordnungen
         # leeren, das Apple-Sheet (69 MB!) schließen (wird fürs nächste Teil

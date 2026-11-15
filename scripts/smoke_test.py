@@ -1152,6 +1152,12 @@ async def t_pdf(h: Harness) -> None:
 
     # Apple-Sheet-RAM: nach dem Build freigegeben, Emoji-Crops bleiben nutzbar
     pdf_mod._apple_png_cache.clear()
+    # Auch den Disk-Cache leeren (die PNGs bleiben sonst über Teile hinweg
+    # liegen — Feature) — ohne das würde das Sheet gar nicht erst öffnen:
+    if pdf_mod._apple_tmpdir:
+        for _f in os.listdir(pdf_mod._apple_tmpdir):
+            if _f.endswith(".png"):
+                os.remove(os.path.join(pdf_mod._apple_tmpdir, _f))
     _ = pdf_mod._apple_emoji_seq_img("🎉")  # zwingend öffnen (lazy load)
     sheet_was = pdf_mod._apple_sheet_img
     pdf_mod._close_apple_sheet()
@@ -1168,8 +1174,16 @@ async def t_pdf(h: Harness) -> None:
     # fror ALLES ein: keine Fortschritts-Edits, keine Logs, keine Timer.
     # Jetzt: Worker-Thread + Ticker + Budget mit sichtbarer Fehlermeldung.
     _saved_budget = pdf_mod._ASSEMBLY_TIMEOUT_S
+    _saved_render = pdf_mod._render_pdf
     try:
+        import time as _time_mod
         pdf_mod._ASSEMBLY_TIMEOUT_S = 0.05
+
+        def _slow_render(*a: Any, **k: Any) -> bytes:
+            _time_mod.sleep(0.3)  # deterministisch über dem Budget
+            return _saved_render(*a, **k)
+
+        pdf_mod._render_pdf = _slow_render
         raised = None
         g_budget = _standard_guild()
         # Leere Historie-Fabrik: sonst greift die echte discord.py-History
@@ -1184,6 +1198,7 @@ async def t_pdf(h: Harness) -> None:
               raised is not None and "zu lange" in raised, str(raised)[:140])
     finally:
         pdf_mod._ASSEMBLY_TIMEOUT_S = _saved_budget
+        pdf_mod._render_pdf = _saved_render
 
     # Pixel-Guard: übergroße Bilder werden VOR dem Dekodieren übersprungen.
     from PIL import Image as _PILTest
@@ -1737,6 +1752,8 @@ async def t_history_delivery(h: Harness) -> None:
     import bot.web.pdf_document as _pdfmod
     import bot.discord_bot as db_mod
 
+    _pdfmod._APPLE_USE_CDN = False  # Tests ohne Netz — Sheet-Pfad deterministisch
+
     _saved_batch = _pdfmod.HISTORY_BATCH_MESSAGES
     _saved_rss = db_mod.current_rss_mb
     try:
@@ -1771,6 +1788,9 @@ async def t_history_delivery(h: Harness) -> None:
                   "Hallo" in part1_text, part1_text[:120])
             check("Batching: Teil-Kopf nennt 'Teil 1 von 3' (Zähl-Durchlauf kennt total)",
                   "Teil 1 von 3" in part1_text, part1_text[:200])
+
+        check("Teil-Bau lief im isolierten KINDPROZESS (fork) — RAM-Isolation aktiv",
+              _pdfmod._FORK_BUILDS["ok"] >= 3, str(_pdfmod._FORK_BUILDS))
 
         # RAM-Guard: kritischer RAM → Abbruch VOR dem Teil (kein verlorener
         # Aufbau), Exception mit klarer Meldung — BEVOR der Container stirbt.
@@ -1811,6 +1831,23 @@ async def t_history_delivery(h: Harness) -> None:
     _relieve()  # darf niemals werfen
     check("RAM-Aufräumen (relieve_ram) läuft ohne Fehler", True, "")
 
+    from bot.ram import container_memory_mb as _container_mem
+    _cu, _cl = _container_mem()
+    check("Container-RAM-Messung: cgroup-Werte plausibel (-1 = nicht lesbar)",
+          (_cu > 0 and _cl > 0) or (_cu < 0 and _cl < 0), f"used={_cu} limit={_cl}")
+
+    _saved_cont = db_mod.container_memory_mb
+    _saved_rss2 = db_mod.current_rss_mb
+    db_mod.container_memory_mb = lambda: (128.0, 512.0)
+    check("Auslastung: 128/512 MB → 25 %", db_mod._auslastung_pct() == 25,
+          str(db_mod._auslastung_pct()))
+    db_mod.container_memory_mb = lambda: (-1.0, -1.0)
+    db_mod.current_rss_mb = lambda: 256.0
+    check("Auslastung ohne cgroup: Prozess-RSS/512 → 50 %",
+          db_mod._auslastung_pct() == 50, str(db_mod._auslastung_pct()))
+    db_mod.container_memory_mb = _saved_cont
+    db_mod.current_rss_mb = _saved_rss2
+
     start_view = startup_notify_view(
         ram_mb=mb, version="9.9", ready_at=now())
     check("Startup-DM-View ist Components V2", start_view.has_components_v2())
@@ -1829,6 +1866,21 @@ async def t_history_delivery(h: Harness) -> None:
               sent_view is not None and sent_view.has_components_v2(),
               str(type(sent_view)))
 
+    _saved_ausl = db_mod._auslastung_pct
+    db_mod._auslastung_pct = lambda: 50
+    class _PresStub:
+        config = SimpleNamespace(command_name="connect")
+        guilds = [1, 2, 3]
+    check("Presence-Text im Owner-Format (… Servers | Auslastung …%)",
+          db_mod.RelayClient._presence_text(_PresStub())
+          == "/connect | 3 Servers | Auslastung 50%",
+          db_mod.RelayClient._presence_text(_PresStub()))
+    db_mod._auslastung_pct = _saved_ausl
+    from bot.config import Config as _Cfg
+    check("Presence-Status-Default: idle (gelber Mond)",
+          _Cfg(discord_token="x").status_presence == "idle",
+          _Cfg(discord_token="x").status_presence)
+
     # RAM-Guard im echten Handler: kritischer RAM → sichtbarer Fehler,
     # KEINE DM (Abbruch vor dem ersten Teil).
     import bot.ram as _rammod
@@ -1836,7 +1888,9 @@ async def t_history_delivery(h: Harness) -> None:
     client2._startup_dm_sent = True
     owner2.sent.clear()
     prog_ram = _ProgMsg()
+    saved_used = db_mod._ram_used_mb
     db_mod.current_rss_mb = lambda: 500.0  # > kritische Schwelle (420)
+    db_mod._ram_used_mb = lambda: 500.0    # Guard liest den Container-RAM
     _rammod.current_rss_mb = lambda: 500.0  # relieve_ram() misst selbst
     try:
         await client2._handle_admin_history(
@@ -1845,6 +1899,7 @@ async def t_history_delivery(h: Harness) -> None:
             mchannel)
     finally:
         db_mod.current_rss_mb = _saved_rss
+        db_mod._ram_used_mb = saved_used
         _rammod.current_rss_mb = _saved_rss_ram
     check("Handler-RAM-Guard: kritischer RAM → sichtbarer Fehler statt OOM",
           "RAM kritisch" in (prog_ram.edits[-1] if prog_ram.edits else "")

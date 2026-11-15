@@ -358,14 +358,17 @@ Portal oder Render-Logs zu öffnen. Drei Dinge laufen von selbst:
 
 ### Live-Presence
 
-Der Statustext des Bots zeigt jederzeit, auf wie vielen Servern er aktiv ist:
+Der Statustext zeigt jederzeit, auf wie vielen Servern der Bot ist und wie
+ausgelastet er ist (genutzter RAM relativ zum Container-Limit):
 
 ```
-/connect | 👀 12 eingerichtete Server
+/connect | 12 Servers | Auslastung 50%
 ```
 
-Bei jedem Server-Beitritt und -Verlassen aktualisiert sich die Zahl sofort
-(Singular bei einem Server: *1 eingerichteter Server*).
+Bei jedem Server-Beitritt und -Verlassen aktualisiert sich die Zahl sofort;
+die Auslastung wird zusätzlich alle 60 s frisch berechnet. Der Status selbst
+steht dauerhaft auf **abwesend** (gelber Mond, `PRESENCE_STATUS=idle` als
+Default).
 
 ### `/adminpanel` — die Server-Liste & Serverdetailansicht im Privatchat
 
@@ -424,9 +427,12 @@ und Server-IDs reisen in den Custom-IDs mit — ein altes Panel bleibt bedienbar
 Sobald der Bot startet (auch nach einem automatischen Neustart), bekommt der
 Bot-Owner sofort eine DM: „🟢 Bot ist online“ mit Uhrzeit, Version und aktuellem
 RAM-Stand — man sieht also sofort, wenn der Bot z. B. durch zu wenig RAM (OOM)
-neu gestartet ist, ohne auf Render-Logs warten zu müssen. Der Bot zählt seinen
-RAM selbst: alle 60 s landet der Stand in den Render-Logs (Warn ab 300 MB,
-kritisch ab 420 MB mit automatischem Aufräumen: GC + PDF-Bildcaches schließen).
+neu gestartet ist, ohne auf Render-Logs warten zu müssen. Die DM zeigt **zwei
+RAM-Werte**: den **Container-RAM** (aus dem cgroup-Memory-Controller — genau
+die Zahl, bei deren Überschreitung Render den OOM-Kill macht; sie zählt alle
+Prozesse + Seiten-Cache) und den **Prozess-RAM** (der Bot selbst). Alle 60 s
+landen beide Werte in den Render-Logs (Warn ab 300 MB, kritisch ab 420 MB mit
+automatischem Aufräumen: GC + PDF-Bildcaches schließen).
 Große Chatverläufe werden **streamend** verarbeitet und automatisch in
 mehrere **Teil-PDFs** aufgeteilt (je 100 Nachrichten): Es liegen nie alle
 Nachrichten im RAM — jede 100er-Gruppe wird direkt aus der Historie gelesen,
@@ -434,10 +440,15 @@ gebaut, sofort per DM versendet und dann **vollständig verworfen** („fertige
 Sachen senden, Daten löschen, Platz für neue“) — auch die fertigen Teil-PDFs
 selbst bleiben nicht referenziert (nur ihre Größen fließen in die
 Ergebnis-Statistik; genau diese Retention war früher der kumulative OOM,
-der RAM stieg ~10 MB pro Teil und fiel nie wieder ab). Nach jedem Teil
-werden zusätzlich die Bild-Caches geleert, das Apple-Sprite-Sheet (~69 MB)
-geschlossen, GC und `malloc_trim` ausgeführt; vor jedem weiteren Teil prüft
-ein RAM-Guard den Speicher. Die Fortschritts-Nachrichten zeigen **zwei
+der RAM stieg ~10 MB pro Teil und fiel nie wieder ab). **Jedes Teil wird
+zusätzlich in einem isolierten KINDPROZESS gebaut** (fork): Das Kind erbt die
+Batch-Nachrichten direkt aus dem Speicher (Copy-on-Write, kein Pickling),
+baut das PDF und endet — damit gibt es seinen kompletten RAM garantiert ans
+OS zurück. Churn und Heap-Fragmentierung von reportlab/Pillow (früher ~3-10 MB
+pro Teil, die nie freigegeben wurden) sterben mit dem Prozess und können den
+Bot-Prozess gar nicht mehr erreichen. Nach jedem Teil werden zusätzlich die
+Bild-Caches geleert und GC ausgeführt; vor jedem weiteren Teil prüft ein
+RAM-Guard den **Container-RAM**. Die Fortschritts-Nachrichten zeigen **zwei
 Balken** (Teile-Fortschritt + Schritt im laufenden Teil) und den **aktuellen
 RAM** live (🧠) — aus Emojis (🟩⬜) und als **normale Nachrichten** (kein „Nur
 du kannst das sehen“-Banner, kein Verwerfen-Button — sie bleiben auch nach
@@ -446,6 +457,14 @@ einem Neustart des Discord-Clients sichtbar).
 Die **Teil-DMs selbst sind minimal**: nur `Teil 3/85:` und darunter die
 Datei (Dateiname enthält Server-/Kanal-ID und Teilnummer) — kein
 wiederholter Boilerplate-Text pro Teil.
+
+**Apple-Emojis ohne Sheet-Dekodierung:** Die Emoji-Bilder kommen als
+EINZELNE kleine PNGs (64 px, echte Apple-Bilder) aus dem
+[emoji-data-Projekt](https://github.com/iamcal/emoji-data) über jsDelivr-CDN
+— jedes nur wenige KB, auf Disk gecacht (nie zweimal geladen). Das 6,8-MB-
+Sprite-Sheet im Repo bleibt nur als Offline-Fallback (wenn das CDN nicht
+erreichbar ist) und wird dann nicht mehr zwangsläufig dekodiert — früher
+kostete das Dekodieren ~69 MB RGBA im RAM bei jedem Teil.
 
 ### DM-Benachrichtigungen bei Beitritt & Verlassen
 
@@ -730,7 +749,7 @@ Eine kommentierte Vorlage liegt in [`.env.example`](.env.example).
 | `PORT` | `8080` | Wird von Render automatisch gesetzt. |
 | `COMMAND_NAME` | `connect` | Name des Slash-Commands. |
 | `BOT_NAME` | `AIDiscordServerEinrichten` | Anzeigename in Antworten. |
-| `PRESENCE_STATUS` | `online` | `online` / `idle` / `dnd` / `invisible`. Der Statustext ist live: `/connect \| 👀 N eingerichtete Server`. |
+| `PRESENCE_STATUS` | `idle` | `online` / `idle` (gelber Mond, Default) / `dnd` / `invisible`. Der Statustext ist live: `/connect \| N Servers \| Auslastung X%`. |
 | `BOT_OWNER_ID` | *(fest)* | Discord-User-ID des Bot-Besitzers. Schaltet `/adminpanel` im Privatchat und die DM-Benachrichtigungen bei Server-Beitritt/-Verlassen frei. `0` = aus. |
 | `SESSION_TTL_HOURS` | `24` | Standard-Gültigkeit eines Tokens. `0` = unbegrenzt. |
 | `SESSION_INACTIVITY_HOURS` | `24` | Verbindung wird automatisch gestoppt, wenn das Token so lange ungenutzt bleibt. `0` = aus. |
@@ -803,7 +822,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 355 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 361 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -886,7 +905,7 @@ akzeptiert diese Sequenz bei **Buttons** klaglos, lehnt sie aber bei
 bekannte Inkonsistenz der Discord-API). `defer()` war dabei immer erfolgreich
 — erst der `followup.send()` mit der fertigen Liste scheiterte, weshalb der
 Client bis zum Timeout „Bot denkt nach…“ zeigte. Auf `main` aktualisieren
-(`/api/health` → `version` sollte `1.0.4` oder neuer sein) und `/adminpanel`
+(`/api/health` → `version` sollte `1.0.5` oder neuer sein) und `/adminpanel`
 erneut ausführen. Im Render-Log steht bei diesem Fehler
 `followup.send() fehlgeschlagen … discord_error_code=…`.
 
@@ -1078,7 +1097,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        355 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        361 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen

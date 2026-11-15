@@ -49,6 +49,9 @@ import discord  # noqa: E402
 from aiohttp import web  # noqa: E402
 from PIL import Image as PILImage, ImageDraw  # noqa: E402
 
+import bot.web.pdf_document as _pdmod  # noqa: E402
+_pdmod._APPLE_USE_CDN = False  # Tests ohne Netz — Sheet-Pfad deterministisch
+
 from bot.web.pdf_document import _clean  # noqa: E402
 
 from bot.web import pdf_document as pdf_mod  # noqa: E402
