@@ -1648,7 +1648,7 @@ async def t_history_delivery(h: Harness) -> None:
         FakeMessage(910000000000000003, mchannel, gone_author,
                     content="Nachricht eines Verlassenen"),
     ]
-    mchannel.history = _hist_factory2(modal_msgs)
+    mchannel.history = _hist_factory2(list(reversed(modal_msgs)))
 
     owner2 = _HUser(555555555555555555, "Bot-Betreiber 2")
     users2 = {owner2.id: owner2}
@@ -1724,6 +1724,121 @@ async def t_history_delivery(h: Harness) -> None:
           len(resp_not_owner.sent) == 1 and bool(prog_not_owner.edits)
           and "Bot-Owner" in (prog_not_owner.edits[-1] or ""),
           f"resp={resp_not_owner.sent} edits={prog_not_owner.edits[-1:]}")
+
+    # ── RAM-Batching: große Verläufe werden in Teil-PDFs verteilt ───────────
+    # „Fertige Sachen senden, Daten löschen, Platz für neue“ — jeder Teil
+    # wird SOFORT versendet und verworfen, egal wie groß der Verlauf ist.
+    print("── Chatverlauf-Batching & RAM-Guard ─────────────────────────")
+    import aiohttp as _aiohttp
+    import bot.web.pdf_document as _pdfmod
+    import bot.discord_bot as db_mod
+
+    _saved_batch = _pdfmod.HISTORY_BATCH_MESSAGES
+    _saved_rss = db_mod.current_rss_mb
+    try:
+        _pdfmod.HISTORY_BATCH_MESSAGES = 1  # 3 Nachrichten → 3 Teile
+        collected: List[Any] = []
+
+        async def _collect_part(pdf_bytes: bytes, idx: int, total: int) -> None:
+            collected.append((pdf_bytes, idx, total))
+
+        async def progress_b(pct: int, text: str) -> None:
+            pass
+
+        async with _aiohttp.ClientSession() as sb:
+            meta = await _pdfmod.build_channel_history_pdf(
+                mchannel, sb, progress=progress_b, max_messages=None,
+                send_part=_collect_part,
+            )
+        check("Batching: 3 Nachrichten bei Batchgröße 1 → 3 Teil-PDFs",
+              len(collected) == 3 and (meta or {}).get("parts") == 3
+              and (meta or {}).get("messages") == 3, str(meta))
+        if collected:
+            import pymupdf as _pm
+            t1 = _pm.open(stream=collected[0][0], filetype="pdf")
+            part1_text = " ".join("".join(p.get_text() for p in t1).split())
+            t1.close()
+            check("Batching: Teil 1 enthält die ÄLTESTE Nachricht (Hallo …)",
+                  "Hallo" in part1_text, part1_text[:120])
+            check("Batching: Teil-Kopf nennt 'Teil 1 von 3'",
+                  "Teil 1 von 3" in part1_text, part1_text[:200])
+
+        # RAM-Guard: kritischer RAM → Abbruch, NACH Teil 1 (der wurde schon
+        # gesendet), kein weiterer Teil, Exception mit klarer Meldung.
+        collected.clear()
+        guard_calls = [0]
+
+        async def _critical_guard() -> None:
+            guard_calls[0] += 1
+            if guard_calls[0] >= 2:  # erst NACH Teil 1 kritisch
+                raise MemoryError("RAM kritisch (500 MB) — Aufbau abgebrochen.")
+
+        raised_hist = None
+        async with _aiohttp.ClientSession() as sb:
+            try:
+                await _pdfmod.build_channel_history_pdf(
+                    mchannel, sb, progress=progress_b, max_messages=None,
+                    send_part=_collect_part, ram_guard=_critical_guard,
+                )
+            except MemoryError as exc:
+                raised_hist = str(exc)
+        check("RAM-Guard: Abbruch NACH Teil 1 mit klarer Meldung (vor OOM)",
+              len(collected) == 1 and raised_hist is not None
+              and "RAM kritisch" in raised_hist,
+              f"sent={len(collected)} exc={raised_hist}")
+    finally:
+        _pdfmod.HISTORY_BATCH_MESSAGES = _saved_batch
+        db_mod.current_rss_mb = _saved_rss
+
+    # ── Startup-DM & RAM-Monitor ────────────────────────────────────────────
+    print("── Startup-DM & RAM-Monitor ─────────────────────────────────")
+    from bot.ram import current_rss_mb as _rss, relieve_ram as _relieve
+    from bot.discord_bot import startup_notify_view
+
+    mb = _rss()
+    check("RAM-Messung: VmRSS lesbar (> 0 MB)", mb > 0, f"{mb} MB")
+    _relieve()  # darf niemals werfen
+    check("RAM-Aufräumen (relieve_ram) läuft ohne Fehler", True, "")
+
+    start_view = startup_notify_view(
+        ram_mb=mb, version="9.9", ready_at=now())
+    check("Startup-DM-View ist Components V2", start_view.has_components_v2())
+
+    owner2.sent.clear()
+    client2._startup_dm_sent = False
+    client2.ready_at = now()  # RelayClient.__new__ setzt keine Attribute
+    await client2._startup_dm_once()
+    await client2._startup_dm_once()  # zweiter on_ready-Durchlauf (Resync)
+    check("Startup-DM: genau EINMAL pro Prozess (on_ready mehrfach ok)",
+          len(owner2.sent) == 1, f"{len(owner2.sent)} DMs")
+    if owner2.sent:
+        kw = owner2.sent[0]
+        sent_view = kw.get("view")
+        check("Startup-DM: als LayoutView (Container) gesendet",
+              sent_view is not None and sent_view.has_components_v2(),
+              str(type(sent_view)))
+
+    # RAM-Guard im echten Handler: kritischer RAM → sichtbarer Fehler,
+    # KEINE DM (Abbruch vor dem ersten Teil).
+    import bot.ram as _rammod
+    _saved_rss_ram = _rammod.current_rss_mb
+    client2._startup_dm_sent = True
+    owner2.sent.clear()
+    prog_ram = _ProgMsg()
+    db_mod.current_rss_mb = lambda: 500.0  # > kritische Schwelle (420)
+    _rammod.current_rss_mb = lambda: 500.0  # relieve_ram() misst selbst
+    try:
+        await client2._handle_admin_history(
+            SimpleNamespace(original_response=lambda: _aret(prog_ram),
+                            followup=_Followup()),
+            mchannel)
+    finally:
+        db_mod.current_rss_mb = _saved_rss
+        _rammod.current_rss_mb = _saved_rss_ram
+    check("Handler-RAM-Guard: kritischer RAM → sichtbarer Fehler statt OOM",
+          "RAM kritisch" in (prog_ram.edits[-1] if prog_ram.edits else "")
+          and len(owner2.sent) == 0,
+          f"edits={prog_ram.edits[-1:] if prog_ram.edits else None}")
 
 
 async def t_security(h: Harness) -> None:

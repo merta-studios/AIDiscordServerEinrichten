@@ -38,6 +38,7 @@ degradieren das Layout, lassen den Build aber niemals crashen.
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -150,6 +151,10 @@ _CONVERT_SEM = asyncio.Semaphore(2)
 _ASSEMBLY_TIMEOUT_S = 600.0
 #: Intervall des Fortschritts-Tickers während der Aufbau-Phase (Sekunden).
 _ASSEMBLY_TICKER_S = 15.0
+#: Nachrichten pro Chatverlauf-Teil-PDF: Jeder Teil wird SOFORT nach dem Bau
+#: versendet und verworfen — RAM bleibt flach („fertige Sachen senden, Daten
+#: löschen, Platz für neue“), egal wie groß der Verlauf ist.
+HISTORY_BATCH_MESSAGES = 100
 COMPONENTS_TEXT_MAX_CHARS = 500
 #: Max. Höhe einer Nachrichten-Kästchen-Box in Punkt — darüber wird die
 #: Nachricht unboxiert (splittbar) gerendert (LayoutError-Schutz).
@@ -2852,18 +2857,35 @@ async def build_channel_history_pdf(
     http_session: aiohttp.ClientSession,
     *,
     progress: ProgressCallback,
-    max_messages: int = 1000,
-) -> bytes:
+    max_messages: Optional[int] = None,
+    send_part: Optional[Callable[[bytes, int, int], Any]] = None,
+    ram_guard: Optional[Callable[[], Any]] = None,
+) -> Any:
     """
-    Kompletter Chatverlauf eines Textkanals/Threads als PDF — NUR für den
-    Bot-Owner bestimmt. Älteste Nachrichten zuerst, mit Apple-Emojis,
-    Custom-Emojis, Bildanhängen, Komponenten und Embeds; Mention-Namen
-    (@Rollenname, #kanalname, @Mitglied) statt IDs; verlassene Mitglieder
-    mit rotem „nicht mehr im Server"-Hinweis.
+    Chatverlauf eines Textkanals/Threads als PDF(s) — NUR für den Bot-Owner.
+
+    **RAM-Batching:** Ist ``send_part`` gegeben, wird der Verlauf in Teilen
+    zu je ``HISTORY_BATCH_MESSAGES`` Nachrichten gebaut; jeder Teil wird
+    SOFORT nach dem Bau per ``send_part(pdf_bytes, teil, teile_gesamt)``
+    versendet und dann verworfen — der RAM bleibt flach, egal wie groß der
+    Verlauf ist („fertige Sachen senden, Daten löschen, Platz für neue“).
+    Zwischen den Teilen prüft ``ram_guard`` (async) den RAM; wirft sie,
+    wird abgebrochen BEVOR der Container in den OOM-Kill läuft.
+
+    Rückgabe:
+    - ``send_part=None`` (Tests/Abwärtskompatibilität): die PDF-Bytes des
+      GESAMTEN Verlaufs in EINEM Dokument.
+    - sonst: Metadaten ``{"parts": N, "messages": M, "span": "…"}``.
+
+    Älteste Nachrichten zuerst; Apple-Emojis, Custom-Emojis, Bildanhänge,
+    Komponenten, Embeds; Mention-Namen (@Rolle, #kanal, @Mitglied);
+    verlassene Mitglieder mit rotem „nicht mehr im Server“-Hinweis.
     """
     guild = channel.guild
     styles = _styles()
     now_utc = datetime.now(timezone.utc)
+    ch_name = getattr(channel, "name", "?")
+    icon_url = getattr(guild.icon, "url", None) if guild.icon else None
 
     await progress(5, "Chatverlauf wird geladen …")
 
@@ -2904,85 +2926,59 @@ async def build_channel_history_pdf(
         for c in getattr(m, "channel_mentions", None) or []:
             _MENTION_NAMES.setdefault(c.id, c.name)
 
-    await progress(30, f"{len(msgs)} Nachrichten geladen — Bilder werden geladen …")
+    await progress(30, f"{len(msgs)} Nachrichten geladen — Aufbereitung startet …")
 
-    # Bild-URLs sammeln: Avatare (Autoren), Icon, Bildanhänge,
-    # Komponenten-Medien, Custom-Emojis aus den Nachrichten
-    image_urls: List[Optional[str]] = [
-        getattr(guild.icon, "url", None) if guild.icon else None,
-    ]
-    avatar_urls: Dict[int, str] = {}
-    att_image_urls: List[str] = []
-    custom_emoji_ids: List[int] = []
-    for m in msgs:
-        av = getattr(getattr(m, "author", None), "display_avatar", None)
-        if av is not None and getattr(av, "url", None):
-            avatar_urls.setdefault(getattr(m.author, "id", 0), av.url)
-        for att in getattr(m, "attachments", None) or []:
-            if (_attachment_is_image(att) and getattr(att, "url", None)
-                    and (getattr(att, "size", 0) or 0) <= _MAX_IMAGE_BYTES):
-                att_image_urls.append(att.url)
-        for em in _DISCORD_EMOJI_RE.finditer(m.content or ""):
-            try:
-                custom_emoji_ids.append(int(em.group(2)))
-            except ValueError:
-                pass
-    seen: set = set()
-    att_image_urls = [u for u in att_image_urls[:MAX_ATTACHMENT_IMAGES] if not (u in seen or seen.add(u))]
-    comp_media = _component_media_urls(
-        [c for m in msgs for c in (getattr(m, "components", None) or [])]
-    )
-    custom_ids_unique = list(dict.fromkeys(custom_emoji_ids))[:40]
-    emoji_url_by_id: Dict[int, Optional[str]] = {}
-    for e in guild.emojis:
-        if e.id in custom_ids_unique:
-            emoji_url_by_id[e.id] = getattr(e, "url", None)
-            image_urls.append(getattr(e, "url", None))
+    full_span = ""
+    if msgs:
+        full_span = (
+            f"{msgs[0].created_at.strftime('%d.%m.%Y %H:%M')} – "
+            f"{msgs[-1].created_at.strftime('%d.%m.%Y %H:%M')} UTC"
+        )
 
-    for uid in list(avatar_urls)[:60]:
-        image_urls.append(avatar_urls[uid])
-    image_urls.extend(att_image_urls)
-    image_urls.extend(comp_media)
+    # ── Batching: Teile bilden ──────────────────────────────────────────────
+    if send_part is not None and len(msgs) > HISTORY_BATCH_MESSAGES:
+        batches = [msgs[i:i + HISTORY_BATCH_MESSAGES]
+                   for i in range(0, len(msgs), HISTORY_BATCH_MESSAGES)]
+    else:
+        batches = [msgs]
+    total = len(batches)
 
-    async def _img_progress_hist(done_n: int, total_n: int) -> None:
-        pct = 30 + min(int(31 * done_n / max(total_n, 1)), 31)
-        await progress(pct, f"Bilder werden geladen ({done_n}/{total_n}) …")
+    def _collect_batch(batch: List[Any]) -> Tuple[Dict[int, str], List[str],
+                                                  Dict[int, Optional[str]], List[str]]:
+        """Bild-URLs EINES Teils (Avatare, Anhänge, Custom-Emojis, Medien)."""
+        avatar_urls: Dict[int, str] = {}
+        att_urls: List[str] = []
+        emoji_ids: List[int] = []
+        for m in batch:
+            av = getattr(getattr(m, "author", None), "display_avatar", None)
+            if av is not None and getattr(av, "url", None):
+                avatar_urls.setdefault(getattr(m.author, "id", 0), av.url)
+            for att in getattr(m, "attachments", None) or []:
+                if (_attachment_is_image(att) and getattr(att, "url", None)
+                        and (getattr(att, "size", 0) or 0) <= _MAX_IMAGE_BYTES):
+                    att_urls.append(att.url)
+            for em in _DISCORD_EMOJI_RE.finditer(m.content or ""):
+                try:
+                    emoji_ids.append(int(em.group(2)))
+                except ValueError:
+                    pass
+        seen: set = set()
+        att_urls = [u for u in att_urls[:MAX_ATTACHMENT_IMAGES] if not (u in seen or seen.add(u))]
+        comp_media = _component_media_urls(
+            [c for m in batch for c in (getattr(m, "components", None) or [])]
+        )
+        emoji_url_by_id: Dict[int, Optional[str]] = {}
+        emoji_urls: List[Optional[str]] = []
+        wanted = set(emoji_ids)
+        for e in guild.emojis:
+            if e.id in wanted:
+                emoji_url_by_id[e.id] = getattr(e, "url", None)
+                emoji_urls.append(getattr(e, "url", None))
+        return avatar_urls, att_urls, emoji_url_by_id, comp_media + emoji_urls
 
-    image_cache = await _download_images(http_session, image_urls, progress_hook=_img_progress_hist)
-
-    _dl_ok = sum(1 for v in image_cache.values() if v)
-    await progress(62, f"Bilder geladen ({_dl_ok}/{len(image_cache)}) — Chatverlauf wird aufbereitet …")
-
-    _ensure_fonts()
-    _ensure_apple_emoji()
-
-    # Wie im Server-Dokument: Aufbereitung im Worker-Thread (Event-Loop bleibt
-    # lebendig — Timer, Logs und Fortschritts-Edits arbeiten weiter) statt
-    # blockierend auf dem Loop, plus Live-Ticker und Budget.
-    loop = asyncio.get_running_loop()
-    _last_pct = [62]
-
-    def _emit_soon(pct: int, text: str) -> None:
-        _last_pct[0] = max(_last_pct[0], min(pct, 99))
-        asyncio.ensure_future(progress(pct, text))
-
-    def _emit(pct: int, text: str) -> None:
-        try:
-            loop.call_soon_threadsafe(_emit_soon, pct, text)
-        except RuntimeError:
-            pass  # Loop bereits geschlossen — Aufbau läuft weiter
-
-    async def _assembly_ticker(started: float) -> None:
-        while True:
-            await asyncio.sleep(_ASSEMBLY_TICKER_S)
-            try:
-                await progress(_last_pct[0], f"Chatverlauf wird erstellt … "
-                               f"({time.monotonic() - started:.0f} s verstrichen)")
-            except Exception:  # noqa: BLE001 — Ticker darf niemals abbrechen
-                pass
-
-    def _assemble() -> bytes:
-        """(Worker-Thread) Flowables + PDF-Bau für den Chatverlauf."""
+    def _make_ctx(image_cache: Dict[str, Optional[bytes]],
+                  avatar_urls: Dict[int, str],
+                  emoji_url_by_id: Dict[int, Optional[str]]) -> Dict[str, Any]:
         def img(url: Optional[str], **kwargs: Any) -> Optional[Image]:
             return _image_flow(image_cache.get(url) if url else None, **kwargs)
 
@@ -2990,9 +2986,10 @@ async def build_channel_history_pdf(
             return _avatar_flow(image_cache.get(avatar_urls.get(member_id, "")), size_mm)
 
         def emoji_png(eid: int) -> Optional[str]:
-            return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")), f"hist-emoji-{eid}")
+            return _custom_emoji_png(image_cache.get(emoji_url_by_id.get(eid, "")),
+                                     f"hist-emoji-{eid}")
 
-        msg_ctx: Dict[str, Any] = {
+        return {
             "styles": styles,
             "img": img,
             "avatar_img": avatar_img,
@@ -3001,26 +2998,31 @@ async def build_channel_history_pdf(
             "content_width": CONTENT_WIDTH,
         }
 
-        flowables: List[Any] = []
-
-        # ---- Kopfbereich ----
-        icon_url = getattr(guild.icon, "url", None) if guild.icon else None
+    def _head_flowables(image_cache: Dict[str, Optional[bytes]],
+                        idx: int, batch: List[Any]) -> List[Any]:
+        """Kopf eines Teil-PDFs (Titel, Server/Kanal/IDs, Zeitraum des Teils)."""
         icon_flow = _avatar_flow(image_cache.get(icon_url), 18) if icon_url else None
         span = ""
-        if msgs:
-            first, last = msgs[0].created_at, msgs[-1].created_at
-            span = f"{first.strftime('%d.%m.%Y %H:%M')} – {last.strftime('%d.%m.%Y %H:%M')} UTC"
+        if batch:
+            span = (
+                f"{batch[0].created_at.strftime('%d.%m.%Y %H:%M')} – "
+                f"{batch[-1].created_at.strftime('%d.%m.%Y %H:%M')} UTC"
+            )
+        title = "Chatverlauf" if total <= 1 else f"Chatverlauf — Teil {idx + 1} von {total}"
         ch_type_name = str(getattr(getattr(channel, "type", None), "name", "kanal") or "kanal")
-
         head_bits = [
             f"Server <b>{_clean(guild.name)}</b> (ID {_clean(guild.id)})",
-            f"{_clean(ch_type_name.replace('_', ' ').title())}: <b>#{_clean(channel.name)}</b> "
+            f"{_clean(ch_type_name.replace('_', ' ').title())}: <b>#{_clean(ch_name)}</b> "
             f"(ID {_clean(channel.id)})",
-            f"{len(msgs)} Nachricht{'en' if len(msgs) != 1 else ''}"
+            f"{len(batch)} Nachricht{'en' if len(batch) != 1 else ''}"
             + (f" · Zeitraum {span}" if span else ""),
         ]
+        if total > 1:
+            head_bits.append(
+                f"Teil {idx + 1}/{total} des Verlaufs ({len(msgs)} Nachrichten insgesamt)"
+            )
         head_cells: List[Any] = ([icon_flow] if icon_flow is not None else []) + [[
-            Paragraph("Chatverlauf", ParagraphStyle(
+            Paragraph(title, ParagraphStyle(
                 "hist_title", fontName=_FONTS["bold"], fontSize=17, leading=21, textColor=_C.dark,
             )),
             Paragraph(" · ".join(head_bits), styles["subtitle"]),
@@ -3038,58 +3040,90 @@ async def build_channel_history_pdf(
             ("TOPPADDING", (0, 0), (-1, -1), 0),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
         ]))
-        flowables.append(head)
-        flowables.append(HRFlowable(width="100%", thickness=1.1, color=_C.blurple, spaceAfter=3 * mm))
+        flows: List[Any] = [head,
+                            HRFlowable(width="100%", thickness=1.1, color=_C.blurple,
+                                       spaceAfter=3 * mm)]
         if not msgs:
-            flowables.append(Paragraph(
+            flows.append(Paragraph(
                 "Keine Nachrichten abrufbar (leer, keine Historie-Rechte oder Kanal nicht gefunden).",
                 styles["body"]))
+        elif total > 1 and idx > 0:
+            flows.append(Paragraph(
+                f"Fortsetzung des Verlaufs — Teil {idx + 1} beginnt bei "
+                f"{batch[0].created_at.strftime('%d.%m.%Y %H:%M')} UTC.", styles["subtitle"]))
+        return flows
 
-        for m in msgs:
-            flowables.extend(_message_flowables(m, styles, msg_ctx))
-            flowables.append(Spacer(1, 2.4 * mm))
+    async def _build_and_deliver(idx: int, batch: List[Any]) -> bytes:
+        """Ein Teil: Bilder laden → Flowables im Thread bauen → PDF → senden."""
+        label = f"Teil {idx + 1}/{total}" if total > 1 else "Chatverlauf"
+        base_pct = 30 + int(58 * idx / max(total, 1))
+        await progress(base_pct, f"{label}: Bilder werden geladen …")
 
-        _emit(88, "PDF-Datei wird geschrieben …")
-        pdf_bytes = _render_pdf(
-            flowables,
-            header_left=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
-            footer_left=(
-                "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
-                + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
-            ),
-            title=f"Chatverlauf #{getattr(channel, 'name', '?')} · {guild.name}",
-            subject=f"Chatverlauf von #{getattr(channel, 'name', '?')} "
-                    f"in {guild.name} (ID {guild.id})",
+        avatar_urls, att_urls, emoji_url_by_id, extra_urls = _collect_batch(batch)
+        image_urls: List[Optional[str]] = [icon_url]
+        for uid in list(avatar_urls)[:60]:
+            image_urls.append(avatar_urls[uid])
+        image_urls.extend(att_urls)
+        image_urls.extend(extra_urls)
+
+        image_cache = await _download_images(http_session, image_urls)
+        _dl_ok = sum(1 for v in image_cache.values() if v)
+        await progress(base_pct + 8,
+                       f"{label}: Bilder geladen ({_dl_ok}/{len(image_cache)}) — "
+                       "PDF wird aufbereitet …")
+
+        _ensure_fonts()
+        _ensure_apple_emoji()
+
+        def _assemble() -> bytes:
+            ctx = _make_ctx(image_cache, avatar_urls, emoji_url_by_id)
+            flowables: List[Any] = _head_flowables(image_cache, idx, batch)
+            for m in batch:
+                flowables.extend(_message_flowables(m, styles, ctx))
+                flowables.append(Spacer(1, 2.4 * mm))
+            return _render_pdf(
+                flowables,
+                header_left=f"Chatverlauf #{ch_name} · {guild.name}",
+                footer_left=(
+                    "Vertraulich — nur für den Bot-Owner bestimmt. Erstellt am "
+                    + now_utc.strftime("%d.%m.%Y, %H:%M") + " UTC"
+                ),
+                title=f"Chatverlauf #{ch_name} · {guild.name}",
+                subject=f"Chatverlauf von #{ch_name} in {guild.name} (ID {guild.id})",
+            )
+
+        pdf_bytes = await asyncio.wait_for(
+            asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
         )
+
+        # RAM-Hygiene nach JEDEM Teil: Cache leeren, GC laufen lassen, Sheet
+        # schließen (Crops bleiben auf Disk) — „Daten löschen, Platz für neue“.
+        image_cache.clear()
+        gc.collect()
+        if ram_guard is not None:
+            await ram_guard()
+
+        if send_part is not None:
+            await send_part(pdf_bytes, idx + 1, total)
+        await progress(base_pct + 12, f"{label} fertig.")
+        log.info("Chatverlauf-%s #%s: %d KB (%d Nachrichten)",
+                 f"Teil {idx + 1}/{total}" if total > 1 else "PDF",
+                 ch_name, len(pdf_bytes) // 1024, len(batch))
         return pdf_bytes
 
-    assemble_started = time.monotonic()
-    assemble_task = asyncio.create_task(asyncio.to_thread(_assemble))
-    ticker_task = asyncio.create_task(_assembly_ticker(assemble_started))
-    try:
-        pdf_bytes = await asyncio.wait_for(assemble_task, timeout=_ASSEMBLY_TIMEOUT_S)
-    except (asyncio.TimeoutError, TimeoutError):
-        log.warning(
-            "Chatverlauf-Aufbereitung für #%s hat nach %d s nicht abgeschlossen — "
-            "Abbruch mit sichtbarer Fehlermeldung (der Thread läuft weiter, das Ergebnis wird verworfen).",
-            getattr(channel, "name", "?"), int(_ASSEMBLY_TIMEOUT_S),
-        )
-        raise RuntimeError(
-            f"Die Chatverlauf-Aufbereitung hat zu lange gedauert (>{int(_ASSEMBLY_TIMEOUT_S)} s) "
-            "und wurde abgebrochen. Bitte erneut versuchen — passiert das bei diesem Kanal "
-            "wiederholt, melde dich mit dem Kanal-/Servernamen beim Bot-Team."
-        ) from None
-    finally:
-        ticker_task.cancel()
-
-    log.info("Chatverlauf-Aufbereitung fertig in %.1f s", time.monotonic() - assemble_started)
+    parts_bytes: List[bytes] = []
+    for idx, batch in enumerate(batches):
+        pdf_bytes = await _build_and_deliver(idx, batch)
+        parts_bytes.append(pdf_bytes)
 
     _close_apple_sheet()  # RAM: Sprite-Sheet freigeben (Crops bleiben gecacht)
 
-    await progress(100, "PDF fertiggestellt.")
+    await progress(100, "Chatverlauf fertiggestellt.")
     log.info(
-        "Chatverlauf-PDF für #%s in '%s' (ID %s) erstellt: %d KB, %d Nachrichten",
-        getattr(channel, "name", "?"), guild.name, guild.id,
-        len(pdf_bytes) // 1024, len(msgs),
+        "Chatverlauf für #%s in '%s' (ID %s): %d Teil-PDF(s), %d Nachrichten, Zeitraum %s",
+        ch_name, guild.name, guild.id, total, len(msgs), full_span or "—",
     )
-    return pdf_bytes
+    if send_part is None:
+        return parts_bytes[0]
+    return {"parts": total, "messages": len(msgs), "span": full_span,
+            "bytes": [len(b) for b in parts_bytes]}

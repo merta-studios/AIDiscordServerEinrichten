@@ -70,6 +70,8 @@ from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, now_utc
+from .ram import (RAM_CRITICAL_MB, current_rss_mb, ram_report_loop,
+                  relieve_ram)
 from .web.pdf_document import build_channel_history_pdf, build_server_document
 
 log = logging.getLogger("relay.discord")
@@ -731,6 +733,44 @@ class AdminSearchModal(discord.ui.Modal, title="🔍 Server suchen"):
             pass
 
 
+def startup_notify_view(
+    *,
+    ram_mb: float,
+    version: str,
+    ready_at: Optional[Any] = None,
+) -> discord.ui.LayoutView:
+    """
+    Startup-DM an den Bot-Owner: bestätigt den (Neu)Start sofort — inkl.
+    RAM-Stand und dem Hinweis, dass automatische Neustarts (OOM/Render)
+    damit sofort sichtbar sind.
+    """
+    ts = getattr(ready_at, "strftime", lambda _f: "?")("%d.%m.%Y, %H:%M UTC") if ready_at else "?"
+    ram_text = f"{ram_mb:.0f} MB" if ram_mb and ram_mb > 0 else "unbekannt"
+    container = discord.ui.Container(
+        discord.ui.TextDisplay("# 🟢 Bot ist online"),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            f"**Neustart abgeschlossen:** {ts}\n"
+            f"**Version:** v{version}\n"
+            f"**RAM aktuell:** {ram_text} (Container-Limit ~512 MB)"
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            "Wenn du diesen Start nicht ausgelöst hast (Deploy oder „Restart“ "
+            "in Render), war es ein **automatischer Neustart** — typische "
+            "Ursache: zu wenig RAM (OOM) oder ein Fehler im Prozess. Der "
+            "RAM-Verbrauch wird alle 60 s in die Render-Logs geschrieben "
+            "(Warn ab 300 MB, kritisch ab 420 MB); der Chatverlauf-Abruf "
+            "verschickt große Verläufe automatisch in mehreren Teil-PDFs, "
+            "damit der RAM flach bleibt."
+        ),
+        accent_colour=CONNECTED_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
 class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
     """
     Fragt die Kanal-ID ab (steht im Server-Dokument) und schickt danach das
@@ -998,6 +1038,10 @@ class RelayClient(discord.Client):
         self.state = state
         self.tree = app_commands.CommandTree(self)
         self.ready_at: Optional[Any] = None
+        # Startup-DM: genau EINMAL pro Prozess (ein OOM-/Crash-Restart ist ein
+        # neuer Prozess → die DM kommt erneut — genau das gewünschte Signal).
+        self._startup_dm_sent: bool = False
+        self._ram_monitor_task: Optional[asyncio.Task[Any]] = None
         # Kick/Ban-Gründe, die live per Gateway empfangen wurden (siehe
         # ``on_audit_log_entry_create``): guild_id -> {"action", "reason", "by", "ts"}.
         # Nach dem Verlassen des Servers hat der Bot keinen Audit-Log-Zugriff
@@ -1118,6 +1162,55 @@ class RelayClient(discord.Client):
                 await self.tree.sync(guild=g)
             except Exception as exc:  # noqa: BLE001
                 log.debug("Guild-Sync für %s (%s): %s", g.id, g.name, exc)
+
+        # Startup-DM an den Bot-Owner (einmal pro Prozess) — meldet jeden
+        # (Neu)Start sofort, z. B. automatische Neustarts durch OOM/Render.
+        await self._startup_dm_once()
+        self._ensure_ram_monitor()
+
+    async def _startup_dm_once(self) -> None:
+        """Sendet die Startup-DM — garantiert genau EINMAL pro Prozess."""
+        if self._startup_dm_sent:
+            return
+        self._startup_dm_sent = True
+        try:
+            await self._send_startup_dm()
+        except Exception:  # noqa: BLE001 — Startup darf nie am DM hängen
+            log.exception("Startup-DM konnte nicht gesendet werden.")
+
+    async def _send_startup_dm(self) -> bool:
+        """
+        DM an den Bot-Owner: „Bot ist online“ mit RAM-Stand und dem klaren
+        Hinweis, dass (automatische) Neustarts — z. B. OOM — sofort sichtbar
+        sind. Gesendet wird genau einmal pro Prozess.
+        """
+        owner = self._bot_owner()
+        if owner is None:
+            log.debug("Startup-DM übersprungen — kein Bot-Owner konfiguriert.")
+            return False
+        view = startup_notify_view(
+            ram_mb=current_rss_mb(),
+            version=__version__,
+            ready_at=self.ready_at,
+        )
+        sent = await self._dm_user(owner, view, context="startup")
+        if sent:
+            log.info("Startup-DM an den Bot-Owner gesendet.")
+        return sent
+
+    def _ensure_ram_monitor(self) -> None:
+        """Startet den RAM-Monitor (einmalig; beim Neustart des Prozesses neu)."""
+        task = getattr(self, "_ram_monitor_task", None)
+        if task is not None and not task.done():
+            return
+        self._ram_monitor_task = asyncio.create_task(ram_report_loop())
+
+    async def close(self) -> None:
+        """Fährt den Client herunter und stoppt den RAM-Monitor."""
+        task = getattr(self, "_ram_monitor_task", None)
+        if task is not None:
+            task.cancel()
+        await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         log.info("Server beigetreten: %s (%d Mitglieder, ID %s)",
@@ -2073,6 +2166,75 @@ class RelayClient(discord.Client):
                 )
                 return
 
+            # RAM-Guard: Vor jedem Teil-PDF den eigenen RAM prüfen — bei
+            # kritischer Schwelle abbrechen (mit Aufräumen), BEVOR der
+            # Container in den OOM-Kill läuft.
+            async def _ram_guard() -> None:
+                mb = current_rss_mb()
+                if mb >= RAM_CRITICAL_MB:
+                    after = relieve_ram()
+                    if after >= RAM_CRITICAL_MB:
+                        raise MemoryError(
+                            f"RAM kritisch ({after:.0f} MB, Limit ~512 MB) — "
+                            "Aufbau abgebrochen, um einen OOM-Neustart zu verhindern. "
+                            "Bitte erneut versuchen; bleibt es kritisch, den Kanal "
+                            "in kleineren Zeiträumen abrufen."
+                        )
+
+            # Vor der neuen Zustellung: alte Chatverlauf-DMs löschen (es bleibt
+            # nur das aktuelle Set übrig). Fehler dürfen den Versand nie blockieren.
+            try:
+                cleaned = await self._cleanup_previous_history_documents(recipient.id)
+                if cleaned:
+                    log.info("Vor neuer Zustellung %d alte Chatverlauf-DM(s) gelöscht.", cleaned)
+            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
+                log.exception("Aufräumen alter Chatverlauf-DMs fehlgeschlagen — Versand läuft weiter.")
+
+            sent_ids: List[int] = []
+
+            async def _send_part(pdf_bytes: bytes, idx: int, total: int) -> None:
+                """
+                Sendet einen fertigen Teil SOFORT (RAM-Batching: „fertige
+                Sachen senden, Daten löschen, Platz für neue“). Bei
+                DM-Fehlern wird abgebrochen — die restlichen Teile werden
+                nicht mehr gebaut, der Fehler wird sichtbar gemeldet.
+                """
+                if total > 1:
+                    fname = f"chatverlauf-{guild.id}-{channel.id}-teil-{idx}-von-{total}.pdf"
+                    content = (
+                        f"💬 **Chatverlauf Teil {idx}/{total}** von #{ch_name} in "
+                        f"**{guild.name}** (Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
+                        "Große Verläufe werden auf mehrere Teil-PDFs verteilt, damit "
+                        "die Erstellung zuverlässig bleibt. Alle Teile zusammen sind "
+                        "der **komplette** Verlauf (Apple-Emojis, Bildanhänge, "
+                        "Komponenten, Embeds, Mention-Namen).\n\n"
+                        "_Vertraulich — nur für dich (Bot-Owner) bestimmt. Der Server "
+                        "selbst hat davon nichts bemerkt._"
+                    )
+                else:
+                    fname = f"chatverlauf-{guild.id}-{channel.id}.pdf"
+                    content = (
+                        f"💬 **Chatverlauf von #{ch_name}** in **{guild.name}** "
+                        f"(Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
+                        "Dieses PDF enthält den **kompletten** Chatverlauf des Kanals "
+                        "(inkl. Apple-Emojis, Bildanhängen, Komponenten, Embeds und "
+                        "Mention-Namen) und wurde über das Adminpanel angefordert.\n\n"
+                        "_Vertraulich — nur für dich (Bot-Owner) bestimmt. Der Server "
+                        "selbst hat davon nichts bemerkt._"
+                    )
+                file = discord.File(io.BytesIO(pdf_bytes), filename=fname)
+                try:
+                    sent = await recipient.send(content=content, file=file)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("Chatverlauf-Teil %d/%d konnte nicht per DM an %s gesendet werden: %s",
+                                idx, total, recipient.display_name, exc)
+                    raise RuntimeError(
+                        f"Teil {idx}/{total} konnte nicht per DM an {recipient.display_name} "
+                        "zugestellt werden (DMs vom Bot deaktiviert oder kein gemeinsamer "
+                        "Server) — die restlichen Teile wurden nicht erstellt."
+                    ) from exc
+                sent_ids.append(sent.id)
+
             http_session = getattr(self.state, "http_session", None)
             if http_session is None:
                 http_session = aiohttp.ClientSession(
@@ -2082,55 +2244,19 @@ class RelayClient(discord.Client):
             else:
                 own_session = False
             try:
-                pdf_bytes = await build_channel_history_pdf(
-                    channel, http_session, progress=_progress, max_messages=None
+                meta = await build_channel_history_pdf(
+                    channel, http_session, progress=_progress, max_messages=None,
+                    send_part=_send_part, ram_guard=_ram_guard,
                 )
             finally:
                 if own_session:
                     await http_session.close()
 
-            file = discord.File(
-                io.BytesIO(pdf_bytes),
-                filename=f"chatverlauf-{guild.id}-{channel.id}.pdf",
-            )
-
-            # Vor der neuen Zustellung: alte Chatverlauf-DMs löschen (es bleibt
-            # nur das aktuelle PDF übrig). Fehler dürfen den Versand nie blockieren.
-            try:
-                cleaned = await self._cleanup_previous_history_documents(recipient.id)
-                if cleaned:
-                    log.info("Vor neuer Zustellung %d alte Chatverlauf-DM(s) gelöscht.", cleaned)
-            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
-                log.exception("Aufräumen alter Chatverlauf-DMs fehlgeschlagen — Versand läuft weiter.")
-
-            try:
-                sent = await recipient.send(
-                    content=(
-                        f"💬 **Chatverlauf von #{ch_name}** in **{guild.name}** "
-                        f"(Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
-                        "Dieses PDF enthält den **kompletten** Chatverlauf des Kanals "
-                        "(inkl. Apple-Emojis, Bildanhängen, Komponenten, Embeds und "
-                        "Mention-Namen) und wurde über das Adminpanel angefordert.\n\n"
-                        "_Vertraulich — nur für dich (Bot-Owner) bestimmt. Der Server "
-                        "selbst hat davon nichts bemerkt._"
-                    ),
-                    file=file,
-                )
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("Chatverlauf-PDF konnte nicht per DM an %s gesendet werden: %s",
-                            recipient.display_name, exc)
-                await _final(
-                    f"❌ Das PDF wurde erstellt, konnte aber **nicht per DM an "
-                    f"{recipient.display_name}** zugestellt werden.\n"
-                    "Mögliche Ursache: DMs vom Bot sind deaktiviert oder es gibt "
-                    "keinen gemeinsamen Server."
-                )
-                return
-
             state = self._load_doc_delivery()
             state["last_history_delivery"] = {
                 "recipient_id": recipient.id,
-                "message_id": sent.id,
+                "message_id": sent_ids[-1] if sent_ids else None,
+                "parts": len(sent_ids),
                 "guild_id": guild.id,
                 "channel_id": channel.id,
                 "channel_name": ch_name,
@@ -2138,9 +2264,15 @@ class RelayClient(discord.Client):
             }
             self._save_doc_delivery(state)
 
+            parts = int((meta or {}).get("parts", len(sent_ids) or 1))
+            msg_count = int((meta or {}).get("messages", 0))
+            span_text = str((meta or {}).get("span") or "—")
+            size_kb = sum((meta or {}).get("bytes") or []) // 1024
             await _final(
-                f"✅ Chatverlauf von **#{ch_name}** ({len(pdf_bytes) // 1024} KB) erstellt "
-                f"und per DM an **{recipient.display_name}** (Bot-Owner) gesendet."
+                f"✅ Chatverlauf von **#{ch_name}** erstellt — **{parts} "
+                f"Teil-PDF{'s' if parts != 1 else ''}** ({size_kb} KB, {msg_count} Nachrichten, "
+                f"Zeitraum {span_text}) per DM an **{recipient.display_name}** "
+                "(Bot-Owner) gesendet."
             )
         except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt
             log.exception("Fehler beim Erstellen des Chatverlaufs für '%s'", ch_name)
