@@ -752,66 +752,81 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
         self.guild = guild
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Gleiches Guard-Prinzip wie das Panel: nur der Bot-Owner. Guards
-        # antworten IMMER sichtbar — ein stilles return würde Discord nur
-        # „Die Anwendung reagiert nicht“ zeigen.
-        if int(getattr(self.client.config, "bot_owner_id", 0) or 0) == 0:
-            await interaction.response.send_message(
-                "ℹ️ Chatverlauf-Abruf ist nicht aktiviert (kein `BOT_OWNER_ID` gesetzt).",
-                ephemeral=True,
-            )
-            return
-        if interaction.user.id != self.client.config.bot_owner_id:
-            log.warning("Chatverlauf-Abruf von %s — nicht der Bot-Owner.",
-                        getattr(interaction.user, "id", "?"))
-            await interaction.response.send_message(
-                "⛔ Nur der Bot-Owner kann den Chatverlauf abrufen.", ephemeral=True,
-            )
-            return
-
+        """
+        Erste Amtshandlung: die Interaktion SOFORT beantworten (Callback Typ 4)
+        — bevor Guards, Kanalsuche (REST!) oder sonst etwas läuft. Discord
+        zeigt sonst bei jeder Verzögerung/hängenden Antwort den generischen
+        Dialog „Etwas ist schief gelaufen“. Danach läuft die gesamte Logik in
+        try/except und meldet jedes Ergebnis per Edit sichtbar.
+        """
         raw = (self.channel_id.value or "").strip()
-        if not raw.isdigit():
-            await interaction.response.send_message(
-                "❌ Das ist keine Kanal-ID — bitte nur Ziffern eingeben "
-                "(die ID steht im Server-Dokument beim jeweiligen Kanal).",
-                ephemeral=True,
-            )
-            return
-        cid = int(raw)
-
-        # 1) Im Server, aus dem der Button kam; 2) in allen Servern des Bots —
-        # der Bot muss in dem Server sein, sonst gibt es den Kanal für ihn nicht.
-        channel = await self.client._resolve_history_channel(cid, self.guild)
-        if channel is None:
-            await interaction.response.send_message(
-                "❌ Kanal nicht gefunden — der Bot ist (nicht mehr) in dem Server "
-                f"mit dem Kanal `{cid}`, oder die ID ist falsch.",
-                ephemeral=True,
-            )
-            return
-        if not hasattr(channel, "history") or not isinstance(
-            channel, (discord.TextChannel, discord.Thread)
-        ):
-            await interaction.response.send_message(
-                "❌ Dieser Kanal hat keinen abrufbaren Chatverlauf "
-                "(z. B. Sprachkanal, Kategorie oder Forum selbst).",
-                ephemeral=True,
-            )
-            return
-
-        # Sofortige, garantiert gültige Antwort (Callback Typ 4). Der frühere
-        # defer (Typ 5 + Ephemeral-Flags) ist bei Modal-Submits die einzige
-        # Stelle, an der Discord die Antwort mit „Etwas ist schief gelaufen“
-        # quittieren konnte — Typ 4 ist für Modals immer erlaubt und zeigt
-        # dem Owner sofort die Fortschritts-Nachricht.
         try:
             await interaction.response.send_message(
-                f"💬 Chatverlauf von **#{getattr(channel, 'name', '?')}** wird erstellt …",
-                ephemeral=True,
+                "💬 Chatverlauf wird erstellt … (Kanal wird gesucht)", ephemeral=True,
             )
         except discord.HTTPException as exc:
             log.warning("Modal-Antwort konnte nicht gesendet werden: %s — Verarbeitung läuft weiter.", exc)
-        await self.client._handle_admin_history(interaction, channel)
+
+        progress_msg: Any = None
+        try:
+            progress_msg = await interaction.original_response()
+        except Exception:  # noqa: BLE001 — ohne Original-Nachricht: Followup
+            progress_msg = None
+
+        async def _final(content: str) -> None:
+            if progress_msg is not None:
+                try:
+                    await progress_msg.edit(content=content)
+                    return
+                except Exception:  # noqa: BLE001 — Token/Netz egal
+                    pass
+            try:
+                await interaction.followup.send(content, ephemeral=True)
+            except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
+                log.warning("Chatverlauf-Ergebnis konnte nicht angezeigt werden: %s", content[:80])
+
+        try:
+            # Gleiches Guard-Prinzip wie das Panel: nur der Bot-Owner.
+            if int(getattr(self.client.config, "bot_owner_id", 0) or 0) == 0:
+                await _final("ℹ️ Chatverlauf-Abruf ist nicht aktiviert (kein `BOT_OWNER_ID` gesetzt).")
+                return
+            if interaction.user.id != self.client.config.bot_owner_id:
+                log.warning("Chatverlauf-Abruf von %s — nicht der Bot-Owner.",
+                            getattr(interaction.user, "id", "?"))
+                await _final("⛔ Nur der Bot-Owner kann den Chatverlauf abrufen.")
+                return
+
+            if not raw.isdigit():
+                await _final(
+                    "❌ Das ist keine Kanal-ID — bitte nur Ziffern eingeben "
+                    "(die ID steht im Server-Dokument beim jeweiligen Kanal)."
+                )
+                return
+            cid = int(raw)
+
+            # 1) Im Server, aus dem der Button kam; 2) in allen Servern des Bots —
+            # der Bot muss in dem Server sein, sonst gibt es den Kanal für ihn nicht.
+            channel = await self.client._resolve_history_channel(cid, self.guild)
+            if channel is None:
+                await _final(
+                    "❌ Kanal nicht gefunden — der Bot ist (nicht mehr) in dem Server "
+                    f"mit dem Kanal `{cid}`, oder die ID ist falsch."
+                )
+                return
+            if not hasattr(channel, "history") or not isinstance(
+                channel, (discord.TextChannel, discord.Thread)
+            ):
+                await _final(
+                    "❌ Dieser Kanal hat keinen abrufbaren Chatverlauf "
+                    "(z. B. Sprachkanal, Kategorie oder Forum selbst)."
+                )
+                return
+
+            await _final(f"💬 Chatverlauf von **#{getattr(channel, 'name', '?')}** wird erstellt …")
+            await self.client._handle_admin_history(interaction, channel)
+        except Exception as error:  # noqa: BLE001 — JEDER Fehler wird sichtbar
+            log.exception("Fehler im Chatverlauf-Abruf-Fenster.")
+            await _final(f"⚠️ Chatverlauf-Abruf fehlgeschlagen: {error}")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         log.exception("Fehler im Chatverlauf-Abruf-Fenster.", exc_info=error)

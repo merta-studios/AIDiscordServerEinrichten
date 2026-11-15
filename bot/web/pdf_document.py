@@ -134,8 +134,17 @@ _IMAGES_PROGRESS_EVERY = 10
 #: Ab wie vielen Sekunden ein einzelner Bild-Download als „langsam“ geloggt wird.
 _SLOW_IMAGE_S = 10.0
 #: Max. Pixel pro Bild — Header-Check VOR dem Dekodieren (PIL.open ist lazy).
-#: Schützt vor Dekodier-Bomben, die Minuten CPU fressen können.
-_MAX_IMAGE_PIXELS = 30_000_000
+#: Schützt vor Dekodier-Bomben, die Minuten CPU fressen können. 16 MP ≈ 64 MB
+#: RGBA-Decode-Spitze (bei max. 2 parallelen Konvertierungen).
+_MAX_IMAGE_PIXELS = 16_000_000
+#: Max. Dateigröße pro Bild-Download (Bytes) — größere Anhänge werden gar
+#: nicht erst in den RAM geladen (Render Free: 512 MB!).
+_MAX_IMAGE_BYTES = 8_000_000
+#: Zielauflösung der Sofort-Konvertierung (px Breite) — deckt alle
+#: Anzeige-Größen im PDF ab (Breitbild-Banner bis ~1024 px ≈ 165 dpi).
+_FINALIZE_MAX_PX_W = 1024
+#: Max. 2 parallele PIL-Konvertierungen — jede kostet bis zu ~64 MB Spitze.
+_CONVERT_SEM = asyncio.Semaphore(2)
 #: Max. Zeit für den kompletten PDF-Aufbau (Flowables + PIL + reportlab im
 #: Worker-Thread) — danach sichtbare Fehlermeldung statt ewiger Stille.
 _ASSEMBLY_TIMEOUT_S = 600.0
@@ -454,6 +463,17 @@ def _ensure_apple_emoji() -> bool:
         return False
 
 
+def _close_apple_sheet() -> None:
+    """Gibt das geladene Sprite-Sheet frei (RAM) — Crops bleiben als PNGs gecacht."""
+    global _apple_sheet_img
+    if _apple_sheet_img is not None:
+        try:
+            _apple_sheet_img.close()
+        except Exception:  # noqa: BLE001 — Aufräumen darf nie werfen
+            pass
+        _apple_sheet_img = None
+
+
 def _apple_emoji_png(key: str, pos: List[int]) -> Optional[str]:
     """Schneidet ein Emoji aus dem Apple-Sheet und liefert den PNG-Pfad."""
     global _apple_sheet_img
@@ -667,6 +687,43 @@ def _fmt_datetime(dt: Optional[datetime]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _finalize_image_sync(data: bytes) -> Optional[bytes]:
+    """(Worker) Roh-Bytes → kleines, druckfertiges PNG (RAM-bewusst)."""
+    try:
+        im = _PILImage.open(io.BytesIO(data))
+        iw, ih = im.size
+        if iw <= 0 or ih <= 0:
+            return None
+        if iw * ih > _MAX_IMAGE_PIXELS:
+            log.warning("Bild übersprungen (%dx%d px > %d MP) — RAM-Schutz.",
+                        iw, ih, _MAX_IMAGE_PIXELS // 1_000_000)
+            return None
+        return _pil_to_png_bytes(im, max_px_w=_FINALIZE_MAX_PX_W, circle=False)
+    except Exception:  # noqa: BLE001 — konvertierbares Bild oder gar keins
+        log.debug("Bild-Konvertierung fehlgeschlagen (%d Bytes) — übersprungen.", len(data))
+        return None
+
+
+async def _finalize_image(data: Optional[bytes]) -> Optional[bytes]:
+    """
+    Roh-Bytes → finaler PNG-Bytesatz (max. ``_FINALIZE_MAX_PX_W`` breit).
+
+    Ohne PIL werden die Rohbytes durchgereicht (ImageReader versucht sein
+    Glück später). Die Konvertierung läuft max. 2× parallel und in einem
+    Thread — der Event-Loop bleibt flott.
+    """
+    if not data:
+        return None
+    if len(data) > _MAX_IMAGE_BYTES:
+        log.warning("Bild übersprungen (%.1f MB > %d MB Limit) — RAM-Schutz.",
+                    len(data) / 1_000_000, _MAX_IMAGE_BYTES // 1_000_000)
+        return None
+    if _PILImage is None:
+        return data
+    async with _CONVERT_SEM:
+        return await asyncio.to_thread(_finalize_image_sync, data)
+
+
 async def _download_image(
     session: aiohttp.ClientSession,
     url: str,
@@ -693,7 +750,12 @@ async def _download_image(
                     return await resp.read()
 
             data = await asyncio.wait_for(_fetch(), timeout=_IMAGE_TIMEOUT_S * 1.5)
-            cache[url] = data if data else None
+            # RAM-Kernfix: Jedes Bild wird SOFORT zu einem kleinen finalen PNG
+            # konvertiert und die Rohdaten verworfen. Vorher lagen im Cache
+            # alle Roh-Downloads gleichzeitig (bei großen Anhängen hunderte MB
+            # → OOM-Kill des Containers: „Einfrieren" OHNE jegliches Log,
+            # Render startet neu, die Fortschritts-Nachricht bleibt stehen).
+            cache[url] = await _finalize_image(data) if data else None
         except asyncio.CancelledError:
             raise  # Budget-Abschaltung — NICHT als Bildfehler verschlucken
         except Exception as exc:  # noqa: BLE001 — ein fehlendes Bild darf nicht abbrechen
@@ -777,6 +839,13 @@ def _pil_to_png_bytes(im: "_PILImage.Image", *, max_px_w: int, circle: bool) -> 
             return None
         if getattr(im, "is_animated", False):
             im.seek(0)
+        if getattr(im, "format", "") == "JPEG":
+            # JPEG-Draft: dekodiert direkt in reduzierter Auflösung —
+            # dramatisch weniger RAM-Spitze bei großen Fotos.
+            try:
+                im.draft("RGB", (_FINALIZE_MAX_PX_W, _FINALIZE_MAX_PX_W))
+            except Exception:  # noqa: BLE001 — draft ist optional
+                pass
         has_alpha = im.mode in ("RGBA", "LA", "P") or "transparency" in getattr(im, "info", {})
         if has_alpha:
             im = im.convert("RGBA")
@@ -2061,7 +2130,8 @@ async def build_server_document(
     att_image_urls: List[str] = []
     for m in all_msgs:
         for att in getattr(m, "attachments", None) or []:
-            if _attachment_is_image(att) and getattr(att, "url", None):
+            if (_attachment_is_image(att) and getattr(att, "url", None)
+                    and (getattr(att, "size", 0) or 0) <= _MAX_IMAGE_BYTES):
                 att_image_urls.append(att.url)
     att_image_urls = att_image_urls[:MAX_ATTACHMENT_IMAGES]
     image_urls.extend(att_image_urls)
@@ -2719,6 +2789,10 @@ async def build_server_document(
 
     log.info("Server-Dokument-Aufbereitung fertig in %.1f s", time.monotonic() - assemble_started)
 
+    # RAM: das Apple-Sprite-Sheet (4158×4158 RGBA ≈ 69 MB) nach dem Bau
+    # freigeben — die zugeschnittenen Emoji-PNGs bleiben auf Disk gecacht.
+    _close_apple_sheet()
+
     await progress(100, "PDF fertiggestellt.")
     log.info(
         "Server-Dokument für '%s' (ID %s) erstellt: %d KB, %d Kategorien, %d Rollen, %d Emojis, "
@@ -2845,7 +2919,8 @@ async def build_channel_history_pdf(
         if av is not None and getattr(av, "url", None):
             avatar_urls.setdefault(getattr(m.author, "id", 0), av.url)
         for att in getattr(m, "attachments", None) or []:
-            if _attachment_is_image(att) and getattr(att, "url", None):
+            if (_attachment_is_image(att) and getattr(att, "url", None)
+                    and (getattr(att, "size", 0) or 0) <= _MAX_IMAGE_BYTES):
                 att_image_urls.append(att.url)
         for em in _DISCORD_EMOJI_RE.finditer(m.content or ""):
             try:
@@ -3008,6 +3083,8 @@ async def build_channel_history_pdf(
         ticker_task.cancel()
 
     log.info("Chatverlauf-Aufbereitung fertig in %.1f s", time.monotonic() - assemble_started)
+
+    _close_apple_sheet()  # RAM: Sprite-Sheet freigeben (Crops bleiben gecacht)
 
     await progress(100, "PDF fertiggestellt.")
     log.info(

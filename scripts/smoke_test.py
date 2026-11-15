@@ -1084,6 +1084,84 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: kompakt (Font-Subset < 400 KB)", len(pdf_bytes) < 400_000,
           f"{len(pdf_bytes) // 1024} KB")
 
+    # ── RAM-Schutz: Sofort-Konvertierung statt Rohbytes im Cache ────────────
+    # Produktion (Render Free, 512 MB): die letzten Bild-URLs sind die
+    # Anhänge (mehrere MB) — alle Rohbytes im Cache gleichzeitig drückten
+    # den Container in den OOM-Kill: „Einfrieren" OHNE jegliches Log,
+    # Render startete neu (Startup-Log um 01:50), Fortschritts-Nachricht
+    # blieb eingefroren. Jetzt: jedes Bild wird direkt nach dem Download
+    # zu einem ≤1024-px-PNG konvertiert, Rohbytes sofort verworfen.
+    from PIL import Image as _PILImage2
+    from aiohttp import web as _webmem
+
+    def _noise_png(w: int, h: int, seed: int) -> bytes:
+        import random as _rnd
+        _rnd.seed(seed)
+        buf = io.BytesIO()
+        im = _PILImage2.new("RGB", (w, h))
+        px = im.load()
+        for y in range(0, h, 7):
+            for x in range(w):
+                px[x, y] = (_rnd.randrange(256), _rnd.randrange(256), _rnd.randrange(256))
+        im.save(buf, "PNG")
+        return buf.getvalue()
+
+    async def _serve_one(payload: bytes) -> Any:
+        async def _img(_req: Any) -> Any:
+            return _webmem.Response(body=payload, content_type="image/png")
+        app2 = _webmem.Application()
+        app2.router.add_get("/img.png", _img)
+        port2 = free_port()
+        return await start_web_server(app2, "127.0.0.1", port2), port2
+
+    _saved_bytes = pdf_mod._MAX_IMAGE_BYTES
+    try:
+        big_bytes = _noise_png(1400, 1400, 7)
+
+        # 1) Byte-Guard in _finalize_image: über Limit → None (kein OOM-Risiko)
+        pdf_mod._MAX_IMAGE_BYTES = 200_000
+        check("RAM: Bild über Byte-Limit wird übersprungen (kein OOM-Risiko)",
+              await pdf_mod._finalize_image(big_bytes) is None,
+              f"{len(big_bytes)} Bytes > 200 KB Limit")
+
+        # 2) Unter dem Limit: konvertiert zu ≤1024-px-PNG (deutlich kleiner)
+        pdf_mod._MAX_IMAGE_BYTES = _saved_bytes
+        out = await pdf_mod._finalize_image(big_bytes)
+        w_conv = -1
+        if out:
+            w_conv = _PILImage2.open(io.BytesIO(out)).size[0]
+        check("RAM: Rohbytes werden sofort zu ≤1024-px-PNG konvertiert",
+              bool(out) and w_conv <= 1024,
+              f"in={len(big_bytes)} out={len(out) if out else None} width={w_conv}")
+
+        # 3) Download-Cache hält NUR konvertierte PNGs, keine Rohbytes
+        runner2, p2 = await _serve_one(big_bytes)
+        try:
+            async with _aiohttp.ClientSession() as s3:
+                cache3 = await pdf_mod._download_images(s3, [f"http://127.0.0.1:{p2}/img.png"])
+                got = cache3.get(f"http://127.0.0.1:{p2}/img.png")
+                ok3 = False
+                if got:
+                    ok3 = _PILImage2.open(io.BytesIO(got)).size[0] <= 1024
+                check("RAM: Download-Cache hält konvertierte PNGs, keine Rohbytes",
+                      ok3, f"raw={len(big_bytes)} cached={len(got) if got else None}")
+        finally:
+            await runner2.cleanup()
+    finally:
+        pdf_mod._MAX_IMAGE_BYTES = _saved_bytes
+
+    # Apple-Sheet-RAM: nach dem Build freigegeben, Emoji-Crops bleiben nutzbar
+    pdf_mod._apple_png_cache.clear()
+    _ = pdf_mod._apple_emoji_seq_img("🎉")  # zwingend öffnen (lazy load)
+    sheet_was = pdf_mod._apple_sheet_img
+    pdf_mod._close_apple_sheet()
+    sheet_after_close = pdf_mod._apple_sheet_img
+    crop_after_close = pdf_mod._apple_emoji_seq_img("🎉")  # warmer Cache → kein Reopen
+    check("RAM: Apple-Sheet freigegeben, gecachte Crops bleiben nutzbar",
+          sheet_was is not None and sheet_after_close is None
+          and crop_after_close is not None and pdf_mod._apple_sheet_img is None,
+          f"was={sheet_was is not None} crop={crop_after_close is not None}")
+
     # ── Regression: PDF-Aufbau läuft im Worker-Thread mit Budget ────────────
     # Produktion: der gesamte Aufbau (Flowables + PIL + reportlab) lief als
     # EIN synchroner Block AUF DEM EVENT-LOOP — blockierte er (große Bilder),
@@ -1127,12 +1205,16 @@ async def t_pdf(h: Harness) -> None:
     import time as _time
     from aiohttp import web as _web
 
+    _ok_png_buf = io.BytesIO()
+    _PILTest.new("RGB", (24, 24), (30, 40, 50)).save(_ok_png_buf, "PNG")
+    ok_png = _ok_png_buf.getvalue()
+
     async def _stall_handler(_request: Any) -> Any:
         await asyncio.sleep(300)  # simuliert einen CDN-Hänger
         return _web.Response(body=b"x")
 
     async def _ok_handler(_request: Any) -> Any:
-        return _web.Response(body=b"PNGDATA")
+        return _web.Response(body=ok_png, content_type="image/png")
 
     stall_app = _web.Application()
     stall_app.router.add_get("/stall", _stall_handler)
@@ -1157,9 +1239,14 @@ async def t_pdf(h: Harness) -> None:
             t0 = _time.monotonic()
             cache_ok = await pdf_mod._download_images(s2, [f"{stall_base}/ok"])
             elapsed_ok = _time.monotonic() - t0
-            check("Funktionierender Bild-Request liefert Bytes",
-                  cache_ok == {f"{stall_base}/ok": b"PNGDATA"} and elapsed_ok < 15,
-                  f"{elapsed_ok:.1f}s, cache={cache_ok}")
+            got_ok = cache_ok.get(f"{stall_base}/ok")
+            ok_decodes = False
+            if got_ok:
+                _oi = _PILTest.open(io.BytesIO(got_ok))
+                ok_decodes = _oi.size == (24, 24)
+            check("Funktionierender Bild-Request liefert konvertiertes PNG",
+                  ok_decodes and elapsed_ok < 15,
+                  f"{elapsed_ok:.1f}s, cached={len(got_ok) if got_ok else None}")
 
             # Globales Budget: selbst wenn ALLE Requests hängen (und der
             # per-Request-Timeout sie NICHT erwischt), kehrt die Phase zurück.
@@ -1179,8 +1266,11 @@ async def t_pdf(h: Harness) -> None:
             check("Download-Budget bricht die GESAMTE Phase ab und kehrt zurück",
                   isinstance(cache_budget, dict) and elapsed_budget < 12,
                   f"{elapsed_budget:.1f}s")
+            _bi = _PILTest.open(io.BytesIO(cache_budget[ok_url])) \
+                if cache_budget.get(ok_url) else None
             check("Bereits geladene Bilder überleben den Budget-Abbruch",
-                  cache_budget.get(ok_url) == b"PNGDATA", str(list(cache_budget)))
+                  _bi is not None and _bi.size == (24, 24),
+                  str(list(cache_budget)))
             check("Fortschritts-Callback wird aufgerufen",
                   len(hook_calls) >= 1 and hook_calls[0][1] == 2, str(hook_calls[:3]))
     finally:
@@ -1610,24 +1700,30 @@ async def t_history_delivery(h: Harness) -> None:
           (state2.get("last_history_delivery") or {}).get("channel_id") == mchannel.id,
           str(state2))
 
-    # Kanal existiert nicht (Bot nicht im Server) → sichtbare Fehlermeldung
-    resp_missing = await run_modal(client2, g2, "888888888888888888", owner2, _ProgMsg())
-    check("Modal: Kanal nicht gefunden → sichtbare Meldung statt Stillstand",
-          len(resp_missing.sent) == 1 and "Kanal nicht gefunden" in (resp_missing.sent[0][0] or ""),
-          str(resp_missing.sent))
+    # Fehlerfälle: die Interaktion wird IMMER sofort beantwortet (Typ 4),
+    # die konkrete Fehlermeldung landet sichtbar als Edit in derselben
+    # Nachricht — kein stiller Pfad, kein generischer Discord-Fehler.
+    prog_missing = _ProgMsg()
+    resp_missing = await run_modal(client2, g2, "888888888888888888", owner2, prog_missing)
+    check("Modal: sofortige Antwort + Kanal-nicht-gefunden als sichtbares Edit",
+          len(resp_missing.sent) == 1 and "wird erstellt" in (resp_missing.sent[0][0] or "")
+          and bool(prog_missing.edits) and "Kanal nicht gefunden" in (prog_missing.edits[-1] or ""),
+          f"resp={resp_missing.sent} edits={prog_missing.edits[-1:]}")
 
-    # Keine gültige ID → sichtbare Fehlermeldung
-    resp_bad = await run_modal(client2, g2, "keine-zahl", owner2, _ProgMsg())
-    check("Modal: ungültige Eingabe → sichtbare Meldung",
-          len(resp_bad.sent) == 1 and "keine Kanal-ID" in (resp_bad.sent[0][0] or ""),
-          str(resp_bad.sent))
+    prog_bad = _ProgMsg()
+    resp_bad = await run_modal(client2, g2, "keine-zahl", owner2, prog_bad)
+    check("Modal: ungültige Eingabe → sichtbares Edit",
+          len(resp_bad.sent) == 1 and bool(prog_bad.edits)
+          and "keine Kanal-ID" in (prog_bad.edits[-1] or ""),
+          f"resp={resp_bad.sent} edits={prog_bad.edits[-1:]}")
 
-    # Nicht-Owner → Abwehr mit sichtbarer Meldung
+    prog_not_owner = _ProgMsg()
     other_user = SimpleNamespace(id=111222333444555666, display_name="Angreifer")
-    resp_not_owner = await run_modal(client2, g2, str(mchannel.id), other_user, _ProgMsg())
-    check("Modal: Nicht-Owner wird abgewehrt (mit sichtbarer Meldung)",
-          len(resp_not_owner.sent) == 1 and "Bot-Owner" in (resp_not_owner.sent[0][0] or ""),
-          str(resp_not_owner.sent))
+    resp_not_owner = await run_modal(client2, g2, str(mchannel.id), other_user, prog_not_owner)
+    check("Modal: Nicht-Owner abgewehrt (sofortige Antwort + sichtbares Edit)",
+          len(resp_not_owner.sent) == 1 and bool(prog_not_owner.edits)
+          and "Bot-Owner" in (prog_not_owner.edits[-1] or ""),
+          f"resp={resp_not_owner.sent} edits={prog_not_owner.edits[-1:]}")
 
 
 async def t_security(h: Harness) -> None:
