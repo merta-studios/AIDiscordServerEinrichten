@@ -219,8 +219,27 @@ def _build_guild(base_url: str) -> Any:
         msg(3, m3, "Bot-Nachricht", embeds=[embed]),
         m_webhook,
     ])
-    t2.history = _hist([msg(4, m4, "Zweite Nachricht ✓ — 中文 テスト"),])
+    t2.history = _hist([msg(4, m4, "Zweite Nachricht ✓ — 中文 テスト 한국어"),])
     loose.history = _hist([])
+    # Bot-Komponenten (Layouts v2): Container mit Text, Trennlinien, Galerie,
+    # Buttons — wird als strukturierte Bullet-Liste dargestellt.
+    def _comp(name: str, **kw: Any) -> Any:
+        return type("C", (), {"type": type("T", (), {"name": name}), **kw})()
+    btn_link = _comp("button", label="Receive support", style=type("S", (), {"name": "LINK"}))
+    m_comp = msg(5, m3, "Support-Panel mit Komponenten")
+    m_comp.components = [
+        _comp("container", children=[
+            _comp("text_display", content="Wähle unten eine Option"),
+            _comp("separator"),
+            _comp("text_display", content="Hilfe gibt es im Kanal"),
+            _comp("media_gallery", items=[object(), object()]),
+            _comp("separator"),
+            _comp("action_row", children=[btn_link,
+                                          _comp("button", label="Setup now!",
+                                                style=type("S", (), {"name": "LINK"}))]),
+        ]),
+    ]
+    t2.history = _hist([msg(4, m4, "Zweite Nachricht ✓ — 中文 テスト 한국어"), m_comp])
     # Kanal-Details: Slow-Modus + NSFW an zwei Kanälen
     t2.slowmode_delay = 300
     t2.nsfw = True
@@ -282,7 +301,7 @@ async def run_tests() -> int:
         check(f"Glyphe vorhanden: {ch!r}", ord(ch) in (pdf_mod._GLYPH_COVERAGE or set()))
 
     # ── Text-Aufbereitung: Emojis & Unicode-Schriften bleiben sichtbar ─────
-    nasty = "🎮🎉 🛡️ <:custom_emoji:123456789012345678> <@123456789012345678> 👍🏽 🇩🇪 Привет 中文 ✓ «ok» 𝗖𝗵𝗮𝘁 𝕏"
+    nasty = "🎮🎉 🛡️ <:custom_emoji:123456789012345678> <@123456789012345678> 👍🏽 🇩🇪 Привет 中文 テスト 한국어 ✓ «ok» 𝗖𝗵𝗮𝘁 𝕏"
     prepared = _prepare_text(nasty)
     check("Custom-Emoji-Syntax aufgelöst", "custom emoji" in prepared or "custom emoji" in prepared.lower(), prepared)
     check("Member-Mention lesbar umschrieben", "@nutzer-123456789012345678" in prepared, prepared)
@@ -295,13 +314,16 @@ async def run_tests() -> int:
     # muss in mind. einem der drei Fonts darstellbar sein.
     markup = _clean(nasty)
     tag_free = re.sub(r"</?font[^>]*>|<br/>", "", markup)
-    uncovered = [ch for ch in tag_free
-                 if ord(ch) not in (pdf_mod._FONT_COVERAGE.get("sans") or set())
-                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("emoji") or set())
-                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("math") or set())]
+    all_covered: set = set()
+    for cov in pdf_mod._FONT_COVERAGE.values():
+        if cov:
+            all_covered.update(cov)
+    uncovered = [ch for ch in tag_free if ord(ch) not in all_covered]
     check("Markup: kein Zeichen ohne Glyphe in irgendeinem Font", not uncovered, repr(uncovered[:10]))
-    check("Ungedeckte Zeichen (CJK ohne Font) gefiltert statt Notdef",
-          "中" not in markup and "文" not in markup and "🎮" in markup)
+    check("CJK ist jetzt sichtbar (Noto Sans SC/KR)",
+          "中" in markup and "文" in markup and "한" in markup and "テ" in markup)
+    check("Wirklich ungedeckte Zeichen (U+0378, unassigned) gefiltert statt Notdef",
+          "\u0378" not in _clean("a\u0378b") and "ab" in _clean("a\u0378b"))
     check("Zeitangaben bleiben unzerstört",
           _prepare_text("Treffen 12:30:00 Uhr") == "Treffen 12:30:00 Uhr",
           _prepare_text("Treffen 12:30:00 Uhr"))
@@ -342,12 +364,12 @@ async def run_tests() -> int:
               len(re.findall(rb"/FontFile2", pdf_bytes)) >= 5,
               f"{len(re.findall(rb'/FontFile2', pdf_bytes))} FontFile2-Streams")
 
-        # 2) Notdef-Schutz: Emojis/𝗖 laufen über Zusatz-Fonts, ungedeckte
-        #    Zeichen (CJK — DejaVu+Noto Math kennen keine Ideographen) werden
-        #    im Markup gefiltert statt als schwarzes Viereck zu landen:
-        check("Notdef-Schutz: ungedeckte Zeichen gefiltert, Emoji/Math sichtbar",
-              "中" not in _clean("中文🎮𝗖") and "🎮" in _clean("中文🎮𝗖") and "𝗖" in _clean("中文🎮𝗖"),
-              repr(_clean("中文🎮𝗖")))
+        # 2) Notdef-Schutz: ungedeckte Zeichen (U+0378, unassigned — kein
+        #    Font der Welt hat dafür Glyphen) werden im Markup gefiltert
+        #    statt als schwarzes Viereck zu landen; CJK läuft über SC:
+        check("Notdef-Schutz: ungedeckte Zeichen gefiltert, CJK sichtbar",
+              "\u0378" not in _clean("中\u0378文") and "中" in _clean("中\u0378文"),
+              repr(_clean("中\u0378文")))
 
         # 3) Tabellenbreiten: Summe der colWidths entspricht CONTENT_WIDTH
         check("CONTENT_WIDTH ist A4 abzüglich Ränder",
@@ -368,7 +390,7 @@ async def run_tests() -> int:
               b"NotoSansMath-Regular" in pdf_bytes, "")
         if pymupdf is not None:
             doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            full_text = "\n".join(p.get_text() for p in doc)
+            full_text = " ".join("\n".join(p.get_text() for p in doc).split())
             doc.close()
             check("Extraktion: Kanal-Details (Slow-Modus 5 min, NSFW)",
                   "Slow-Modus 5 min" in full_text and "NSFW" in full_text, "")
@@ -376,6 +398,12 @@ async def run_tests() -> int:
                   "Bitrate 64 kbps" in full_text and "Limit 12 Nutzer" in full_text, "")
             check("Extraktion: Kanal-Überschrift #allgemein vorhanden",
                   "#allgemein" in full_text, "")
+            check("Extraktion: Administrator-Zeile statt Aufzählung",
+                  "ADMINISTRATOR — umfasst ALLE Berechtigungen" in full_text, "")
+            check("Extraktion: Komponenten strukturiert (Trennlinie, Medien-Galerie, Button)",
+                  "Trennlinie" in full_text and "Medien-Galerie (2 Medien)" in full_text
+                  and "Schaltfläche „Receive support“ (Link)" in full_text
+                  and "Komponenten:" in full_text, "")
 
 
         # ── Regression: Riesige Nachrichten dürfen den Build nicht crashen ──

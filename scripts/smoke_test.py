@@ -1014,18 +1014,19 @@ async def t_pdf(h: Harness) -> None:
     check("PDF: Math-Font-Markup für 𝗖𝗵𝗮𝘁 & Co.",
           "name='DejaVu-math'" in markup and "𝗖" in markup and "𝕏" in markup, markup[:220])
     check("PDF: DejaVu-fähige Zeichen bleiben ohne Font-Tag",
-          "Привет" in markup and "✓" in markup and "中文" not in markup
-          and "name='DejaVu-sans'" not in markup, markup[:220])
+          "Привет" in markup and "✓" in markup and "name='DejaVu-sans'" not in markup, markup[:220])
+    check("PDF: CJK läuft über Noto-SC-Font", "name='DejaVu-cjk_sc'" in markup, markup[:220])
     check("PDF: Fonts registriert (Emoji + Math)",
           _FONTS.get("emoji") == "DejaVu-emoji" and _FONTS.get("math") == "DejaVu-math",
           str(_FONTS))
     # No-Notdef-Garantie im FERTIGEN Markup (Tags entfernt): jedes gerenderte
-    # Zeichen muss in mind. einem Font (Sans/Emoji/Math) darstellbar sein.
+    # Zeichen muss in mind. einem der geladenen Fonts darstellbar sein.
     tag_free = re.sub(r"</?font[^>]*>|<br/>", "", markup)
-    leftovers = [ch for ch in tag_free
-                 if ord(ch) not in (pdf_mod._FONT_COVERAGE.get("sans") or set())
-                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("emoji") or set())
-                 and ord(ch) not in (pdf_mod._FONT_COVERAGE.get("math") or set())]
+    all_covered: set = set()
+    for cov in pdf_mod._FONT_COVERAGE.values():
+        if cov:
+            all_covered.update(cov)
+    leftovers = [ch for ch in tag_free if ord(ch) not in all_covered]
     check("PDF: kein Zeichen ohne Glyphe im Ergebnis", not leftovers, repr(leftovers[:10]))
     check("PDF: Zeitangaben bleiben unzerstört",
           _prepare_text("Treffen 12:30:00 Uhr") == "Treffen 12:30:00 Uhr")

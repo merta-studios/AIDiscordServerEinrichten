@@ -1,0 +1,7 @@
+Die Noto Sans Script-Schriften in dieser Version (Devanagari, Bengali,
+Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Lao,
+Myanmar, Khmer, Ethiopic, Cherokee, Mongolian, Thai, Noto Serif Tibetan,
+Noto Sans SC, Noto Sans KR) stammen aus https://github.com/google/fonts
+(Projekt: Noto Fonts, https://fonts.google.com/noto) und stehen unter der
+SIL Open Font License 1.1 — siehe die beigefügten LICENSE-Dateien bzw.
+https://openfontlicense.org
