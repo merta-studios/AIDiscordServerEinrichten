@@ -2860,6 +2860,7 @@ async def build_channel_history_pdf(
     max_messages: Optional[int] = None,
     send_part: Optional[Callable[[bytes, int, int], Any]] = None,
     ram_guard: Optional[Callable[[], Any]] = None,
+    part_progress: Optional[Callable[[int, int, int, str], Any]] = None,
 ) -> Any:
     """
     Chatverlauf eines Textkanals/Threads als PDF(s) — NUR für den Bot-Owner.
@@ -2871,6 +2872,11 @@ async def build_channel_history_pdf(
     Verlauf ist („fertige Sachen senden, Daten löschen, Platz für neue“).
     Zwischen den Teilen prüft ``ram_guard`` (async) den RAM; wirft sie,
     wird abgebrochen BEVOR der Container in den OOM-Kill läuft.
+
+    ``part_progress(parts_done, parts_total, part_pct, text)`` meldet den
+    Fortschritt zweistufig: fertige Teile von der Gesamtzahl (Balken 1) und
+    den Schritt im laufenden Teil (Balken 2). Ohne ``part_progress`` fällt
+    der Fortschritt auf ``progress`` (Global-Prozent) zurück.
 
     Rückgabe:
     - ``send_part=None`` (Tests/Abwärtskompatibilität): die PDF-Bytes des
@@ -2927,6 +2933,37 @@ async def build_channel_history_pdf(
                 AttributeError, TypeError):
             ait = None
 
+    # Gesamtzahl VAB ZÄHLEN (ohne Halten!): Erst die Historie einmal nur
+    # durchzählen (die Objekte werden sofort verworfen) — so kennt der
+    # Fortschritts-Balken „Teil X von Y“ die echte Gesamtzahl, ohne dass
+    # alle Nachrichten im RAM liegen müssten.
+    total_estimate = 0
+    if history is not None and ait is not None:
+        try:
+            async for _m in ait:
+                total_estimate += 1
+                if total_estimate % 500 == 0:
+                    await progress(8 + min(int(20 * total_estimate / 1000), 20),
+                                   f"{total_estimate} Nachrichten gefunden …")
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            total_estimate = 0
+        # FRISCHER Iterator für den eigentlichen Stream (der Zähl-Durchlauf
+        # hat den alten verbraucht — sonst wäre der Verlauf leer).
+        try:
+            ait = history(limit=max_messages, oldest_first=True)
+        except TypeError:
+            try:
+                ait = history(limit=max_messages)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound,
+                    AttributeError, TypeError):
+                ait = None
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound,
+                AttributeError, TypeError):
+            ait = None
+    await progress(30,
+                   f"{total_estimate} Nachrichten gefunden — "
+                   f"{max(1, -(-total_estimate // HISTORY_BATCH_MESSAGES))} Teil-PDF(s) werden erstellt …")
+
     seen_count = 0
     first_seen: Optional[Any] = None
     last_seen: Optional[Any] = None
@@ -2958,7 +2995,7 @@ async def build_channel_history_pdf(
         )
 
     full_span = _span(first_seen, last_seen) if seen_count else ""
-    total = 0  # Gesamtzahl der Teile ist beim Streaming unbekannt (0 = offen)
+    total = max(1, -(-total_estimate // HISTORY_BATCH_MESSAGES))  # Teile gesamt
 
     def _collect_batch(batch: List[Any]) -> Tuple[Dict[int, str], List[str],
                                                   Dict[int, Optional[str]], List[str]]:
@@ -3072,16 +3109,26 @@ async def build_channel_history_pdf(
                 f"{batch[0].created_at.strftime('%d.%m.%Y %H:%M')} UTC.", styles["subtitle"]))
         return flows
 
+    async def _part_report(part_pct: int, text: str) -> None:
+        """Fortschritt des laufenden Teils (Balken 2) — part_progress oder Fallback."""
+        if part_progress is not None:
+            try:
+                await part_progress(part_idx_count[0], total, part_pct, text)
+                return
+            except Exception:  # noqa: BLE001 — Fortschritt darf nie abbrechen
+                pass
+        # Fallback (Tests/ohne part_progress): Global-Prozent auf progress
+        pct = 30 + int(68 * ((part_idx_count[0] * 100 + part_pct)
+                             / max(total * 100, 100)))
+        await progress(pct, text)
+
+    part_idx_count = [0]  # fertige Teile (für Balken 1)
+
     async def _build_and_deliver(idx: int, batch: List[Any]) -> bytes:
         """Ein Teil: Bilder laden → Flowables im Thread bauen → PDF → senden."""
-        if total == 0:
-            label = f"Teil {idx + 1}"
-        elif total > 1:
-            label = f"Teil {idx + 1}/{total}"
-        else:
-            label = "Chatverlauf"
-        base_pct = (30 + int(58 * idx / max(total, 1))) if total else 38
-        await progress(base_pct, f"{label}: Bilder werden geladen …")
+        von = f" von {total}" if total > 1 else ""
+        label = f"Teil {idx + 1}{von}" if total != 1 else "Chatverlauf"
+        await _part_report(2, f"{label}: Bilder werden geladen …")
 
         avatar_urls, att_urls, emoji_url_by_id, extra_urls = _collect_batch(batch)
         image_urls: List[Optional[str]] = [icon_url]
@@ -3090,11 +3137,15 @@ async def build_channel_history_pdf(
         image_urls.extend(att_urls)
         image_urls.extend(extra_urls)
 
-        image_cache = await _download_images(http_session, image_urls)
+        async def _img_progress_part(done_n: int, total_n: int) -> None:
+            await _part_report(2 + int(36 * done_n / max(total_n, 1)),
+                               f"{label}: Bilder werden geladen ({done_n}/{total_n}) …")
+
+        image_cache = await _download_images(http_session, image_urls,
+                                             progress_hook=_img_progress_part)
         _dl_ok = sum(1 for v in image_cache.values() if v)
-        await progress(base_pct + 8,
-                       f"{label}: Bilder geladen ({_dl_ok}/{len(image_cache)}) — "
-                       "PDF wird aufbereitet …")
+        await _part_report(42, f"{label}: Bilder geladen ({_dl_ok}/{len(image_cache)}) — "
+                               "PDF wird aufbereitet …")
 
         _ensure_fonts()
         _ensure_apple_emoji()
@@ -3116,22 +3167,35 @@ async def build_channel_history_pdf(
                 subject=f"Chatverlauf von #{ch_name} in {guild.name} (ID {guild.id})",
             )
 
+        await _part_report(48, f"{label}: PDF wird geschrieben …")
         pdf_bytes = await asyncio.wait_for(
             asyncio.to_thread(_assemble), timeout=_ASSEMBLY_TIMEOUT_S
         )
 
-        # RAM-Hygiene nach JEDEM Teil: Cache leeren, GC laufen lassen, Sheet
-        # schließen (Crops bleiben auf Disk) — „Daten löschen, Platz für neue“.
+        # RAM-Hygiene nach JEDEM Teil („fertige Sachen senden, Daten löschen“):
+        # Bild-Cache leeren, Emoji-Zuordnungen leeren, das Apple-Sheet (69 MB!)
+        # schließen (wird fürs nächste Teil lazy neu geladen), GC + malloc_trim
+        # — glibc gibt freigegebenen Heap sonst NICHT ans OS zurück
+        # (Fragmentierung = der Kumulativ-OOM bei Teil 8).
         image_cache.clear()
+        _custom_png_cache.clear()
+        _apple_png_cache.clear()
+        _close_apple_sheet()
         gc.collect()
+        try:
+            from bot.ram import malloc_trim as _mtrim
+            _mtrim()
+        except Exception:  # noqa: BLE001 — Trim ist Best-Effort
+            pass
         if ram_guard is not None:
             await ram_guard()
 
         if send_part is not None:
             await send_part(pdf_bytes, idx + 1, total)
-        await progress(base_pct + 12, f"{label} fertig.")
+        part_idx_count[0] = idx + 1
+        await _part_report(100, f"{label} fertig und gesendet.")
         log.info("Chatverlauf-%s #%s: %d KB (%d Nachrichten)",
-                 f"Teil {idx + 1}/{total}" if total > 1 else "PDF",
+                 f"Teil {idx + 1}{von}" if total > 1 else "PDF",
                  ch_name, len(pdf_bytes) // 1024, len(batch))
         return pdf_bytes
 
@@ -3147,10 +3211,15 @@ async def build_channel_history_pdf(
             loaded_since_guard = 0
             await ram_guard()
 
+    async def _guard_before_part() -> None:
+        if ram_guard is not None:
+            await ram_guard()
+
     async def _finish_batch() -> None:
         nonlocal part_idx, batch, full_span
         if not batch:
             return
+        await _guard_before_part()
         full_span = _span(first_seen, last_seen) if seen_count else full_span
         pdf_bytes = await _build_and_deliver(part_idx, batch)
         parts_bytes.append(pdf_bytes)

@@ -47,10 +47,28 @@ def current_rss_mb() -> float:
         return -1.0
 
 
+def malloc_trim() -> None:
+    """
+    Gibt freigegebenen Heap-Speicher an das Betriebssystem zurück (glibc).
+
+    Python gibt Objekte korrekt frei — aber glibc behält den Heap oft
+    zurück (Fragmentierung): Der RSS-Wachstum über viele PDF-Teile kam
+    genau daher, nicht aus echten Leaks. ``malloc_trim(0)`` räumt das ab.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:  # noqa: BLE001 — Trim ist Best-Effort (nicht-Linux: egal)
+        pass
+
+
 def relieve_ram() -> float:
     """
     Aggressives Aufräumen: GC + PDF-Bildcaches schließen (das Apple-Sheet
-    ist ≈69 MB RGBA; die zugeschnittenen Emoji-PNGs bleiben auf Disk).
+    ist ≈69 MB RGBA; die zugeschnittenen Emoji-PNGs bleiben auf Disk) +
+    ``malloc_trim`` (Heap-Fragmentierung ans OS zurückgeben).
 
     Rückgabe: RAM-Verbrauch nach dem Aufräumen (MB).
     """
@@ -64,6 +82,7 @@ def relieve_ram() -> float:
     except Exception:  # noqa: BLE001 — Aufräumen darf nie werfen
         log.debug("PDF-Caches konnten nicht geleert werden.", exc_info=True)
     gc.collect()
+    malloc_trim()
     return current_rss_mb()
 
 

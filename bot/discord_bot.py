@@ -2009,12 +2009,14 @@ class RelayClient(discord.Client):
         )
 
         async def _progress(percent: int, text: str) -> None:
+            ram = current_rss_mb()
+            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
                         content=(
                             f"📄 **Server-Dokument** für **{guild.name}**\n"
-                            f"{_progress_bar(percent)} {percent} %\n{text}"
+                            f"{_progress_bar(percent)} {percent} %\n{text}{ram_line}"
                         ),
                     ),
                     timeout=10,
@@ -2138,32 +2140,69 @@ class RelayClient(discord.Client):
 
         async def _final(content: str) -> None:
             """Meldet das Ergebnis sichtbar — nie raisend, nie still."""
+            ram = current_rss_mb()
+            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
             if progress_msg is not None:
                 try:
-                    await progress_msg.edit(content=content)
+                    await progress_msg.edit(
+                        content=f"{content}\n{_progress_bar(100)}{ram_line}"
+                    )
                     return
                 except Exception:  # noqa: BLE001 — z. B. Token nach 15 min abgelaufen
                     log.warning("Ergebnis-Edit der Chatverlauf-Nachricht fehlgeschlagen — Fallback auf Followup.")
             try:
-                await interaction.followup.send(content)
+                await interaction.followup.send(f"{content}\n{_progress_bar(100)}{ram_line}")
             except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
                 log.warning("Chatverlauf-Ergebnis konnte nicht angezeigt werden: %s", content[:80])
 
         async def _progress(percent: int, text: str) -> None:
             if progress_msg is None:
                 return
+            ram = current_rss_mb()
+            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
                         content=(
                             f"💬 **Chatverlauf von #{ch_name}**\n"
-                            f"{_progress_bar(percent)} {percent} %\n{text}"
+                            f"{_progress_bar(percent)} {percent} %\n{text}{ram_line}"
                         ),
                     ),
                     timeout=10,
                 )
             except Exception:  # noqa: BLE001 — Fortschritt darf niemals blockieren
                 pass  # z. B. Interaktions-Token nach 15 min abgelaufen — DM geht trotzdem raus
+
+        async def _part_progress(
+            parts_done: int, parts_total: int, part_pct: int, text: str
+        ) -> None:
+            """
+            Zweistufiger Fortschritt (beim Chatverlauf):
+            Balken 1 = fertige Teile von der Gesamtzahl,
+            Balken 2 = Schritt im laufenden Teil,
+            plus Live-RAM.
+            """
+            if progress_msg is None:
+                return
+            ram = current_rss_mb()
+            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
+            p1 = int(100 * parts_done / max(parts_total, 1))
+            cur = min(parts_done + 1, max(parts_total, 1))
+            try:
+                await asyncio.wait_for(
+                    progress_msg.edit(
+                        content=(
+                            f"💬 **Chatverlauf von #{ch_name}**\n"
+                            f"**Teile:** {_progress_bar(p1)} {p1} % — "
+                            f"Teil {cur}/{parts_total} fertig\n"
+                            f"**Läuft:** {_progress_bar(part_pct)} {part_pct} % — {text}"
+                            f"{ram_line}"
+                        ),
+                    ),
+                    timeout=10,
+                )
+            except Exception:  # noqa: BLE001 — Fortschritt darf niemals blockieren
+                pass
 
         try:
             try:
@@ -2258,6 +2297,7 @@ class RelayClient(discord.Client):
                 meta = await build_channel_history_pdf(
                     channel, http_session, progress=_progress, max_messages=None,
                     send_part=_send_part, ram_guard=_ram_guard,
+                    part_progress=_part_progress,
                 )
             finally:
                 if own_session:
