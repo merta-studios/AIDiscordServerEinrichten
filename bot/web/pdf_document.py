@@ -45,6 +45,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -122,6 +123,14 @@ EMBED_LABEL_MAX_CHARS = 80
 MAX_ATTACHMENT_NAMES = 6
 #: Bildanhänge, die als Bild gerendert werden (global pro Dokument)
 MAX_ATTACHMENT_IMAGES = 60
+#: Hart-Timeout pro Bild-Request (Sekunden) — Sicherheitsnetz über dem
+#: aiohttp-Timeout (fängt DNS-/Connector-Stalls mit ab).
+_IMAGE_TIMEOUT_S = 20.0
+#: Globales Budget für die GESAMTE Bild-Download-Phase: Danach wird mit den
+#: bereits geladenen Bildern weitergebaut statt sich ewig aufzuhängen.
+_IMAGES_BUDGET_S = 150.0
+#: Alle N fertigen Bildern eine Fortschrittsmeldung senden.
+_IMAGES_PROGRESS_EVERY = 10
 COMPONENTS_TEXT_MAX_CHARS = 500
 #: Max. Höhe einer Nachrichten-Kästchen-Box in Punkt — darüber wird die
 #: Nachricht unboxiert (splittbar) gerendert (LayoutError-Schutz).
@@ -654,36 +663,88 @@ async def _download_image(
     cache: Dict[str, Optional[bytes]],
     semaphore: asyncio.Semaphore,
 ) -> None:
-    """Lädt ein Bild in den Byte-Cache (fehlertolerant)."""
+    """Lädt ein Bild in den Byte-Cache (fehlertolerant, mit Hart-Timeout)."""
     if url in cache:
         return
     async with semaphore:
         if url in cache:
             return
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    cache[url] = None
-                    return
-                data = await resp.read()
+            # asyncio.wait_for als Sicherheitsnetz ÜBER dem aiohttp-Timeout:
+            # fängt auch Hänger ab, die der Request-Timeout nicht erreicht
+            # (z. B. DNS-/Connector-Stalls vor dem eigentlichen Request).
+            async def _fetch() -> Optional[bytes]:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=_IMAGE_TIMEOUT_S)
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    return await resp.read()
+
+            data = await asyncio.wait_for(_fetch(), timeout=_IMAGE_TIMEOUT_S * 1.5)
             cache[url] = data if data else None
+        except asyncio.CancelledError:
+            raise  # Budget-Abschaltung — NICHT als Bildfehler verschlucken
         except Exception as exc:  # noqa: BLE001 — ein fehlendes Bild darf nicht abbrechen
             log.debug("Bild konnte nicht geladen werden %s: %s", url, exc)
             cache[url] = None
 
 
 async def _download_images(
-    session: aiohttp.ClientSession, urls: List[Optional[str]]
+    session: aiohttp.ClientSession,
+    urls: List[Optional[str]],
+    progress_hook: Optional[Callable[[int, int], Any]] = None,
 ) -> Dict[str, Optional[bytes]]:
-    """Lädt alle Bild-URLs parallel (max. 8 gleichzeitig) → ``{url: bytes|None}``."""
+    """
+    Lädt alle Bild-URLs parallel (max. 8 gleichzeitig) → ``{url: bytes|None}``.
+
+    Ist gegen „ewiges Hängen“ gefeit: Jeder Request hat einen Hart-Timeout
+    UND die gesamte Phase hat ein Budget (``_IMAGES_BUDGET_S``). Läuft das
+    Budget ab, wird abgebrochen und mit den bereits geladenen Bildern
+    weitergebaut (fehlende Bilder werden einfach nicht eingebettet — der
+    PDF-Bau bricht nie wegen eines Bildes). ``progress_hook(done, total)``
+    meldet sichtbaren Fortschritt zwischen den Prozent-Schritten.
+    """
     cache: Dict[str, Optional[bytes]] = {}
     unique = [u for u in dict.fromkeys(u for u in urls if u)]
     if not unique:
         return cache
+    total = len(unique)
     semaphore = asyncio.Semaphore(8)
-    await asyncio.gather(*(_download_image(session, u, cache, semaphore) for u in unique))
+    started = time.monotonic()
+    done = [0]
+
+    async def _one_counted(u: str) -> None:
+        await _download_image(session, u, cache, semaphore)
+        done[0] += 1
+        if progress_hook is not None and (
+            done[0] % _IMAGES_PROGRESS_EVERY == 0 or done[0] == total
+        ):
+            try:
+                await progress_hook(done[0], total)
+            except Exception:  # noqa: BLE001 — Fortschritt darf nie abbrechen
+                pass
+
+    log.info("Server-Dokument: %d Bild-URLs werden geladen …", total)
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(_one_counted(u) for u in unique)),
+            timeout=_IMAGES_BUDGET_S,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning(
+            "Server-Dokument: Bild-Download-Budget (%.0f s) erschöpft — fahre mit "
+            "%d/%d geladenen Bildern fort (Rest wird nicht eingebettet).",
+            _IMAGES_BUDGET_S, done[0], total,
+        )
+    except Exception:  # noqa: BLE001 — Download-Fehler dürfen nie den Build killen
+        log.exception("Server-Dokument: unerwarteter Fehler im Bild-Download — fahre fort.")
     ok = sum(1 for v in cache.values() if v)
-    log.info("Server-Dokument: %d/%d Bilder geladen", ok, len(unique))
+    fail = total - len(cache)
+    log.info(
+        "Server-Dokument: %d/%d Bilder geladen (%d fehlgeschlagen) in %.1f s",
+        ok, total, fail, time.monotonic() - started,
+    )
     return cache
 
 
@@ -1460,7 +1521,16 @@ async def _ensure_member_list(
     if len(members) >= max(target, 1):
         return member_count, members
     try:
-        fetched = [m async for m in guild.fetch_members(limit=max(target, 1))]
+        async def _fetch_all() -> List[Any]:
+            return [m async for m in guild.fetch_members(limit=max(target, 1))]
+
+        # Hart-Budget: ein hängender fetch_members darf den Dokument-Bau
+        # niemals blockieren (wie die Bild-Download-Phase).
+        fetched = await asyncio.wait_for(_fetch_all(), timeout=45)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning("fetch_members für %s überschritt 45 s — fahre mit Cache-Fortschritt fort.",
+                    getattr(guild, "id", "?"))
+        fetched = []
     except (discord.Forbidden, discord.HTTPException, discord.NotFound, AttributeError, TypeError):
         fetched = []
     if fetched:
@@ -1974,7 +2044,11 @@ async def build_server_document(
         [c for m in all_msgs for c in (getattr(m, "components", None) or [])]
     ))
 
-    image_cache = await _download_images(http_session, image_urls)
+    async def _img_progress(done_n: int, total_n: int) -> None:
+        pct = 34 + min(int(27 * done_n / max(total_n, 1)), 27)
+        await progress(pct, f"Bilder werden geladen ({done_n}/{total_n}) …")
+
+    image_cache = await _download_images(http_session, image_urls, progress_hook=_img_progress)
 
     # ── 4. PDF-Datenstrukturen ─────────────────────────────────────────────
     await progress(62, "Tabellen werden aufbereitet …")
@@ -2710,7 +2784,11 @@ async def build_channel_history_pdf(
     image_urls.extend(att_image_urls)
     image_urls.extend(comp_media)
 
-    image_cache = await _download_images(http_session, image_urls)
+    async def _img_progress_hist(done_n: int, total_n: int) -> None:
+        pct = 30 + min(int(31 * done_n / max(total_n, 1)), 31)
+        await progress(pct, f"Bilder werden geladen ({done_n}/{total_n}) …")
+
+    image_cache = await _download_images(http_session, image_urls, progress_hook=_img_progress_hist)
 
     await progress(62, "Nachrichten werden aufbereitet …")
 

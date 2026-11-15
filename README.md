@@ -774,7 +774,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 326 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 331 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -1049,7 +1049,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        326 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        331 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
