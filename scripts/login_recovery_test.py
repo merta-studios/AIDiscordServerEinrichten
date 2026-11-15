@@ -57,6 +57,9 @@ import discord  # noqa: E402
 
 from bot import main as botmain  # noqa: E402
 from bot.config import Config, ConfigError, load_config, mask_proxy_url  # noqa: E402
+import bot.web.pdf_document as _pdlmod  # noqa: E402
+_pdlmod._APPLE_USE_CDN = False  # Tests ohne Netz — Sheet-Pfad deterministisch
+
 from bot.discord_bot import (  # noqa: E402
     CID_CONNECT, CID_DISCONNECT, CID_REGENERATE, RelayClient,
     connected_view, welcome_view,
@@ -1232,19 +1235,22 @@ async def test_owner_features() -> None:
     client.state = AppState(client=client, config=cfg, store=store)
     client.tree.sync = (lambda guild=None: _async_iter([]))  # type: ignore[method-assign]
 
-    # ── Presence: Live-Zähler + Singular/Plural ────────────────────────────
-    check("Presence: 0 Server (Plural)",
-          client._presence_text() == "/connect | 👀 0 eingerichtete Server",
+    # ── Presence: Live-Zähler + Auslastung (Owner-Format) ──────────────────
+    import bot.discord_bot as _dbmod
+    _saved_ausl = _dbmod._auslastung_pct
+    _dbmod._auslastung_pct = lambda: 50  # deterministisch für die Tests
+    check("Presence: 0 Server (Owner-Format)",
+          client._presence_text() == "/connect | 0 Servers | Auslastung 50%",
           client._presence_text())
     g_small = FakeGuild(gid=901, name="Klein"); g_small.member_count = 5
     g_big = FakeGuild(gid=902, name="Gross");   g_big.member_count = 900
     client._connection._guilds = {g.id: g for g in (g_small, g_big)}
-    check("Presence: 2 Server (Plural)",
-          client._presence_text() == "/connect | 👀 2 eingerichtete Server",
+    check("Presence: 2 Server (Owner-Format)",
+          client._presence_text() == "/connect | 2 Servers | Auslastung 50%",
           client._presence_text())
     client._connection._guilds = {g_small.id: g_small}
-    check("Presence: 1 Server (Singular 'eingerichteter')",
-          client._presence_text() == "/connect | 👀 1 eingerichteter Server",
+    check("Presence: 1 Server (Owner-Format)",
+          client._presence_text() == "/connect | 1 Servers | Auslastung 50%",
           client._presence_text())
 
     presence_calls: List[Any] = []
@@ -1266,7 +1272,8 @@ async def test_owner_features() -> None:
     client._connection._guilds[join_guild.id] = join_guild
     await client.on_guild_join(join_guild)
     await asyncio.sleep(0)
-    check("Join aktualisiert die Presence", presence_calls == ["/connect | 👀 2 eingerichtete Server"],
+    check("Join aktualisiert die Presence",
+          presence_calls == ["/connect | 2 Servers | Auslastung 50%"],
           str(presence_calls))
 
     check("Join-DM an den Bot-Owner ging raus", len(bot_owner_dm.sent) == 1,
@@ -1318,8 +1325,9 @@ async def test_owner_features() -> None:
     bot_owner_dm.sent.clear()
     await client.on_guild_remove(audit_guild)
     check("Leave aktualisiert die Presence erneut", len(presence_calls) == 2
-          and presence_calls[1] == "/connect | 👀 1 eingerichteter Server",
+          and presence_calls[1] == "/connect | 1 Servers | Auslastung 50%",
           str(presence_calls))
+    _dbmod._auslastung_pct = _saved_ausl
     check("Leave-DM an den Bot-Owner ging raus", len(bot_owner_dm.sent) == 1,
           str(len(bot_owner_dm.sent)))
     leave_text = _view_text(bot_owner_dm.sent[0]) if bot_owner_dm.sent else ""

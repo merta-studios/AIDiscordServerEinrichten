@@ -90,7 +90,7 @@ class Config:
     discord_token: str
     bot_name: str = "AIDiscordServerEinrichten"
     command_name: str = "connect"
-    status_presence: str = "online"
+    status_presence: str = "idle"
     bot_owner_id: int = 1414615828342509628
     """
     Discord-User-ID des Bot-Besitzers (``BOT_OWNER_ID``).
@@ -330,7 +330,7 @@ def load_config() -> Config:
         discord_token=token,
         bot_name=_str("BOT_NAME", "AIDiscordServerEinrichten"),
         command_name=_str("COMMAND_NAME", "connect").lstrip("/").lower()[:32] or "connect",
-        status_presence=_str("PRESENCE_STATUS", "online").lower(),
+        status_presence=_str("PRESENCE_STATUS", "idle").lower(),
         bot_owner_id=_int("BOT_OWNER_ID", 1414615828342509628),
         host=_str("HOST", "0.0.0.0"),
         port=_int("PORT", 8080),

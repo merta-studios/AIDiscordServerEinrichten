@@ -70,8 +70,8 @@ from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, now_utc
-from .ram import (RAM_CRITICAL_MB, current_rss_mb, ram_report_loop,
-                  relieve_ram)
+from .ram import (RAM_CRITICAL_MB, container_memory_mb, current_rss_mb,
+                  ram_report_loop, relieve_ram)
 from .web.pdf_document import build_channel_history_pdf, build_server_document
 
 log = logging.getLogger("relay.discord")
@@ -739,6 +739,46 @@ def _progress_bar(pct: int, width: int = 10) -> str:
     return "🟩" * filled + "⬜" * (width - filled)
 
 
+def _ram_used_mb() -> float:
+    """
+    Der RAM-Wert, auf den Guards/Anzeigen bauen: die CONTAINER-Nutzung
+    (cgroup) — genau die Zahl, bei deren Überschreitung Render den OOM-Kill
+    macht —, sonst der Prozess-RSS. (Der Prozess-RSS allein unterschlägt
+    Seiten-Cache und andere Prozesse im Container.)
+    """
+    container_mb, _limit = container_memory_mb()
+    if container_mb > 0:
+        return container_mb
+    return current_rss_mb()
+
+
+def _ram_line() -> str:
+    """🧠-Zeile für Lade-/Ergebnis-Nachrichten: „X/Y MB“ (Container) bzw. „X MB“."""
+    container_mb, container_limit = container_memory_mb()
+    if container_mb > 0:
+        if container_limit > 0:
+            return f"\n🧠 RAM: {container_mb:.0f}/{container_limit:.0f} MB"
+        return f"\n🧠 RAM: {container_mb:.0f} MB"
+    mb = current_rss_mb()
+    return f"\n🧠 RAM: {mb:.0f} MB" if mb > 0 else ""
+
+
+def _auslastung_pct() -> int:
+    """
+    Auslastung in Prozent (für die Presence): genutzter RAM relativ zum
+    Container-Limit — bei unbekanntem cgroup-Limit werden 512 MB (Render
+    Free) angenommen. Nicht lesbar → 0.
+    """
+    used, limit = container_memory_mb()
+    if used < 0:
+        used = current_rss_mb()
+    if used < 0:
+        return 0
+    if limit <= 0:
+        limit = 512.0
+    return max(0, min(100, int(round(100 * used / limit))))
+
+
 def _part_message_content(idx: int, total: int) -> str:
     """
     Text einer Teil-DM — bewusst MINIMAL (Owner-Wunsch): nur „Teil N/M:"",
@@ -754,31 +794,41 @@ def startup_notify_view(
     ram_mb: float,
     version: str,
     ready_at: Optional[Any] = None,
+    container_mb: float = -1.0,
+    container_limit_mb: float = -1.0,
 ) -> discord.ui.LayoutView:
     """
     Startup-DM an den Bot-Owner: bestätigt den (Neu)Start sofort — inkl.
-    RAM-Stand und dem Hinweis, dass automatische Neustarts (OOM/Render)
-    damit sofort sichtbar sind.
+    RAM-Stand (Container + Prozess) und dem Hinweis, dass automatische
+    Neustarts (OOM/Render) damit sofort sichtbar sind.
     """
     ts = getattr(ready_at, "strftime", lambda _f: "?")("%d.%m.%Y, %H:%M UTC") if ready_at else "?"
     ram_text = f"{ram_mb:.0f} MB" if ram_mb and ram_mb > 0 else "unbekannt"
+    if container_mb > 0 and container_limit_mb > 0:
+        container_text = f"**RAM (Container):** {container_mb:.0f}/{container_limit_mb:.0f} MB (OOM-relevant)\n"
+    elif container_mb > 0:
+        container_text = f"**RAM (Container):** {container_mb:.0f} MB (OOM-relevant)\n"
+    else:
+        container_text = ""
     container = discord.ui.Container(
         discord.ui.TextDisplay("# 🟢 Bot ist online"),
         discord.ui.Separator(),
         discord.ui.TextDisplay(
             f"**Neustart abgeschlossen:** {ts}\n"
             f"**Version:** v{version}\n"
-            f"**RAM aktuell:** {ram_text} (Container-Limit ~512 MB)"
+            f"{container_text}"
+            f"**RAM (Prozess):** {ram_text}"
         ),
         discord.ui.Separator(),
         discord.ui.TextDisplay(
             "Wenn du diesen Start nicht ausgelöst hast (Deploy oder „Restart“ "
             "in Render), war es ein **automatischer Neustart** — typische "
             "Ursache: zu wenig RAM (OOM) oder ein Fehler im Prozess. Der "
-            "RAM-Verbrauch wird alle 60 s in die Render-Logs geschrieben "
-            "(Warn ab 300 MB, kritisch ab 420 MB); der Chatverlauf-Abruf "
-            "verschickt große Verläufe automatisch in mehreren Teil-PDFs, "
-            "damit der RAM flach bleibt."
+            "RAM-Verbrauch (Container + Prozess) wird alle 60 s in die "
+            "Render-Logs geschrieben (Warn ab 300 MB, kritisch ab 420 MB); "
+            "der Chatverlauf-Abruf verschickt große Verläufe automatisch in "
+            "mehreren Teil-PDFs, die jeweils in einem isolierten Kindprozess "
+            "gebaut werden — damit bleibt der RAM flach."
         ),
         accent_colour=CONNECTED_ACCENT,
     )
@@ -1188,6 +1238,7 @@ class RelayClient(discord.Client):
         # (Neu)Start sofort, z. B. automatische Neustarts durch OOM/Render.
         await self._startup_dm_once()
         self._ensure_ram_monitor()
+        self._ensure_presence_loop()
 
     async def _startup_dm_once(self) -> None:
         """Sendet die Startup-DM — garantiert genau EINMAL pro Prozess."""
@@ -1211,6 +1262,8 @@ class RelayClient(discord.Client):
             return False
         view = startup_notify_view(
             ram_mb=current_rss_mb(),
+            container_mb=container_memory_mb()[0],
+            container_limit_mb=container_memory_mb()[1],
             version=__version__,
             ready_at=self.ready_at,
         )
@@ -1227,10 +1280,13 @@ class RelayClient(discord.Client):
         self._ram_monitor_task = asyncio.create_task(ram_report_loop())
 
     async def close(self) -> None:
-        """Fährt den Client herunter und stoppt den RAM-Monitor."""
+        """Fährt den Client herunter und stoppt RAM-Monitor & Presence-Loop."""
         task = getattr(self, "_ram_monitor_task", None)
         if task is not None:
             task.cancel()
+        pres = getattr(self, "_presence_task", None)
+        if pres is not None:
+            pres.cancel()
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -1374,20 +1430,47 @@ class RelayClient(discord.Client):
     # ── Presence & Owner-Benachrichtigungen ──────────────────────────────────
     def _presence_text(self) -> str:
         """
-        Der Live-Status: ``/connect | 👀 N eingerichtete Server``.
+        Der Live-Status (Owner-Wunsch, exakt dieses Format):
+        ``/connect | 28 Servers | Auslastung 50%``.
 
-        Die Zahl ist die Anzahl der Server, auf denen der Bot ist — sie wird
-        bei jedem Join/Leave aktualisiert.
+        Die Serverzahl ist die Anzahl der Server, auf denen der Bot ist (bei
+        jedem Join/Leave aktualisiert); die Auslastung ist der genutzte RAM
+        relativ zum Container-Limit und wird regelmäßig (alle 60 s) frisch
+        berechnet.
         """
         count = len(self.guilds)
-        server_word = "eingerichteter Server" if count == 1 else "eingerichtete Server"
-        return f"/{self.config.command_name} | 👀 {count} {server_word}"
+        return (f"/{self.config.command_name} | {count} Servers | "
+                f"Auslastung {_auslastung_pct()}%")
 
     async def _update_presence(self) -> None:
-        """Setzt den Live-Status (Aufruf bei on_ready und jedem Server-Wechsel)."""
+        """Setzt den Live-Status (on_ready, Join/Leave, Presence-Loop)."""
         presence = discord.Activity(type=discord.ActivityType.playing, name=self._presence_text())
-        status = getattr(discord.Status, self.config.status_presence, discord.Status.online)
+        status = getattr(discord.Status, self.config.status_presence, discord.Status.idle)
         await self.change_presence(activity=presence, status=status)
+
+    def _ensure_presence_loop(self) -> None:
+        """Startet den Presence-Loop (einmalig) — aktualisiert die Auslastung live."""
+        task = getattr(self, "_presence_task", None)
+        if task is not None and not task.done():
+            return
+        self._presence_task = asyncio.create_task(self._presence_loop())
+
+    async def _presence_loop(self, interval_s: float = 60.0) -> None:
+        """
+        Aktualisiert die Presence regelmäßig: die Auslastung ist ein berechneter,
+        live Wert (RAM-Nutzung relativ zum Container-Limit) und ändert sich
+        ständig. 60-s-Takt (Discord verträgt Presence-Updates problemlos in
+        diesem Rhythmus).
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._update_presence()
+            except Exception:  # noqa: BLE001 — Presence darf niemals stören
+                log.debug("Presence-Loop-Update fehlgeschlagen.", exc_info=True)
 
     def _bot_owner(self) -> Optional[discord.abc.User]:
         """Der Bot-Owner als User-Objekt (Cache, sonst REST — darf None sein)."""
@@ -2019,8 +2102,7 @@ class RelayClient(discord.Client):
         )
 
         async def _progress(percent: int, text: str) -> None:
-            ram = current_rss_mb()
-            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
+            ram_line = _ram_line()
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
@@ -2150,8 +2232,7 @@ class RelayClient(discord.Client):
 
         async def _final(content: str) -> None:
             """Meldet das Ergebnis sichtbar — nie raisend, nie still."""
-            ram = current_rss_mb()
-            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
+            ram_line = _ram_line()
             if progress_msg is not None:
                 try:
                     await progress_msg.edit(
@@ -2168,8 +2249,7 @@ class RelayClient(discord.Client):
         async def _progress(percent: int, text: str) -> None:
             if progress_msg is None:
                 return
-            ram = current_rss_mb()
-            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
+            ram_line = _ram_line()
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
@@ -2194,8 +2274,7 @@ class RelayClient(discord.Client):
             """
             if progress_msg is None:
                 return
-            ram = current_rss_mb()
-            ram_line = f"\n🧠 RAM: {ram:.0f} MB" if ram > 0 else ""
+            ram_line = _ram_line()
             p1 = int(100 * parts_done / max(parts_total, 1))
             cur = min(parts_done + 1, max(parts_total, 1))
             try:
@@ -2232,7 +2311,7 @@ class RelayClient(discord.Client):
             # kritischer Schwelle abbrechen (mit Aufräumen), BEVOR der
             # Container in den OOM-Kill läuft.
             async def _ram_guard() -> None:
-                mb = current_rss_mb()
+                mb = _ram_used_mb()
                 if mb >= RAM_CRITICAL_MB:
                     after = relieve_ram()
                     if after >= RAM_CRITICAL_MB:
