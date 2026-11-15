@@ -733,6 +733,12 @@ class AdminSearchModal(discord.ui.Modal, title="🔍 Server suchen"):
             pass
 
 
+def _progress_bar(pct: int, width: int = 10) -> str:
+    """Ladebalken aus Emojis: 🟩 gefüllt, ⬜ offen (10 Segmente)."""
+    filled = max(0, min(width, int(round(width * max(0, min(pct, 100)) / 100.0))))
+    return "🟩" * filled + "⬜" * (width - filled)
+
+
 def startup_notify_view(
     *,
     ram_mb: float,
@@ -801,8 +807,11 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
         """
         raw = (self.channel_id.value or "").strip()
         try:
+            # Normale (nicht-ephemerale) Nachricht: kein „Nur du kannst das
+            # sehen“-Banner, kein Verwerfen-Button — sie bleibt bestehen,
+            # auch wenn der Discord-Client neu geöffnet wird.
             await interaction.response.send_message(
-                "💬 Chatverlauf wird erstellt … (Kanal wird gesucht)", ephemeral=True,
+                "💬 Chatverlauf wird erstellt … (Kanal wird gesucht)",
             )
         except discord.HTTPException as exc:
             log.warning("Modal-Antwort konnte nicht gesendet werden: %s — Verarbeitung läuft weiter.", exc)
@@ -816,12 +825,14 @@ class AdminHistoryModal(discord.ui.Modal, title="💬 Chatverlauf abrufen"):
         async def _final(content: str) -> None:
             if progress_msg is not None:
                 try:
-                    await progress_msg.edit(content=content)
+                    await progress_msg.edit(
+                        content=f"{content}\n{_progress_bar(100)}"
+                    )
                     return
                 except Exception:  # noqa: BLE001 — Token/Netz egal
                     pass
             try:
-                await interaction.followup.send(content, ephemeral=True)
+                await interaction.followup.send(content)
             except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
                 log.warning("Chatverlauf-Ergebnis konnte nicht angezeigt werden: %s", content[:80])
 
@@ -1986,20 +1997,25 @@ class RelayClient(discord.Client):
             await interaction.followup.send(
                 "Weder der Bot-Owner noch der Server-Owner konnte ermittelt werden — "
                 "das Dokument kann nicht versandt werden.",
-                ephemeral=True,
             )
             return
 
-        # Fortschrittsmeldung als Follow-up, damit der Admin sieht, dass etwas passiert
+        # Fortschrittsmeldung als normale Nachricht (KEIN „Nur du kannst das
+        # sehen“-Banner, kein Verwerfen-Button, bleibt beim Client-Neustart).
         progress_msg = await interaction.followup.send(
-            "Server-Dokument wird erstellt (0 %) …", ephemeral=True, wait=True
+            f"📄 **Server-Dokument** für **{guild.name}**\n{_progress_bar(0)}\n"
+            "Server-Daten werden gesammelt …",
+            wait=True,
         )
 
         async def _progress(percent: int, text: str) -> None:
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
-                        content=f"Server-Dokument wird erstellt ({percent} %) — {text}"
+                        content=(
+                            f"📄 **Server-Dokument** für **{guild.name}**\n"
+                            f"{_progress_bar(percent)} {percent} %\n{text}"
+                        ),
                     ),
                     timeout=10,
                 )
@@ -2023,15 +2039,8 @@ class RelayClient(discord.Client):
 
             file = discord.File(io.BytesIO(pdf_bytes), filename=f"server-dokument-{guild.id}.pdf")
 
-            # Vor der neuen Zustellung: alte Dokument-DMs löschen (letzter
-            # Empfänger + der neue Empfänger) — Fehler dürfen den Versand
-            # niemals verhindern.
-            try:
-                cleaned = await self._cleanup_previous_documents(recipient.id)
-                if cleaned:
-                    log.info("Vor neuer Zustellung %d alte Server-Dokument-DM(s) gelöscht.", cleaned)
-            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
-                log.exception("Aufräumen alter Server-Dokument-DMs fehlgeschlagen — Versand läuft weiter.")
+            # Alte Dokument-DMs bleiben bewusst BESTEHEN (Wunsch: nichts wird
+            # mehr gelöscht) — jedes Dokument wird einfach neu zugestellt.
 
             kind_text = (
                 "Bot-Owner (Empfänger dieses Dokuments)"
@@ -2080,8 +2089,8 @@ class RelayClient(discord.Client):
             await progress_msg.edit(
                 content=(
                     f"✅ Server-Dokument für **{guild.name}** erstellt und per DM an "
-                    f"**{recipient.display_name}** ({kind_text.split(' — ')[0]}) gesendet. "
-                    "Alte Dokument-DMs wurden vorher gelöscht."
+                    f"**{recipient.display_name}** ({kind_text.split(' — ')[0]}) gesendet.\n"
+                    f"{_progress_bar(100)}"
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — jede Fehlermeldung wird dem Admin angezeigt
@@ -2089,7 +2098,7 @@ class RelayClient(discord.Client):
             try:
                 await progress_msg.edit(content=f"❌ Fehler beim Erstellen des Dokuments: {exc}")
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                await interaction.followup.send(f"❌ Fehler: {exc}", ephemeral=True)
+                await interaction.followup.send(f"❌ Fehler: {exc}")
 
     async def _handle_admin_history(
         self, interaction: discord.Interaction, channel: Any
@@ -2118,8 +2127,9 @@ class RelayClient(discord.Client):
         if progress_msg is None:
             try:
                 progress_msg = await interaction.followup.send(
-                    f"Chatverlauf von #{ch_name} wird erstellt (0 %) …",
-                    ephemeral=True, wait=True,
+                    f"💬 **Chatverlauf von #{ch_name}**\n{_progress_bar(0)}\n"
+                    "Chatverlauf wird geladen …",
+                    wait=True,
                 )
             except Exception:  # noqa: BLE001 — ohne Fortschritt läuft der Bau weiter
                 progress_msg = None
@@ -2135,7 +2145,7 @@ class RelayClient(discord.Client):
                 except Exception:  # noqa: BLE001 — z. B. Token nach 15 min abgelaufen
                     log.warning("Ergebnis-Edit der Chatverlauf-Nachricht fehlgeschlagen — Fallback auf Followup.")
             try:
-                await interaction.followup.send(content, ephemeral=True)
+                await interaction.followup.send(content)
             except Exception:  # noqa: BLE001 — dann ist der Token endgültig tot
                 log.warning("Chatverlauf-Ergebnis konnte nicht angezeigt werden: %s", content[:80])
 
@@ -2145,7 +2155,10 @@ class RelayClient(discord.Client):
             try:
                 await asyncio.wait_for(
                     progress_msg.edit(
-                        content=f"Chatverlauf von #{ch_name} wird erstellt ({percent} %) — {text}"
+                        content=(
+                            f"💬 **Chatverlauf von #{ch_name}**\n"
+                            f"{_progress_bar(percent)} {percent} %\n{text}"
+                        ),
                     ),
                     timeout=10,
                 )
@@ -2181,14 +2194,8 @@ class RelayClient(discord.Client):
                             "in kleineren Zeiträumen abrufen."
                         )
 
-            # Vor der neuen Zustellung: alte Chatverlauf-DMs löschen (es bleibt
-            # nur das aktuelle Set übrig). Fehler dürfen den Versand nie blockieren.
-            try:
-                cleaned = await self._cleanup_previous_history_documents(recipient.id)
-                if cleaned:
-                    log.info("Vor neuer Zustellung %d alte Chatverlauf-DM(s) gelöscht.", cleaned)
-            except Exception:  # noqa: BLE001 — Aufräumen darf nicht blockieren
-                log.exception("Aufräumen alter Chatverlauf-DMs fehlgeschlagen — Versand läuft weiter.")
+            # Alte Chatverlauf-DMs bleiben bewusst BESTEHEN (Wunsch: nichts
+            # wird mehr gelöscht) — jede Anforderung hängt neue PDFs an.
 
             sent_ids: List[int] = []
 
@@ -2199,10 +2206,14 @@ class RelayClient(discord.Client):
                 DM-Fehlern wird abgebrochen — die restlichen Teile werden
                 nicht mehr gebaut, der Fehler wird sichtbar gemeldet.
                 """
-                if total > 1:
-                    fname = f"chatverlauf-{guild.id}-{channel.id}-teil-{idx}-von-{total}.pdf"
+                if total != 1:
+                    von = f" von {total}" if total > 1 else ""
+                    fname = (
+                        f"chatverlauf-{guild.id}-{channel.id}-teil-{idx}"
+                        + (f"-von-{total}" if total > 1 else "") + ".pdf"
+                    )
                     content = (
-                        f"💬 **Chatverlauf Teil {idx}/{total}** von #{ch_name} in "
+                        f"💬 **Chatverlauf Teil {idx}{von}** von #{ch_name} in "
                         f"**{guild.name}** (Server-ID `{guild.id}`, Kanal-ID `{channel.id}`)\n\n"
                         "Große Verläufe werden auf mehrere Teil-PDFs verteilt, damit "
                         "die Erstellung zuverlässig bleibt. Alle Teile zusammen sind "
