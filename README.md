@@ -418,6 +418,19 @@ die Owner-ID. Die Liste zeigt:
 Auch die Panel-Buttons und Selects überleben einen Neustart: Seite, Suchbegriff
 und Server-IDs reisen in den Custom-IDs mit — ein altes Panel bleibt bedienbar.
 
+#### Startup-DM & RAM-Monitor
+
+Sobald der Bot startet (auch nach einem automatischen Neustart), bekommt der
+Bot-Owner sofort eine DM: „🟢 Bot ist online“ mit Uhrzeit, Version und aktuellem
+RAM-Stand — man sieht also sofort, wenn der Bot z. B. durch zu wenig RAM (OOM)
+neu gestartet ist, ohne auf Render-Logs warten zu müssen. Der Bot zählt seinen
+RAM selbst: alle 60 s landet der Stand in den Render-Logs (Warn ab 300 MB,
+kritisch ab 420 MB mit automatischem Aufräumen: GC + PDF-Bildcaches schließen).
+Große Chatverläufe werden automatisch in mehrere **Teil-PDFs** aufgeteilt
+(je 100 Nachrichten): Jeder fertige Teil wird sofort per DM versendet und dann
+verworfen („fertige Sachen senden, Daten löschen, Platz für neue“) — der
+RAM-Verbrauch bleibt flach, egal wie groß der Verlauf ist.
+
 ### DM-Benachrichtigungen bei Beitritt & Verlassen
 
 Der Bot-Owner bekommt bei jedem Server-Wechsel eine DM (Container V2 mit
@@ -774,7 +787,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 343 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 353 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -1049,7 +1062,7 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        343 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        353 Prüfungen ohne Discord-Verbindung
 │   ├── pdf_document_test.py 57 Prüfungen: Server-Dokument + Chatverlauf (PDF) — Apple-Emojis, Bilder & Fonts
 │   ├── login_recovery_test.py 207 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   ├── delete_sent_documents.py Alte Server-Dokument-DMs sofort löschen
