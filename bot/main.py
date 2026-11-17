@@ -129,6 +129,9 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
         try:
+            state.prune_rate_limits()
+            if state.client is not None:
+                state.client._prune_pending_leave_reasons()
             state.store._prune_locked()  # noqa: SLF001 — bewusst, gleiche Klasse
             idle_hours = float(getattr(state.config, "session_inactivity_hours", 0.0) or 0.0)
             stopped = await state.store.revoke_inactive(
@@ -1038,6 +1041,8 @@ async def amain() -> int:
     app = build_app(state)
     runner: Optional[Any] = None
     stop = asyncio.Event()
+    state.stop_event = stop
+    state.restart_requested = False
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1113,14 +1118,18 @@ async def amain() -> int:
         store.save()
         log.info("Auf Wiedersehen. 👋")
 
-    return 0
+    return 4 if state.restart_requested else 0
 
 
 def main() -> int:
     """Synchroner Einstiegspunkt (``python -m bot``)."""
     print(BANNER, flush=True)
     try:
-        return asyncio.run(amain())
+        result = asyncio.run(amain())
+        if result == 4:
+            # Replace only after asyncio.run closed the loop, HTTP and gateway.
+            os.execv(sys.executable, [sys.executable, "-m", "bot"])
+        return result
     except KeyboardInterrupt:  # pragma: no cover
         return 0
 

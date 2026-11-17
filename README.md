@@ -1144,3 +1144,34 @@ AIDiscordServerEinrichten/
 Discord-Server. Lies den Abschnitt [Sicherheitsmodell](#sicherheitsmodell), bevor
 du es auf einem Server einsetzt, der dir wichtig ist — und trenne die Verbindung,
 wenn du fertig bist.
+
+
+### Neustart, Feedback und Langzeitbetrieb
+
+- Im privaten `/adminpanel` kann ausschließlich `BOT_OWNER_ID` über **Bot
+  neustarten** und eine zweite Bestätigung den Prozess neu starten. HTTP-Server
+  und Discord-Verbindung werden beendet, Sessions gespeichert und anschließend
+  der Python-Prozess ersetzt. Kein externer Prozessmanager ist dafür nötig.
+  Mit `PERSIST_SESSIONS=false` gehen aktive Verbindungen beim Neustart verloren.
+- `/feedback` ist auf Servern für alle Mitglieder verfügbar (ohne Adminrechte).
+  Ein privates Formular nimmt bis zu 3500 Zeichen entgegen und sendet sie mit
+  Absender- und Server-ID an `BOT_OWNER_ID` (ohne Konfiguration an den
+  Application-Owner). „Danke“ erscheint erst nach erfolgreichem Versand.
+  Bei gesperrten DMs wird ein Fehler angezeigt. Pro Nutzer ist ein Aufruf alle
+  fünf Minuten erlaubt. Discord schreibt Slash-Command-Namen klein.
+- Komponenten-Nachrichten werden nicht mehr pro Nachricht unbegrenzt im
+  discord.py-ViewStore gehalten: Ein zentraler Custom-ID-Router verarbeitet
+  auch alte Buttons nach einem Neustart. Der ungenutzte Nachrichten-Cache ist
+  deaktiviert; Rate-Limit-Buckets und alte Kick/Ban-Notizen werden regelmäßig
+  entfernt. Guild-Command-Sync läuft nicht mehr bei jedem Gateway-Reconnect.
+- Die zuvor fehlenden Bridge-Button-Handler sind implementiert; sie bestätigen
+  Klicks vor der Sitzungserstellung. Auch `/connect` bestätigt frühzeitig.
+  Die Presence-Auslastung bezeichnet **RAM**, nicht CPU. Ein niedrigerer
+  Dauerverbrauch muss nach dem Deployment anhand der RAM-Logs über mehrere
+  Tage geprüft werden; ein Offline-Test ersetzt keinen Langzeittest.
+
+Zusätzliche Offline-Regressionstests:
+
+```bash
+python -m unittest discover -s scripts -p bot_reliability_test.py
+```

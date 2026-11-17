@@ -198,6 +198,48 @@ def _bridge_prompt_line(base_url: str, token: str) -> str:
 _VARIATION_SELECTORS = "\ufe0e\ufe0f"
 
 
+class StatelessLayoutView(discord.ui.LayoutView):
+    """Components are routed by on_interaction, never retained per message.
+
+    Keeping timeout=None views in discord.py's ViewStore retains every sent
+    message indefinitely. The central custom-ID router also works after restart.
+    """
+
+    def is_dispatchable(self) -> bool:
+        return False
+
+
+class FeedbackModal(discord.ui.Modal, title="Feedback senden"):
+    feedback = discord.ui.TextInput(
+        label="Dein Feedback", style=discord.TextStyle.paragraph,
+        min_length=1, max_length=3500,
+    )
+
+    def __init__(self, client: "RelayClient") -> None:
+        super().__init__(timeout=300)
+        self.client = client
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        text = self.feedback.value.strip()
+        if not text:
+            await interaction.followup.send("Bitte schreibe ein Feedback.", ephemeral=True)
+            return
+        try:
+            async with asyncio.timeout(20):
+                owner_id = self.client.config.bot_owner_id
+                owner = (self.client.get_user(owner_id) or await self.client.fetch_user(owner_id)) if owner_id else (await self.client.application_info()).owner
+                embed = discord.Embed(title="Neues Feedback", description=text)
+                embed.add_field(name="Absender", value=f"{interaction.user} ({interaction.user.id})")
+                embed.add_field(name="Server", value=f"{interaction.guild} ({interaction.guild_id})")
+                await owner.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.HTTPException, TimeoutError):
+            log.warning("Feedback konnte nicht zugestellt werden", exc_info=True)
+            await interaction.followup.send("Feedback konnte nicht zugestellt werden. Bitte versuche es später erneut.", ephemeral=True)
+            return
+        await interaction.followup.send("Danke für dein Feedback! 💙", ephemeral=True)
+
+
 def _select_safe_emoji(emoji: str) -> str:
     """Entfernt Variation-Selectoren aus einem Emoji für ``discord.SelectOption``.
 
@@ -227,7 +269,7 @@ def welcome_view() -> discord.ui.LayoutView:
         ),
         accent_colour=WELCOME_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -277,7 +319,7 @@ def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
         ),
         accent_colour=CONNECTED_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -310,7 +352,7 @@ def manage_database_unavailable_view() -> discord.ui.LayoutView:
         ),
         accent_colour=WARN_COLOR,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -323,7 +365,7 @@ def _button_registration_view() -> discord.ui.LayoutView:
     in :meth:`RelayClient.on_interaction` — die Buttons hier haben absichtlich
     keinen Callback.
     """
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(
         discord.ui.Container(
             discord.ui.ActionRow(
@@ -484,13 +526,17 @@ def admin_panel_view(
         discord.ui.Separator(),
         discord.ui.TextDisplay(footer),
         discord.ui.ActionRow(*buttons),
+        discord.ui.ActionRow(discord.ui.Button(
+            label="Bot neustarten", style=discord.ButtonStyle.danger,
+            custom_id=_admin_custom_id("restart", page, query),
+        )),
     ])
 
     container = discord.ui.Container(
         *container_items,
         accent_colour=WELCOME_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -655,7 +701,7 @@ def admin_guild_detail_view(
         *components,
         accent_colour=CONNECTED_ACCENT if sessions else WELCOME_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -691,7 +737,7 @@ def admin_guild_leave_confirm_view(
         ),
         accent_colour=ERR_COLOR,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -889,7 +935,7 @@ def startup_notify_view(
         ),
         accent_colour=CONNECTED_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -1052,7 +1098,7 @@ def guild_join_notify_view(guild: discord.Guild, owner: Optional[Any]) -> discor
         ),
         accent_colour=OK_COLOR,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -1079,7 +1125,7 @@ def guild_remove_notify_view(
         items.append(discord.ui.Separator())
         items.append(discord.ui.TextDisplay(" ".join(parts)))
     container = discord.ui.Container(*items, accent_colour=ERR_COLOR)
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -1115,7 +1161,7 @@ def server_owner_welcome_view(guild: discord.Guild) -> discord.ui.LayoutView:
         ),
         accent_colour=WELCOME_ACCENT,
     )
-    view = discord.ui.LayoutView(timeout=None)
+    view = StatelessLayoutView(timeout=None)
     view.add_item(container)
     return view
 
@@ -1143,12 +1189,10 @@ class RelayClient(discord.Client):
         Client und ``AppState`` verweisen aufeinander; ``main.amain`` erzeugt
         deshalb erst den Client und setzt ``client.state`` direkt danach.
         """
-        # max_messages=200: discord.py cached intern bis zu N Nachrichten
-        # (Default 1000) — für unsere Features (cached_messages) ungenutzt.
-        # Der Cap verhindert, dass der Cache während großer Verlauf-Läufe
-        # unnötig RAM bindet.
+        # No message cache: history/export uses REST, not cached_messages.
+        # Gateway messages otherwise retain embeds, attachments and users.
         options: Dict[str, Any] = {"intents": intents or build_intents(True),
-                                   "max_messages": 200}
+                                   "max_messages": None}
         proxy = (getattr(config, "discord_proxy", "") or "").strip()
         if proxy:
             # discord.py reicht den Proxy an REST **und** Gateway weiter — genau
@@ -1170,6 +1214,7 @@ class RelayClient(discord.Client):
         # Startup-DM: genau EINMAL pro Prozess (ein OOM-/Crash-Restart ist ein
         # neuer Prozess → die DM kommt erneut — genau das gewünschte Signal).
         self._startup_dm_sent: bool = False
+        self._guild_commands_synced = False
         self._ram_monitor_task: Optional[asyncio.Task[Any]] = None
         # Kick/Ban-Gründe, die live per Gateway empfangen wurden (siehe
         # ``on_audit_log_entry_create``): guild_id -> {"action", "reason", "by", "ts"}.
@@ -1184,7 +1229,7 @@ class RelayClient(discord.Client):
         # Persistente Button-View registrieren: ``timeout=None`` plus diese
         # Registrierung sorgt dafür, dass Klicks auf ausgelieferte Nachrichten
         # auch nach einem Render-Deploy noch dispatched werden.
-        self.add_view(_button_registration_view())
+        # Stateless components are handled exclusively by on_interaction.
         await self._sync_commands()
 
     async def _sync_commands(self) -> None:
@@ -1285,12 +1330,14 @@ class RelayClient(discord.Client):
         self._check_guild_permissions()
 
         # Slash-Commands sofort auf allen bestehenden Servern registrieren
-        for g in self.guilds:
-            try:
-                self.tree.copy_global_to(guild=g)
-                await self.tree.sync(guild=g)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("Guild-Sync für %s (%s): %s", g.id, g.name, exc)
+        if not self._guild_commands_synced:
+            self._guild_commands_synced = True
+            for g in self.guilds:
+                try:
+                    self.tree.copy_global_to(guild=g)
+                    await self.tree.sync(guild=g)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Guild-Sync für %s (%s): %s", g.id, g.name, exc)
 
         # Startup-DM an den Bot-Owner (einmal pro Prozess) — meldet jeden
         # (Neu)Start sofort, z. B. automatische Neustarts durch OOM/Render.
@@ -1347,6 +1394,9 @@ class RelayClient(discord.Client):
         pres = getattr(self, "_presence_task", None)
         if pres is not None:
             pres.cancel()
+        tasks = [t for t in (task, pres) if t is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -1798,6 +1848,24 @@ class RelayClient(discord.Client):
         action = parsed["action"]
         page = parsed.get("page", 0)
         query = parsed.get("query", "")
+
+        if action == "restart":
+            view = StatelessLayoutView(timeout=None)
+            view.add_item(discord.ui.Container(
+                discord.ui.TextDisplay("## Bot wirklich neustarten?\nDie Bridge ist kurz nicht erreichbar. Aktive Sitzungen werden gemäß Persistenz-Konfiguration gespeichert."),
+                discord.ui.ActionRow(
+                    discord.ui.Button(label="Ja, neustarten", style=discord.ButtonStyle.danger,
+                                      custom_id=_admin_custom_id("restart_confirm", page, query)),
+                    discord.ui.Button(label="Abbrechen", custom_id=_admin_custom_id("nav", page, query)),
+                ),
+            ))
+            await self._show(interaction, view)
+            return
+        if action == "restart_confirm":
+            await interaction.response.send_message("🔄 Neustart wird ausgeführt …")
+            self.state.restart_requested = True
+            self.state.stop_event.set()
+            return
 
         if action == "close":
             # Das Panel ist eine normale DM. Erst den Klick bestätigen, dann
@@ -2487,9 +2555,40 @@ class RelayClient(discord.Client):
             note=note,
         )
 
+    async def _handle_connect(self, interaction: discord.Interaction) -> None:
+        gate = await self._guard(interaction)
+        if gate is None:
+            return
+        await interaction.response.defer()
+        session, token = await self._new_session(gate["guild"], gate["member"], note="per Verbinden-Button")
+        await self._show(interaction, connected_view(self.state.base_url(), token))
+
+    async def _handle_regenerate(self, interaction: discord.Interaction) -> None:
+        gate = await self._guard(interaction)
+        if gate is None:
+            return
+        await interaction.response.defer()
+        await self.store.revoke(guild_id=gate["guild"].id, by=str(interaction.user.id))
+        session, token = await self._new_session(gate["guild"], gate["member"], note="Token erneuert")
+        await self._show(interaction, connected_view(self.state.base_url(), token))
+
+    async def _handle_revoke_all(self, interaction: discord.Interaction) -> None:
+        gate = await self._guard(interaction, require_bot_admin=False)
+        if gate is None:
+            return
+        await interaction.response.defer()
+        await self.store.revoke(guild_id=gate["guild"].id, by=str(interaction.user.id))
+        await self._show(interaction, welcome_view())
+
     # ── Command-Registrierung ────────────────────────────────────────────────
     def _register_commands(self) -> None:
         command_name = self.config.command_name
+
+        @self.tree.command(name="feedback", description="💬 Feedback an den Bot-Owner senden")
+        @app_commands.guild_only()
+        @app_commands.checks.cooldown(1, 300.0, key=lambda i: i.user.id)
+        async def feedback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(FeedbackModal(self))
 
         @self.tree.command(
             name=command_name,
@@ -2504,6 +2603,7 @@ class RelayClient(discord.Client):
             guild = gate["guild"]
             member = gate["member"]
 
+            await interaction.response.defer(ephemeral=True, thinking=True)
             if self.store.active_for_guild(guild.id):
                 # Bereits verbunden → verbundenen Zustand zeigen. Der Klartext
                 # des alten Tokens liegt nicht mehr vor (gespeichert ist nur
@@ -2514,7 +2614,7 @@ class RelayClient(discord.Client):
                 )
                 self.state.maybe_save(force=True)
                 try:
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         view=connected_view(self.state.base_url(), token), ephemeral=True,
                     )
                 except discord.HTTPException as exc:
@@ -2528,7 +2628,7 @@ class RelayClient(discord.Client):
             else:
                 # Noch nicht verbunden → Willkommen mit grünem Verbinden-Button.
                 try:
-                    await interaction.response.send_message(view=welcome_view(), ephemeral=True)
+                    await interaction.followup.send(view=welcome_view(), ephemeral=True)
                 except discord.HTTPException as exc:
                     log.error("Antwort auf /%s fehlgeschlagen: %s", self.config.command_name, exc)
                     return
@@ -2766,6 +2866,9 @@ class RelayClient(discord.Client):
         Bearbeiten nicht mehr (Nachricht weg/zu alt), gibt es eine frische
         ephemeral Nachricht als Fallback.
         """
+        if interaction.response.is_done():
+            await interaction.edit_original_response(view=view, content=None, embeds=[], attachments=[])
+            return
         try:
             await interaction.response.edit_message(
                 view=view, content=None, embeds=[], attachments=[],
