@@ -956,8 +956,8 @@ async def test_client_setup() -> None:
     check("setup_hook() wirft nicht", setup_ok, setup_detail)
 
     names = {c.name for c in client.tree.get_commands()}
-    check("connect, adminpanel und manage_database sind registriert",
-          names == {"connect", "adminpanel", "manage_database"}, str(sorted(names)))
+    check("connect, feedback, adminpanel und manage_database sind registriert",
+          names == {"connect", "feedback", "adminpanel", "manage_database"}, str(sorted(names)))
     db_command = client.tree.get_command("manage_database")
     check("manage_database ist als Slash-Command vorhanden", db_command is not None)
     panel_command = client.tree.get_command("adminpanel")
@@ -968,8 +968,8 @@ async def test_client_setup() -> None:
           and panel_contexts.dm_channel is True
           and panel_contexts.private_channel is False,
           str(panel_contexts))
-    check("genau eine persistente Button-View",
-          len(client.persistent_views) == 1, str(len(client.persistent_views)))
+    check("keine gespeicherten Button-Views (zentraler Router)",
+          len(client.persistent_views) == 0, str(len(client.persistent_views)))
     check("Command-Sync wurde aufgerufen", len(sync_calls) == 1)
 
     # 1b) /connect ist optionenlos und antwortet als Container-V2-Nachricht.

@@ -195,6 +195,13 @@ class AppState:
             self.store.save()
 
     # ── Rate-Limiting (pro Token, Sliding Window) ────────────────────────────
+    def prune_rate_limits(self) -> None:
+        now = time.monotonic()
+        window = float(self.config.api_rate_window)
+        for key, bucket in list(self._rate.items()):
+            if not bucket or now - bucket[-1] > window:
+                self._rate.pop(key, None)
+
     def check_rate_limit(self, key: str) -> Optional[float]:
         """Liefert ``retry_after`` in Sekunden oder ``None``, wenn alles frei ist."""
         limit = self.config.api_rate_limit
